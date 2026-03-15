@@ -125,15 +125,23 @@ const NAV: { id: Page; label: string; icon: string }[] = [
   { id: 'settings',  label: 'Settings',     icon: '⚙' },
 ];
 
+// ── Shared note-type color map — works in both light and dark mode ──────────
+const NOTE_COLORS: Record<string, string> = {
+  LESSON:          'text-amber-600 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/60 border border-amber-200 dark:border-amber-800/40',
+  STRATEGY_RESULT: 'text-purple-600 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/60 border border-purple-200 dark:border-purple-800/40',
+  OBSERVATION:     'text-blue-600 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/60 border border-blue-200 dark:border-blue-800/40',
+  INSIGHT:         'text-teal-600 dark:text-teal-300 bg-teal-50 dark:bg-teal-950/60 border border-teal-200 dark:border-teal-800/40',
+};
+
 const STEP_META: Record<string, { icon: string; label: string; color: string }> = {
-  START:        { icon: '▶', label: 'Pipeline Started',   color: 'text-brand-400'   },
-  WEB_RESEARCH: { icon: '⌖', label: 'Shared Retrieval',   color: 'text-purple-400'  },
-  DEBATE_PANEL: { icon: '◈', label: 'Debate Panel',       color: 'text-teal-400'    },
-  AGENT_QUERY:  { icon: '◉', label: 'Agent Query',        color: 'text-teal-300'    },
-  JUDGE:        { icon: '⚖', label: 'Judge',              color: 'text-amber-400'   },
-  DEPLOY:       { icon: '◆', label: 'Deploy Strategy',    color: 'text-brand-400'   },
-  MEMORY_WRITE: { icon: '◈', label: 'Write Memories',     color: 'text-indigo-400'  },
-  ERROR:        { icon: '✕', label: 'Error',              color: 'text-down'        },
+  START:        { icon: '▶', label: 'Pipeline Started',   color: 'text-brand-500 dark:text-brand-400'    },
+  WEB_RESEARCH: { icon: '⌖', label: 'Shared Retrieval',   color: 'text-purple-600 dark:text-purple-400'  },
+  DEBATE_PANEL: { icon: '◈', label: 'Debate Panel',       color: 'text-teal-600 dark:text-teal-400'      },
+  AGENT_QUERY:  { icon: '◉', label: 'Agent Query',        color: 'text-teal-600 dark:text-teal-300'      },
+  JUDGE:        { icon: '⚖', label: 'Judge',              color: 'text-amber-600 dark:text-amber-400'    },
+  DEPLOY:       { icon: '◆', label: 'Deploy Strategy',    color: 'text-brand-500 dark:text-brand-400'    },
+  MEMORY_WRITE: { icon: '◈', label: 'Write Memories',     color: 'text-indigo-600 dark:text-indigo-400'  },
+  ERROR:        { icon: '✕', label: 'Error',              color: 'text-down'                             },
 };
 
 // ── Small reusable components ──────────────────────────────────────────────
@@ -149,7 +157,7 @@ function Badge({ type }: { type: 'LONG' | 'SHORT' | string }) {
 function StatusChip({ status }: { status: string }) {
   const map: Record<string, string> = {
     ACTIVE:   'bg-up-bg text-up-text border border-up/20',
-    PENDING:  'bg-amber-950 text-amber-300 border border-amber-500/20',
+    PENDING:  'bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300 border border-amber-300 dark:border-amber-500/20',
     REJECTED: 'bg-down-bg text-down-text border border-down/20',
     CLOSED:   'bg-surface3 text-textDim border border-borderLight',
   };
@@ -191,7 +199,7 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void 
 // ── Stat Drawer ────────────────────────────────────────────────────────────
 
 function StatDrawer({
-  focus, onClose, activeStrategies, pendingStrategies, debates, memories, groupedMemories, onApproval, darkMode,
+  focus, onClose, activeStrategies, pendingStrategies, debates, memories, groupedMemories, onApproval,
 }: {
   focus: 'active' | 'pending' | 'debates' | 'memories';
   onClose: () => void;
@@ -201,7 +209,6 @@ function StatDrawer({
   memories: AgentMemory[];
   groupedMemories: Record<string, AgentMemory[]>;
   onApproval: (id: number, action: string) => void;
-  darkMode: boolean;
 }) {
   const [expandedDebateId, setExpandedDebateId] = useState<number | null>(null);
 
@@ -212,12 +219,7 @@ function StatDrawer({
     memories: 'Agent Memory Notes',
   };
 
-  const noteColors: Record<string, string> = {
-    LESSON:          darkMode ? 'text-amber-300 bg-amber-950/60'   : 'text-amber-700 bg-amber-100',
-    STRATEGY_RESULT: darkMode ? 'text-purple-300 bg-purple-950/60' : 'text-purple-700 bg-purple-100',
-    OBSERVATION:     darkMode ? 'text-blue-300 bg-blue-950/60'     : 'text-blue-700 bg-blue-100',
-    INSIGHT:         darkMode ? 'text-teal-300 bg-teal-950/60'     : 'text-teal-700 bg-teal-100',
-  };
+  const noteColors = NOTE_COLORS;
 
   const renderContent = () => {
     if (focus === 'active' || focus === 'pending') {
@@ -1202,7 +1204,6 @@ function AppInner() {
           memories={memories}
           groupedMemories={groupedMemories}
           onApproval={handleApproval}
-          darkMode={darkMode}
         />
       )}
 
@@ -1264,7 +1265,7 @@ function AppInner() {
                         </div>
                         <div className="flex items-center gap-3">
                           {hasPending && (
-                            <span className="text-[10px] text-amber-300 bg-amber-950 border border-amber-500/30 px-2 py-0.5 rounded-full animate-pulse">
+                            <span className="text-[10px] text-amber-700 dark:text-amber-300 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 px-2 py-0.5 rounded-full animate-pulse">
                               Pending
                             </span>
                           )}
@@ -1288,13 +1289,13 @@ function AppInner() {
                                     <div className="flex gap-2">
                                       <button
                                         onClick={() => handleApproval(strat.id, 'approve')}
-                                        className="px-3 py-1.5 bg-up text-white rounded-lg text-xs font-semibold hover:bg-emerald-400 transition-colors"
+                                        className="px-3 py-1.5 bg-up text-white rounded-lg text-xs font-semibold hover:opacity-80 transition-opacity"
                                       >
                                         Approve
                                       </button>
                                       <button
                                         onClick={() => handleApproval(strat.id, 'reject')}
-                                        className="px-3 py-1.5 bg-down text-white rounded-lg text-xs font-semibold hover:bg-rose-400 transition-colors"
+                                        className="px-3 py-1.5 bg-down text-white rounded-lg text-xs font-semibold hover:opacity-80 transition-opacity"
                                       >
                                         Reject
                                       </button>
@@ -1448,7 +1449,7 @@ function AppInner() {
                                 {debate.judge_reasoning && (
                                   <div className="bg-amber-950/30 border border-amber-700/30 rounded-lg p-4">
                                     <p className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider mb-2">⚖ Judge Verdict</p>
-                                    <p className="text-[11px] text-amber-200/80 leading-relaxed">{debate.judge_reasoning}</p>
+                                    <p className="text-[11px] text-textMuted leading-relaxed">{debate.judge_reasoning}</p>
                                   </div>
                                 )}
                                 <div>
@@ -1533,12 +1534,7 @@ function AppInner() {
             />
             <div className="divide-y divide-borderLight max-h-80 overflow-y-auto">
               {agentMemories.map(m => {
-                const noteColors: Record<string, string> = {
-                  LESSON:          'text-amber-300 bg-amber-950/60',
-                  STRATEGY_RESULT: 'text-purple-300 bg-purple-950/60',
-                  OBSERVATION:     'text-blue-300 bg-blue-950/60',
-                  INSIGHT:         'text-teal-300 bg-teal-950/60',
-                };
+                const noteColors = NOTE_COLORS;
                 return (
                   <div key={m.id} className="px-4 py-3">
                     <div className="flex items-center justify-between mb-1.5">
@@ -2156,7 +2152,7 @@ function AppInner() {
                     {stockCalEvents.map((ev, i) => (
                       <div key={i} className="flex items-center gap-3 px-3 py-2.5 bg-surface2 border border-borderLight rounded-lg">
                         <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full shrink-0 ${
-                          ev.event_type === 'Earnings' ? 'bg-brand-900/60 text-brand-300 border border-brand-700/30' : 'bg-teal-900/60 text-teal-300 border border-teal-700/30'
+                          ev.event_type === 'Earnings' ? 'bg-brand-100 dark:bg-brand-900/60 text-brand-700 dark:text-brand-300 border border-brand-300 dark:border-brand-700/30' : 'bg-teal-100 dark:bg-teal-900/60 text-teal-700 dark:text-teal-300 border border-teal-300 dark:border-teal-700/30'
                         }`}>{ev.event_type}</span>
                         <span className="text-xs font-mono text-textMain">{ev.date}</span>
                         {ev.detail && <span className="text-xs text-textMuted">{ev.detail}</span>}
@@ -2201,12 +2197,7 @@ function AppInner() {
 
   const renderSettings = () => {
     const agentMemoriesFor = (name: string) => memories.filter(m => m.agent_name === name);
-    const noteColors: Record<string, string> = {
-      LESSON:          'text-amber-300 bg-amber-950/60',
-      STRATEGY_RESULT: 'text-purple-300 bg-purple-950/60',
-      OBSERVATION:     'text-blue-300 bg-blue-950/60',
-      INSIGHT:         'text-teal-300 bg-teal-950/60',
-    };
+    const noteColors = NOTE_COLORS;
     return (
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         {/* Left column: system settings */}
@@ -2243,7 +2234,7 @@ function AppInner() {
                 <button onClick={() => setMode('auto')} className={`flex-1 py-2.5 text-sm font-medium transition-colors ${approvalMode === 'auto' ? 'bg-brand-600 text-white' : 'bg-surface2 text-textMuted hover:bg-surface3'}`}>
                   Auto Deploy
                 </button>
-                <button onClick={() => setMode('manual')} className={`flex-1 py-2.5 text-sm font-medium transition-colors ${approvalMode === 'manual' ? 'bg-amber-500 text-white' : 'bg-surface2 text-textMuted hover:bg-surface3'}`}>
+                <button onClick={() => setMode('manual')} className={`flex-1 py-2.5 text-sm font-medium transition-colors ${approvalMode === 'manual' ? 'bg-amber-600 text-white' : 'bg-surface2 text-textMuted hover:bg-surface3'}`}>
                   Manual
                 </button>
               </div>
@@ -2426,10 +2417,11 @@ function AppInner() {
                             <div className="divide-y divide-borderLight max-h-64 overflow-y-auto">
                               {agentEvolution.map(ev => {
                                 const reasonColor: Record<string, string> = {
-                                  MUTATION:  'text-amber-400 bg-amber-950/50',
-                                  CROSSOVER: 'text-purple-400 bg-purple-950/50',
-                                  RESET:     'text-blue-400 bg-blue-950/50',
-                                  SEED:      'text-teal-400 bg-teal-950/50',
+                                  MUTATION:  'text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800/40',
+                                  CROSSOVER: 'text-purple-700 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/50 border border-purple-200 dark:border-purple-800/40',
+                                  RESET:     'text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-800/40',
+                                  SEED:      'text-teal-700 dark:text-teal-400 bg-teal-50 dark:bg-teal-950/50 border border-teal-200 dark:border-teal-800/40',
+                                  MANUAL:    'text-textMuted bg-surface2 border border-borderLight',
                                 };
                                 return (
                                   <div key={ev.id} className="px-3 py-3">
@@ -2586,7 +2578,7 @@ function AppInner() {
                           <div className="flex items-center gap-2">
                             <span className={`text-xs font-semibold ${meta.color}`}>{meta.label}</span>
                             {ev.agent_name && (
-                              <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${isAgentQuery ? 'text-teal-700 dark:text-teal-300 bg-teal-100 dark:bg-teal-900/60 border border-teal-400/50 dark:border-teal-700/50' : 'text-brand-700 dark:text-brand-300 bg-brand-100 dark:bg-brand-900/60 border border-brand-400/50 dark:border-brand-700/50'}`}>{ev.agent_name}</span>
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-medium ${isAgentQuery ? 'text-teal-600 dark:text-teal-300 bg-teal-50 dark:bg-teal-900/60 border border-teal-300 dark:border-teal-700/50' : 'text-brand-600 dark:text-brand-300 bg-brand-50 dark:bg-brand-900/60 border border-brand-300 dark:border-brand-700/50'}`}>{ev.agent_name}</span>
                             )}
                             {ev.status === 'ERROR' && (
                               <span className="text-[10px] text-down bg-down-bg border border-down/20 px-1.5 py-0.5 rounded">ERROR</span>
@@ -2594,7 +2586,7 @@ function AppInner() {
                             {ev.step === 'WEB_RESEARCH' && ev.status === 'DONE' && research.length > 0 && (
                               <button
                                 onClick={() => setResearchStepOpen(o => !o)}
-                                className="text-[10px] text-brand-700 dark:text-brand-300 bg-brand-100 dark:bg-brand-900/60 border border-brand-400/50 dark:border-brand-700/50 px-2 py-0.5 rounded-full hover:bg-brand-200 dark:hover:bg-brand-800/60 transition-colors">
+                                className="text-[10px] text-brand-600 dark:text-brand-300 bg-brand-50 dark:bg-brand-900/60 border border-brand-300 dark:border-brand-700/50 px-2 py-0.5 rounded-full hover:bg-brand-100 dark:hover:bg-brand-800/60 transition-colors">
                                 {research.length} articles {researchStepOpen ? '▲' : '▼'}
                               </button>
                             )}
@@ -2818,10 +2810,10 @@ function AppInner() {
                         )}
                         {visibleResults.map(t => {
                           const typeColor: Record<string, string> = {
-                            equity: 'text-brand-400 bg-brand-900/30',
-                            etf:    'text-teal-400 bg-teal-900/30',
-                            crypto: 'text-amber-400 bg-amber-900/30',
-                            future: 'text-purple-400 bg-purple-900/30',
+                            equity: 'text-brand-600 dark:text-brand-400 bg-brand-50 dark:bg-brand-900/30',
+                            etf:    'text-teal-600 dark:text-teal-400 bg-teal-50 dark:bg-teal-900/30',
+                            crypto: 'text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/30',
+                            future: 'text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-900/30',
                           };
                           const tc = typeColor[t.type] ?? 'text-textDim bg-surface3';
                           return (
@@ -3043,7 +3035,7 @@ function AppInner() {
             {pendingStrategies.length > 0 && (
               <button
                 onClick={() => setPage('dashboard')}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-950 border border-amber-500/30 text-amber-300 rounded-lg text-xs font-medium animate-pulse hover:bg-amber-900 transition-colors"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 text-amber-700 dark:text-amber-300 rounded-lg text-xs font-medium animate-pulse hover:bg-amber-200 dark:hover:bg-amber-900 transition-colors"
               >
                 <span>⚠</span> {pendingStrategies.length} Pending
               </button>
