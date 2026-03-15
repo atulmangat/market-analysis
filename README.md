@@ -1,180 +1,248 @@
-# Market Analysis
+<div align="center">
 
-A multi-agent AI stock market analysis system. Multiple AI agents debate every trade across US, India, Crypto, and Commodities markets — then vote on a LONG or SHORT strategy. Agents accumulate persistent memory, and underperforming prompts are auto-improved via Darwinian selection.
+# ◈ Market Analysis
 
-**Live at [market-analysis.space](https://market-analysis.space)**
+**A multi-agent AI trading system where four specialized LLM agents debate every trade, vote on LONG/SHORT strategies, and evolve over time through Darwinian selection.**
+
+[![Live Demo](https://img.shields.io/badge/Live%20Demo-market--analysis.space-6366f1?style=for-the-badge&logo=vercel)](https://market-analysis.space)
+[![Python](https://img.shields.io/badge/Python-3.11-3776ab?style=for-the-badge&logo=python)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110-009688?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/React-18-61dafb?style=for-the-badge&logo=react)](https://react.dev)
+[![License](https://img.shields.io/badge/License-MIT-22c55e?style=for-the-badge)](LICENSE)
+
+</div>
+
+---
+
+## What is this?
+
+Four AI agents — a **Value Investor**, **Technical Analyst**, **Macro Economist**, and **Sentiment Analyst** — each independently research the markets, form a thesis, and debate their recommended trade. A judge synthesises the debate and deploys a consensus LONG/SHORT strategy.
+
+Every agent carries **persistent memory** across rounds. Agents that perform well gain conviction. Agents that underperform have their prompts automatically rewritten by an LLM reflection loop — survival of the fittest.
+
+> *This is not financial advice. It's an experiment in multi-agent reasoning.*
 
 ---
 
 ## Features
 
-- **Multi-Agent Debate** — Specialized AI agents analyze stocks from different perspectives and vote on a consensus trading action
-- **Live Price Tracking** — Active strategies monitored against real-time market prices
-- **Auto Stop-Loss / Take-Profit** — Positions close automatically at −10% (stop-loss) or +15% (take-profit)
-- **Persistent Agent Memory** — Each agent accumulates observations across rounds, shaping future decisions
-- **Darwinian Evolution** — Underperforming agents are automatically rewritten via LLM reflection
-- **Multi-Market Coverage** — US stocks, India NSE, Crypto pairs, MCX Futures
-- **Web Research** — Real-time news from Google News RSS + Yahoo Finance (30-min cache)
-- **Approval Modes** — Auto-deploy or manual approval workflow for strategies
-- **Full Dashboard** — Strategy controls, agent memory feed, debate history, live quotes, and market toggles
-
----
-
-## Tech Stack
-
-| Layer | Technology |
+| | |
 |---|---|
-| Backend | FastAPI, SQLAlchemy, APScheduler, SQLite / PostgreSQL |
-| LLM | OpenRouter (OpenAI-compatible), primary + fallback model |
-| Market Data | yfinance, feedparser (Google News RSS) |
-| Auth | JWT (python-jose), bcrypt |
-| Frontend | React 19, Vite, Tailwind CSS, TypeScript |
-| Deploy | Vercel (serverless) or Railway (always-on) |
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- Python 3.8+
-- Node 16+
-- [OpenRouter API key](https://openrouter.ai)
-
-### Backend
-
-```bash
-cd backend
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Create your .env file
-cp .env.example .env
-# Add your OPENROUTER_API_KEY to .env
-
-uvicorn main:app --reload
-```
-
-Backend runs at `http://localhost:8000` — API docs at `/docs`.
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Frontend runs at `http://localhost:5173` and polls the backend every 10 seconds.
-
----
-
-## Environment Variables
-
-Create `backend/.env`:
-
-```env
-# Required
-OPENROUTER_API_KEY=your_key_here
-
-# Auth
-APP_PASSWORD=your_strong_password
-JWT_SECRET=your_random_string_min_32_chars
-
-# LLM models (optional)
-LLM_MODEL=stepfun/step-3.5-flash:free
-FALLBACK_LLM_MODEL=minimax/minimax-m2.5:nitro
-
-# Production only
-DATABASE_URL=postgresql://user:pass@host:5432/dbname
-FRONTEND_URL=https://your-frontend.vercel.app
-CRON_SECRET=your_cron_secret
-```
-
----
-
-## Deployment
-
-### Vercel (Serverless)
-
-1. Push to GitHub and import into Vercel
-2. Deploy `backend/` as a Vercel Functions project, `frontend/` as a separate static project
-3. Set all environment variables in Vercel dashboard
-4. Cron jobs (`backend/vercel.json`) run automatically:
-   - Debate: daily at 9 AM UTC
-   - Evaluate: daily at 10 AM UTC
-
-### Railway (Always-On)
-
-1. Create a Railway project and connect your GitHub repo
-2. Railway auto-detects `backend/railway.toml` and deploys the backend
-3. APScheduler runs continuously — no cron config needed
-4. Set environment variables in the Railway dashboard
+| 🤖 **Multi-Agent Debate** | Value Investor, Technical Analyst, Macro Economist, Sentiment Analyst argue every trade |
+| 🧠 **Persistent Memory** | Each agent remembers past wins/losses and updates its reasoning accordingly |
+| 🧬 **Darwinian Evolution** | Underperforming agent prompts are auto-rewritten via LLM reflection |
+| 📊 **Strategy Reports** | Each trade comes with a full report: price chart, fundamentals, agent debate breakdown |
+| 📰 **Live Research** | Real-time news from curated RSS feeds + Stocktwits social sentiment |
+| 📈 **Live P&L Tracking** | Active positions tracked against real market prices with auto stop-loss/take-profit |
+| 🌍 **4 Markets** | US Equities, India NSE, Crypto, MCX Futures |
+| ⚡ **Live Pipeline** | Watch the debate happen in real-time, step by step |
+| 🔁 **Auto Schedule** | Runs on configurable interval (default: every 60 minutes) |
+| ✋ **Manual Approval** | Optional manual review before strategies go live |
 
 ---
 
 ## Architecture
 
-### Debate Cycle (default: every 60 min)
-
 ```
-Fetch news + prices → Agents debate in parallel → Majority vote → Deploy strategy → Write agent memory
+┌─────────────────────────────────────────────────────────┐
+│                     Pipeline Run                        │
+│                                                         │
+│  Web Research ──► Agent Context                         │
+│     RSS feeds      Current date + news age labels       │
+│     Stocktwits     Per-ticker fundamentals              │
+│     yfinance       Agent memory (last 50 notes)         │
+│                           │                             │
+│                    ┌──────▼──────┐                      │
+│              ┌─────┤   4 Agents  ├─────┐                │
+│              │     └─────────────┘     │                │
+│        Value Investor           Technical Analyst       │
+│        Macro Economist          Sentiment Analyst       │
+│              │                         │                │
+│              └──────────┬──────────────┘                │
+│                         │                               │
+│                   ┌─────▼──────┐                        │
+│                   │   Judge    │  Majority vote          │
+│                   └─────┬──────┘  + reasoning           │
+│                         │                               │
+│                ┌────────▼────────┐                      │
+│                │ Deploy Strategy │  LONG / SHORT         │
+│                └────────┬────────┘  1 active per ticker │
+│                         │                               │
+│              ┌──────────▼──────────┐                    │
+│              │  Generate Report    │  Chart + Fundamentals│
+│              │  Write Agent Memory │  LESSON / INSIGHT   │
+│              └─────────────────────┘                    │
+└─────────────────────────────────────────────────────────┘
+
+Later: Validator scores each strategy against live prices,
+       closes at -10% stop-loss / +15% take-profit,
+       and auto-rewrites underperforming agent prompts.
 ```
-
-### Evaluation Cycle (default: every 60 min)
-
-```
-Fetch live prices → Update returns → Close at SL/TP → Score predictions → Auto-improve weak agents
-```
-
-### Markets & Tickers
-
-| Market | Tickers |
-|---|---|
-| US | AAPL, MSFT, GOOGL, AMZN, TSLA, NVDA, META, NFLX |
-| India (NSE) | RELIANCE.NS, TCS.NS, INFY.NS, HDFC.NS, SBIN.NS, LT.NS, WIPRO.NS, MARUTI.NS |
-| Crypto | BTC-USD, ETH-USD, SOL-USD, XRP-USD, ADA-USD, DOGE-USD, MATIC-USD |
-| MCX Futures | GOLD=F, SILVER=F, CRUDEOIL=F, NATURALGAS=F, COPPER=F |
-
-Per-market enable/disable is configurable from the dashboard.
-
-### Key Modules
-
-| File | Responsibility |
-|---|---|
-| `main.py` | FastAPI app, APScheduler setup, CORS, cron endpoints |
-| `orchestrator.py` | `run_debate()` — research, agent queries, consensus, deployment |
-| `agents.py` | `query_agent()` — OpenRouter wrapper with primary/fallback retry |
-| `api.py` | REST endpoints under `/api` |
-| `validator.py` | `evaluate_predictions()` — scoring, SL/TP closes, auto-prompt improvement |
-| `memory_manager.py` | Read/write/prune per-agent memory notes (max 50, injected into context) |
-| `web_research.py` | News fetching with 30-min DB cache |
-| `data_ingestion.py` | yfinance price fetching |
-| `models.py` | SQLAlchemy ORM models |
-| `database.py` | DB session factory and `get_db` dependency |
 
 ---
 
-## API Reference
+## Stack
 
-All endpoints are prefixed with `/api`:
+| Layer | Tech |
+|---|---|
+| **Backend** | Python · FastAPI · SQLAlchemy · PostgreSQL (Neon) |
+| **LLMs** | OpenRouter (any model, primary + fallback) |
+| **Market Data** | yfinance · Google News RSS · Stocktwits |
+| **Frontend** | React · TypeScript · Vite · Tailwind CSS |
+| **Deploy** | Vercel (frontend + backend serverless) |
 
-| Method | Endpoint | Description |
+---
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+- Node.js 18+
+- An [OpenRouter](https://openrouter.ai) API key
+
+### 1. Clone
+
+```bash
+git clone https://github.com/atulmangat/market-analysis.git
+cd market-analysis
+```
+
+### 2. Backend
+
+```bash
+cd backend
+python -m venv venv
+source venv/bin/activate       # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Create `backend/.env`:
+
+```env
+OPENROUTER_API_KEY=sk-or-...
+APP_PASSWORD=your_password_here
+
+# Optional: override default models
+LLM_MODEL=stepfun/step-3.5-flash:free
+FALLBACK_LLM_MODEL=minimax/minimax-m2.5:nitro
+
+# Optional: PostgreSQL (defaults to local SQLite)
+DATABASE_URL=postgresql://user:pass@host/db
+```
+
+```bash
+uvicorn main:app --reload
+# API →  http://localhost:8000
+# Docs → http://localhost:8000/docs
+```
+
+### 3. Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev
+# → http://localhost:5173
+```
+
+---
+
+## Deployment (Vercel)
+
+```bash
+# Backend
+cd backend && npx vercel --prod
+
+# Frontend
+cd frontend && npx vercel --prod
+```
+
+**Backend env vars** (set in Vercel project settings):
+
+| Variable | Description |
+|---|---|
+| `OPENROUTER_API_KEY` | Your OpenRouter key |
+| `DATABASE_URL` | Neon / Supabase PostgreSQL URL |
+| `APP_PASSWORD` | Dashboard login password |
+| `JWT_SECRET` | Random 64-char hex string |
+
+**Frontend env vars:**
+
+| Variable | Description |
+|---|---|
+| `VITE_API_URL` | Backend URL + `/api` |
+
+---
+
+## The Agents
+
+Each agent has a distinct investment philosophy with a structured 5-step reasoning framework:
+
+| Agent | Philosophy | Edge |
 |---|---|---|
-| `POST` | `/trigger` | Manually trigger a debate round |
-| `GET` | `/strategies` | List all strategies |
-| `POST` | `/strategies/approve` | Approve a PENDING strategy |
-| `GET` | `/memories` | Agent memory feed |
-| `GET` | `/research` | Web research feed |
-| `POST` | `/config/schedule` | Set debate interval (minutes) |
-| `POST` | `/config/markets` | Enable/disable markets |
-| `POST` | `/cron/debate` | Vercel Cron — debate (requires `CRON_SECRET`) |
-| `POST` | `/cron/evaluate` | Vercel Cron — evaluate (requires `CRON_SECRET`) |
-| `GET` | `/` | Health check |
+| **Value Investor** | Fundamental mispricing vs intrinsic value | Finds assets trading far from fair value with a clear catalyst |
+| **Technical Analyst** | Price structure & momentum | Identifies breakouts, breakdowns, compression setups |
+| **Macro Economist** | Regime identification | Maps macro drivers (rates, geopolitics, flows) to assets |
+| **Sentiment Analyst** | Crowd psychology | Fades peak greed, buys peak fear, spots retail/smart money divergence |
+
+Agents **evolve**: after enough losing trades, the validator triggers an LLM reflection that rewrites the agent's system prompt — preserving what worked, fixing what didn't.
+
+---
+
+## Project Structure
+
+```
+market-analysis/
+├── backend/
+│   ├── main.py             # FastAPI app + APScheduler
+│   ├── api.py              # REST endpoints + report generation
+│   ├── orchestrator.py     # Agent prompts + debate logic
+│   ├── pipeline.py         # Full pipeline run (research → debate → deploy)
+│   ├── validator.py        # P&L scoring + agent evolution
+│   ├── memory_manager.py   # Per-agent persistent notes (max 50)
+│   ├── web_research.py     # RSS feeds + Stocktwits + yfinance
+│   ├── data_ingestion.py   # Live price fetching
+│   ├── models.py           # SQLAlchemy models
+│   ├── database.py         # DB connection + idempotent migrations
+│   └── agents.py           # OpenRouter LLM wrapper (primary + fallback)
+├── frontend/
+│   └── src/
+│       └── App.tsx         # React app (single file)
+└── CLAUDE.md               # AI coding instructions
+```
+
+---
+
+## Key Data Flows
+
+**Debate cycle:**
+`run_debate()` → fetch RSS/Stocktwits (cached 30 min) → inject per-ticker fundamentals + memory into each agent → LLM response → regex extract ticker/action → majority vote → deploy `DeployedStrategy` → generate report → write `AgentMemory`
+
+**Evaluation cycle:**
+`evaluate_predictions()` → fetch live prices → update `current_return` → write STRATEGY_RESULT/LESSON memory → close at stop-loss/take-profit → auto-improve low-scoring agent prompts
+
+**Report:**
+Pre-generated at pipeline time (chart + fundamentals cached on `DebateRound.report_json`) → served instantly from cache, no blocking yfinance calls on request
+
+---
+
+## Contributing
+
+1. Fork the repo
+2. Create a feature branch: `git checkout -b feature/my-feature`
+3. Commit your changes: `git commit -m 'Add my feature'`
+4. Push: `git push origin feature/my-feature`
+5. Open a Pull Request
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE)
+
+---
+
+<div align="center">
+  <sub>Built with <a href="https://claude.ai/code">Claude Code</a> · <a href="https://market-analysis.space">market-analysis.space</a></sub>
+</div>
