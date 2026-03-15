@@ -418,7 +418,7 @@ def get_pipeline_events(db: Session = Depends(get_db)):
 def get_pipeline_runs(db: Session = Depends(get_db)):
     """Returns a summary list of all past pipeline runs, newest first."""
     cached = cache_get("pipeline_runs")
-    if cached is not None:
+    if cached:  # skip empty-list cache entries
         return cached
     from sqlalchemy import func
     rows = (
@@ -518,9 +518,9 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
             "deploy_detail": deploy_event.detail if deploy_event else None,
             "output":        output,
         })
-    # Only cache if no run is currently active (running runs change every poll)
+    # Only cache if no run is currently active and we have results (don't cache empty lists)
     is_running_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if not (is_running_conf and is_running_conf.value == "1"):
+    if result and not (is_running_conf and is_running_conf.value == "1"):
         cache_set("pipeline_runs", result, _TTL_RUNS_LIST)
     return result
 
@@ -983,6 +983,45 @@ def update_market_config(updates: List[MarketUpdate], db: Session = Depends(get_
             conf.is_enabled = 1 if update.is_enabled else 0
     db.commit()
     return {"status": "success"}
+
+
+@protected.post("/config/markets/{market_name}/exit-positions")
+def exit_market_positions(market_name: str, db: Session = Depends(get_db)):
+    """Close all ACTIVE/PENDING strategies for a given market at current market price."""
+    from data_ingestion import fetch_market_data
+    from datetime import datetime as dt
+
+    tickers = MARKET_TICKERS.get(market_name, [])
+    if not tickers:
+        raise HTTPException(status_code=404, detail=f"Unknown market: {market_name}")
+
+    closed = []
+    for symbol in tickers:
+        strats = db.query(models.DeployedStrategy).filter(
+            models.DeployedStrategy.symbol == symbol,
+            models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"]),
+        ).all()
+        for s in strats:
+            sig = fetch_market_data(s.symbol)
+            exit_px = sig.price if sig else s.entry_price
+            if s.entry_price and exit_px:
+                pct = ((exit_px - s.entry_price) / s.entry_price * 100) if s.strategy_type == "LONG" \
+                      else ((s.entry_price - exit_px) / s.entry_price * 100)
+            else:
+                pct = 0.0
+            position = s.position_size or 0.0
+            s.status = "CLOSED"
+            s.exit_price = exit_px
+            s.current_return = round(pct, 4)
+            s.realized_pnl = round(position * pct / 100, 2) if position else None
+            s.close_reason = "MARKET_DISABLED"
+            s.closed_at = dt.utcnow()
+            closed.append({"id": s.id, "symbol": s.symbol, "pct": round(pct, 2)})
+
+    db.commit()
+    cache_invalidate("debates")
+    cache_invalidate("pipeline_runs")
+    return {"closed": closed, "count": len(closed)}
 
 # --- Approval Mode Config ---
 

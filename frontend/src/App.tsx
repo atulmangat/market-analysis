@@ -1866,11 +1866,35 @@ function AppInner() {
     }
   };
 
+  const _doDisableMarket = async (name: string) => {
+    // 1. Disable market config
+    setMarkets(p => { const u = p.map(m => m.market_name === name ? { ...m, is_enabled: 0 } : m); localStorage.setItem('markets', JSON.stringify(u)); return u; });
+    await apiFetch('/config/markets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify([{ market_name: name, is_enabled: false }]) });
+    // 2. Exit all active/pending positions for this market
+    await apiFetch(`/config/markets/${name}/exit-positions`, { method: 'POST' });
+    // 3. Refresh strategies so closed ones disappear from dashboard
+    const r = await apiFetch('/strategies');
+    if (r.ok) setStrategies(await r.json());
+  };
+
   const toggleMarket = (name: string, enabled: number) => {
-    const v = !enabled;
-    // Update UI immediately, fire API in background
-    setMarkets(p => { const updated = p.map(m => m.market_name === name ? { ...m, is_enabled: v ? 1 : 0 } : m); localStorage.setItem('markets', JSON.stringify(updated)); return updated; });
-    apiFetch('/config/markets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify([{ market_name: name, is_enabled: v }]) }).catch(console.error);
+    if (enabled) {
+      // Disabling — check for active/pending strategies in this market
+      const affected = strategies.filter(s =>
+        (s.status === 'ACTIVE' || s.status === 'PENDING') &&
+        getMarketForTicker(s.symbol) === name
+      );
+      if (affected.length > 0) {
+        setDisableMarketPrompt({ name, affected });
+        return;
+      }
+      // No active positions — just disable
+      _doDisableMarket(name);
+    } else {
+      // Enabling — straightforward
+      setMarkets(p => { const u = p.map(m => m.market_name === name ? { ...m, is_enabled: 1 } : m); localStorage.setItem('markets', JSON.stringify(u)); return u; });
+      apiFetch('/config/markets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify([{ market_name: name, is_enabled: true }]) }).catch(console.error);
+    }
   };
 
   const setMode = (mode: string) => {
@@ -1993,6 +2017,7 @@ function AppInner() {
   const [pipelineRunId, setPipelineRunId]         = useState<string | null>(null);
   const [researchStepOpen, setResearchStepOpen]   = useState(false);
   const [pendingDropdownOpen, setPendingDropdownOpen] = useState(false);
+  const [disableMarketPrompt, setDisableMarketPrompt] = useState<{ name: string; affected: Strategy[] } | null>(null);
   const [pipelineRuns, setPipelineRuns]           = useState<PipelineRun[]>([]);
   const [pipelineRunsLoaded, setPipelineRunsLoaded] = useState(false);
   const [selectedRunId, setSelectedRunId]         = useState<string | null>(null);
@@ -2027,12 +2052,15 @@ function AppInner() {
     prevPipelineRunId.current = pipelineRunId;
   }, [isTriggering, pipelineRunId]);
 
-  const activeStrategies = strategies.filter(s => s.status === 'ACTIVE');
-  const pendingStrategies = strategies.filter(s => s.status === 'PENDING');
+  const visibleStrategies = strategies.filter(s =>
+    enabledMarketNames.length === 0 || enabledMarketNames.includes(getMarketForTicker(s.symbol))
+  );
+  const activeStrategies = visibleStrategies.filter(s => s.status === 'ACTIVE');
+  const pendingStrategies = visibleStrategies.filter(s => s.status === 'PENDING');
 
-  // Group strategies by market → ticker
+  // Group strategies by market → ticker (only enabled markets)
   const strategiesByMarketAndTicker: Record<string, Record<string, Strategy[]>> = {};
-  for (const strat of strategies) {
+  for (const strat of visibleStrategies) {
     const market = getMarketForTicker(strat.symbol);
     if (!strategiesByMarketAndTicker[market]) strategiesByMarketAndTicker[market] = {};
     if (!strategiesByMarketAndTicker[market][strat.symbol]) strategiesByMarketAndTicker[market][strat.symbol] = [];
@@ -4045,6 +4073,50 @@ function AppInner() {
           {pageContent[page]()}
         </div>
       </main>
+
+      {/* Disable Market Confirmation Dialog */}
+      {disableMarketPrompt && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
+          <div className="bg-surface border border-borderMid rounded-2xl shadow-2xl w-full max-w-md p-6 space-y-4">
+            <div className="flex items-start gap-3">
+              <span className="text-amber-400 text-xl shrink-0">⚠</span>
+              <div>
+                <h3 className="text-sm font-semibold text-textMain">Disable {disableMarketPrompt.name} Market?</h3>
+                <p className="text-xs text-textMuted mt-1">
+                  This will close {disableMarketPrompt.affected.length} active position{disableMarketPrompt.affected.length !== 1 ? 's' : ''} at current market price:
+                </p>
+              </div>
+            </div>
+            <div className="bg-surface2 rounded-lg divide-y divide-borderLight">
+              {disableMarketPrompt.affected.map(s => (
+                <div key={s.id} className="flex items-center justify-between px-3 py-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono font-bold text-textMain">{s.symbol}</span>
+                    <Badge type={s.strategy_type} />
+                  </div>
+                  <span className={`text-xs font-mono ${(s.current_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                    {s.current_return != null ? `${s.current_return >= 0 ? '+' : ''}${s.current_return.toFixed(2)}%` : '—'}
+                  </span>
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-3 pt-1">
+              <button
+                onClick={() => setDisableMarketPrompt(null)}
+                className="flex-1 py-2 rounded-lg border border-borderMid text-sm text-textMuted hover:text-textMain hover:border-borderMid transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => { const m = disableMarketPrompt; setDisableMarketPrompt(null); _doDisableMarket(m.name); }}
+                className="flex-1 py-2 rounded-lg bg-down text-white text-sm font-semibold hover:opacity-90 transition-opacity"
+              >
+                Exit Positions & Disable
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Strategy Report Panel */}
       {reportStratId !== null && (
