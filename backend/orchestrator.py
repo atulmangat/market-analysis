@@ -577,23 +577,106 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
          f"{len(price_lines)} prices, {len(fundamentals_blocks)} fundamentals, "
          f"{len(per_ticker_news_blocks)} ticker news blocks")
 
-    return full_context, research_log
+    return full_context, research_log, research_items
 
 
 # ── Layer 2: 4-Agent Debate Panel ────────────────────────────────────────────
 
+def _get_interesting_stocks_from_graph(db) -> tuple[list[str], str]:
+    """
+    Query the knowledge graph for the most "interesting" ASSET nodes:
+    - Most edges (highly connected = most events affecting this asset)
+    - Most recently seen
+    Returns (list_of_symbols, formatted_context_string).
+    """
+    try:
+        from sqlalchemy import func, or_
+        # Count edges per asset node
+        edge_counts = {}
+        asset_nodes = db.query(models.KGNode).filter(
+            models.KGNode.node_type == "ASSET"
+        ).order_by(models.KGNode.last_seen_at.desc()).all()
+
+        if not asset_nodes:
+            return [], ""
+
+        now = datetime.utcnow()
+        for node in asset_nodes:
+            cnt = db.query(models.KGEdge).filter(
+                or_(
+                    models.KGEdge.source_node_id == node.node_id,
+                    models.KGEdge.target_node_id == node.node_id,
+                ),
+                or_(
+                    models.KGEdge.expires_at.is_(None),
+                    models.KGEdge.expires_at > now,
+                )
+            ).count()
+            edge_counts[node.node_id] = cnt
+
+        # Sort by edge count desc, take top 8
+        top_nodes = sorted(asset_nodes, key=lambda n: edge_counts.get(n.node_id, 0), reverse=True)[:8]
+        symbols = [n.symbol or n.node_id.replace("asset:", "") for n in top_nodes]
+
+        lines = ["## Most Active Assets in Knowledge Graph (by market event connections)"]
+        for node in top_nodes:
+            sym = node.symbol or node.node_id.replace("asset:", "")
+            cnt = edge_counts.get(node.node_id, 0)
+            lines.append(f"  - **{sym}** ({node.label}): {cnt} active event connections")
+        return symbols, "\n".join(lines)
+    except Exception as e:
+        print(f"[KG] interesting stocks query failed: {e}")
+        return [], ""
+
+
+def _agent_web_search(agent_name: str, run_id: str, queries: list[str]) -> str:
+    """
+    Execute targeted web searches on behalf of an agent.
+    Returns formatted search results as a context block.
+    """
+    from web_research import _fetch_google_news
+    results = []
+    for q in queries[:2]:  # max 2 searches per agent
+        try:
+            items = _fetch_google_news(q.strip(), max_items=4)
+            for item in items:
+                results.append(f"[Search: {q}] {item.get('title', '')} — {item.get('snippet', '')[:150]}")
+        except Exception:
+            pass
+    if not results:
+        return ""
+    return "## Agent Web Search Results\n" + "\n".join(f"- {r}" for r in results)
+
+
+AGENT_SEARCH_REQUEST_PROMPT = """Before forming your final investment proposal, you may request up to 2 targeted web searches to gather additional details on events or assets you see in the knowledge graph or market data.
+
+If you want to search, output your queries in this EXACT format (nothing else on these lines):
+SEARCH_QUERY_1: <specific search query>
+SEARCH_QUERY_2: <specific search query>  (optional)
+
+Or if no additional research is needed, output:
+NO_SEARCH_NEEDED
+
+Be specific — e.g. "NVIDIA Q1 2026 earnings guidance revenue" not "NVDA news".
+Then stop. Do NOT write your analysis yet."""
+
+
 def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
                         shared_context: str, market_constraint: str,
                         investment_focus: str = "",
-                        portfolio_context: str = "") -> dict:
+                        portfolio_context: str = "",
+                        kg_context: str = "") -> dict:
     """
-    Run one agent in its own thread with its own DB session.
+    Two-pass agent query:
+    Pass 1: Agent sees portfolio + KG + interesting stocks → requests web searches
+    Pass 2: Agent sees search results → forms full structured proposal
+
     Returns a proposal dict on success, or None on error.
     """
     db = SessionLocal()
     try:
         _log(db, run_id, "AGENT_QUERY", "IN_PROGRESS",
-             f"Querying {agent_name} with shared context + memory…", agent_name=agent_name)
+             f"Querying {agent_name}…", agent_name=agent_name)
 
         memories = get_agent_memory(db, agent_name, limit=10)
         memory_context = format_memory_for_context(memories)
@@ -603,51 +686,47 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
         if investment_focus:
             focus_block = (
                 f"## Investment Focus Directive\n"
-                f"The user has specified the following investment interest for this run:\n"
-                f"\"{investment_focus}\"\n"
-                f"Prioritise assets and sectors that align with this focus when making your proposal.\n\n"
+                f"The user has specified: \"{investment_focus}\"\n"
+                f"Prioritise assets aligned with this focus.\n\n"
             )
 
-        # Fetch KG subgraph context for this agent's proposed ticker (if available)
-        kg_context = ""
-        try:
-            from knowledge_graph import build_kg_context_for_ticker
-            # We don't know the ticker yet (agent hasn't responded) — inject graph for all
-            # market tickers is too large; instead inject after first agent response.
-            # For now: inject a general market KG query using the most active asset nodes.
-            from database import SessionLocal as _SL
-            _kgdb = _SL()
-            try:
-                import models as _m
-                asset_nodes = _kgdb.query(_m.KGNode).filter(
-                    _m.KGNode.node_type == "ASSET"
-                ).order_by(_m.KGNode.last_seen_at.desc()).limit(5).all()
-                kg_parts = []
-                for node in asset_nodes:
-                    sym = node.symbol or node.node_id.replace("asset:", "")
-                    ctx = build_kg_context_for_ticker(_kgdb, sym)
-                    if ctx:
-                        kg_parts.append(ctx)
-                if kg_parts:
-                    kg_context = "## Knowledge Graph Context\n" + "\n".join(kg_parts[:3])
-            finally:
-                _kgdb.close()
-        except Exception:
-            pass
-
-        agent_context = (
+        # ── Pass 1: Request targeted searches ────────────────────────────────
+        pass1_context = (
             f"{focus_block}"
             f"{portfolio_context}\n\n"
-            f"{shared_context}\n\n"
             f"{kg_context}\n\n"
             f"ALLOWED MARKETS:\n{market_constraint}\n\n"
-            f"---\n\n"
-            f"{memory_context}\n\n"
-            f"---\n\n"
-            f"{performance_context}\n"
+            f"---\n{memory_context}\n---\n{performance_context}\n"
+        )
+        search_response = query_agent(
+            AGENT_SEARCH_REQUEST_PROMPT,
+            pass1_context
         )
 
-        response = query_agent(system_prompt, agent_context)
+        # Parse search queries
+        search_results_block = ""
+        if "NO_SEARCH_NEEDED" not in search_response.upper():
+            queries = []
+            for line in search_response.strip().splitlines():
+                m = re.search(r"SEARCH_QUERY_\d+:\s*(.+)", line, re.IGNORECASE)
+                if m:
+                    queries.append(m.group(1).strip())
+            if queries:
+                _log(db, run_id, "AGENT_QUERY", "IN_PROGRESS",
+                     f"{agent_name} searching: {'; '.join(queries[:2])}", agent_name=agent_name)
+                search_results_block = _agent_web_search(agent_name, run_id, queries)
+
+        # ── Pass 2: Full analysis with search results ────────────────────────
+        pass2_context = (
+            f"{focus_block}"
+            f"{portfolio_context}\n\n"
+            f"{kg_context}\n\n"
+            f"{shared_context}\n\n"
+            f"{search_results_block}\n\n"
+            f"ALLOWED MARKETS:\n{market_constraint}\n\n"
+            f"---\n{memory_context}\n---\n{performance_context}\n"
+        )
+        response = query_agent(system_prompt, pass2_context)
         ticker, action = extract_proposal(response)
 
         pred = models.AgentPrediction(
@@ -723,6 +802,8 @@ def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: st
     Queries all 4 agents IN PARALLEL — each in its own thread with its own DB session.
     Returns proposals_log: [{agent_name, ticker, action, reasoning}]
     """
+    from knowledge_graph import build_kg_context_for_ticker
+
     agent_prompts = db.query(models.AgentPrompt).all()
 
     # Snapshot agent data before handing off to threads (avoid sharing the session)
@@ -731,13 +812,27 @@ def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: st
     # Build portfolio context once — all agents see the same open positions
     portfolio_context = _build_portfolio_context(db)
 
+    # Build KG context: interesting stocks + their subgraphs
+    interesting_symbols, interesting_summary = _get_interesting_stocks_from_graph(db)
+    kg_parts = []
+    if interesting_summary:
+        kg_parts.append(interesting_summary)
+    for sym in interesting_symbols[:6]:  # cap at 6 subgraphs to keep context manageable
+        subgraph_ctx = build_kg_context_for_ticker(db, sym)
+        if subgraph_ctx:
+            kg_parts.append(subgraph_ctx)
+    kg_context = "\n\n".join(kg_parts) if kg_parts else ""
+    if kg_context:
+        _log(db, run_id, "DEBATE_PANEL", "IN_PROGRESS",
+             f"KG context built for {len(interesting_symbols)} assets — passing to agents")
+
     proposals_log = []
     with ThreadPoolExecutor(max_workers=len(agents_snapshot)) as executor:
         futures = {
             executor.submit(
                 _query_single_agent,
                 name, prompt, run_id, shared_context, market_constraint,
-                investment_focus, portfolio_context
+                investment_focus, portfolio_context, kg_context
             ): name
             for name, prompt in agents_snapshot
         }
@@ -923,7 +1018,7 @@ def run_debate(focus_tickers: list[str] | None = None):
             _log(db, run_id, "START", "DONE", f"Investment focus: {investment_focus[:100]}")
 
         # ── 1. Shared Retrieval ───────────────────────────────────────────────
-        shared_context, research_log = build_shared_retrieval_context(
+        shared_context, research_log, _ = build_shared_retrieval_context(
             db, run_id, enabled_markets, investment_focus=investment_focus)
 
         # ── 2. 4-Agent Debate Panel ───────────────────────────────────────────

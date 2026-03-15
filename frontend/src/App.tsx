@@ -1023,6 +1023,32 @@ function KnowledgeGraphViewer() {
             );
           })()}
 
+          {/* EVENT node: show compressed summary + metadata */}
+          {selectedNode.type === 'EVENT' && (() => {
+            const m = selectedNode.metadata as Record<string, string | number>;
+            const dir = String(m.direction ?? '');
+            const mag = String(m.magnitude ?? '');
+            const exp = m.expires_days ? String(m.expires_days) : '';
+            const sum = String(m.summary ?? '');
+            if (!dir && !sum) return null;
+            return (
+              <div className="space-y-1.5 border-t border-borderLight pt-3">
+                {dir && (
+                  <div className="flex items-center gap-2">
+                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded ${
+                      dir === 'bullish' ? 'bg-up/10 text-up' :
+                      dir === 'bearish' ? 'bg-down/10 text-down' :
+                      'bg-surface3 text-textDim'
+                    }`}>{dir.toUpperCase()}</span>
+                    {mag && <span className="text-[10px] text-textDim">{mag.toUpperCase()} IMPACT</span>}
+                    {exp && <span className="text-[10px] text-textDim ml-auto">expires {exp}d</span>}
+                  </div>
+                )}
+                {sum && <p className="text-[11px] text-textMuted leading-relaxed">{sum}</p>}
+              </div>
+            );
+          })()}
+
           {/* Subgraph shortcut for assets */}
           {selectedNode.type === 'ASSET' && selectedNode.symbol && (
             <button onClick={() => loadSubgraph(selectedNode.symbol!)}
@@ -1778,10 +1804,12 @@ function AppInner() {
     return () => clearInterval(i);
   }, []);
 
-  // Dedicated pipeline poller — 2s while running, 8s while idle
-  // Runs once on mount; state is always read from the backend (survives page refresh)
+  // Dedicated pipeline poller — 2s while running, 8s while idle.
+  // triggerPollRef lets handleManualTrigger kick an immediate poll and switch to fast mode.
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const triggerPollRef = useRef<(() => void) | null>(null);
+
   useEffect(() => {
-    let timerId: ReturnType<typeof setTimeout>;
     const pollPipeline = async () => {
       try {
         const res = await apiFetch('/pipeline/events');
@@ -1798,10 +1826,18 @@ function AppInner() {
         const r = await apiFetch('/pipeline/runs');
         if (r.ok) setPipelineRuns(await r.json());
       } catch { /* ignore */ }
-      timerId = setTimeout(pollPipeline, isTriggeringRef.current ? 2000 : 8000);
+      // Schedule next poll — 2s when running, 8s when idle
+      pollTimerRef.current = setTimeout(pollPipeline, isTriggeringRef.current ? 2000 : 8000);
     };
+
+    // Expose a way for handleManualTrigger to cancel pending timer and poll immediately
+    triggerPollRef.current = () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+      pollPipeline();
+    };
+
     pollPipeline();
-    return () => clearTimeout(timerId);
+    return () => { if (pollTimerRef.current) clearTimeout(pollTimerRef.current); };
   }, []);
 
   const loadRunEvents = async (runId: string) => {
@@ -1898,10 +1934,14 @@ function AppInner() {
     setIsTriggering(true);
     const body = tickers && tickers.length > 0 ? { tickers } : {};
     // Fire-and-forget — the pipeline runs synchronously on the backend (~3 min).
-    // The poller picks up is_running=true immediately and tracks progress.
+    // Immediately reschedule the poller to fast mode (500ms) so we catch is_running=true quickly.
+    setTimeout(() => { triggerPollRef.current?.(); }, 500);
     apiFetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       .then(res => res.json())
-      .then(data => { if (data.status === 'error') { isTriggeringRef.current = false; setIsTriggering(false); alert(data.message); } else { setTimeout(fetchData, 2000); } })
+      .then(data => {
+        if (data.status === 'error') { isTriggeringRef.current = false; setIsTriggering(false); alert(data.message); }
+        else { setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000); }
+      })
       .catch(() => { isTriggeringRef.current = false; setIsTriggering(false); });
   };
 
