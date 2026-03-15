@@ -13,3 +13,9 @@ frontend/.env
 
 # OS
 .DS_Store
+.env*.local
+
+# Vercel — ignore generated files but track project links
+.vercel
+!frontend/.vercel/project.json
+!backend/.vercel/project.json

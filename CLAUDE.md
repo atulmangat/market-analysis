@@ -37,6 +37,27 @@ cd frontend
 npm run build
 ```
 
+## Deploying to Vercel
+
+IMPORTANT: Always deploy from the correct subdirectory. The `.vercel/project.json` in each subdirectory pins the project — never re-run `vercel link` or deploy from the repo root.
+
+### Frontend → market-analysis.space
+```bash
+cd frontend
+npx vercel --prod --yes
+```
+This deploys to the `frontend` Vercel project, which is aliased to `market-analysis.space`.
+
+### Backend
+```bash
+cd backend
+npx vercel --prod --yes
+```
+This deploys to the `backend` Vercel project.
+
+### Do NOT run `vercel` from the repo root
+The root `.vercel/project.json` points to the `market-analysis` project which is NOT connected to the domain. Always deploy from `frontend/` or `backend/` subdirectories.
+
 ## Environment Variables
 
 Create `backend/.env`:
