@@ -181,3 +181,13 @@ class KGEdge(Base):
     expires_at     = Column(DateTime, nullable=True)
     created_at     = Column(DateTime, default=datetime.utcnow)
 
+
+class CacheEntry(Base):
+    """DB-backed cache shared across all workers/serverless invocations."""
+    __tablename__ = "cache_entries"
+
+    key        = Column(String, primary_key=True, index=True)
+    value_json = Column(Text, nullable=False)
+    expires_at = Column(DateTime, nullable=True)   # NULL = no expiry
+    updated_at = Column(DateTime, default=datetime.utcnow)
+

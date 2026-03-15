@@ -9,6 +9,18 @@ import math
 import models
 import yfinance as yf
 from auth import require_auth, verify_password, create_token, check_rate_limit, record_failed_attempt, record_success
+from cache import cache_get, cache_set, cache_invalidate, cache_invalidate_prefix, cache_stats
+
+# TTL constants (seconds)
+_TTL_RUN_EVENTS  = 86400   # 1 day  — completed run events never change
+_TTL_RUNS_LIST   = 60      # 1 min  — new runs appear; short so list stays fresh
+_TTL_DEBATES     = 600     # 10 min — historical debate rounds
+_TTL_RESEARCH    = 600     # 10 min — web research cache
+_TTL_GRAPH       = 600     # 10 min — knowledge graph updated each pipeline run
+_TTL_FITNESS     = 600     # 10 min — agent fitness scores
+_TTL_EVOLUTION   = 3600    # 1 hr   — prompt evolution history
+_TTL_MARKET_EVT  = 1800    # 30 min — earnings/news calendar
+_TTL_MEMORY      = 300     # 5 min  — agent memories written after each run
 
 
 # Public router — no auth required
@@ -346,8 +358,27 @@ def get_strategy_report(strategy_id: int, db: Session = Depends(get_db)):
 
 @protected.get("/debates")
 def get_debates(db: Session = Depends(get_db)):
+    cached = cache_get("debates")
+    if cached is not None:
+        return cached
     debates = db.query(models.DebateRound).order_by(models.DebateRound.timestamp.desc()).limit(20).all()
-    return debates
+    result = [
+        {
+            "id": d.id,
+            "consensus_ticker": d.consensus_ticker,
+            "consensus_action": d.consensus_action,
+            "consensus_votes": d.consensus_votes,
+            "proposals_json": d.proposals_json,
+            "enabled_markets": d.enabled_markets,
+            "research_context": d.research_context,
+            "judge_reasoning": d.judge_reasoning,
+            "timestamp": d.timestamp.isoformat() if d.timestamp else None,
+            "report_json": d.report_json,
+        }
+        for d in debates
+    ]
+    cache_set("debates", result, _TTL_DEBATES)
+    return result
 
 # --- Live Pipeline Endpoint ---
 
@@ -386,6 +417,9 @@ def get_pipeline_events(db: Session = Depends(get_db)):
 @protected.get("/pipeline/runs")
 def get_pipeline_runs(db: Session = Depends(get_db)):
     """Returns a summary list of all past pipeline runs, newest first."""
+    cached = cache_get("pipeline_runs")
+    if cached is not None:
+        return cached
     from sqlalchemy import func
     rows = (
         db.query(
@@ -484,12 +518,20 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
             "deploy_detail": deploy_event.detail if deploy_event else None,
             "output":        output,
         })
+    # Only cache if no run is currently active (running runs change every poll)
+    is_running_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+    if not (is_running_conf and is_running_conf.value == "1"):
+        cache_set("pipeline_runs", result, _TTL_RUNS_LIST)
     return result
 
 
 @protected.get("/pipeline/runs/{run_id}")
 def get_pipeline_run_events(run_id: str, db: Session = Depends(get_db)):
     """Returns all events for a specific pipeline run."""
+    cache_key = f"run_events:{run_id}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
     rows = (
         db.query(models.PipelineEvent)
         .filter(models.PipelineEvent.run_id == run_id)
@@ -507,7 +549,12 @@ def get_pipeline_run_events(run_id: str, db: Session = Depends(get_db)):
         }
         for e in rows
     ]
-    return {"run_id": run_id, "events": events}
+    result = {"run_id": run_id, "events": events}
+    # Only cache if this run is complete (has a DONE or ERROR terminal event)
+    is_current_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
+    if not (is_current_conf and is_current_conf.value == run_id):
+        cache_set(cache_key, result, _TTL_RUN_EVENTS)
+    return result
 
 
 # --- Live Quotes Endpoint ---
@@ -606,6 +653,9 @@ def get_live_quotes():
 @protected.get("/market/events")
 def get_market_events():
     """Fetch upcoming earnings, dividends AND recent news for all markets."""
+    cached = cache_get("market_events")
+    if cached is not None:
+        return cached
     from datetime import timezone
     import datetime as _dt
 
@@ -693,7 +743,9 @@ def get_market_events():
     # Sort news by date desc, earnings/dividends by date asc — mix with news first
     news_events = sorted([e for e in events if e["event_type"] == "News"], key=lambda x: x["date"], reverse=True)
     cal_events  = sorted([e for e in events if e["event_type"] != "News"], key=lambda x: x["date"])
-    return cal_events + news_events
+    result = cal_events + news_events
+    cache_set("market_events", result, _TTL_MARKET_EVT)
+    return result
 
 
 # --- Darwin / Evolution Endpoints ---
@@ -701,6 +753,9 @@ def get_market_events():
 @protected.get("/agents/fitness")
 def get_agent_fitness(db: Session = Depends(get_db)):
     """Returns current fitness scores for all agents based on recent predictions."""
+    cached = cache_get("agents_fitness")
+    if cached is not None:
+        return cached
     from sqlalchemy import func
     from validator import _compute_fitness
 
@@ -708,7 +763,6 @@ def get_agent_fitness(db: Session = Depends(get_db)):
     result = []
     for a in agents:
         fitness = _compute_fitness(db, a.agent_name)
-        # Current generation = total history entries + 1
         gen = db.query(models.AgentPromptHistory).filter(
             models.AgentPromptHistory.agent_name == a.agent_name
         ).count() + 1
@@ -721,19 +775,24 @@ def get_agent_fitness(db: Session = Depends(get_db)):
             "total_scored":  fitness["total_scored"],
             "updated_at":    a.updated_at.isoformat() if a.updated_at else None,
         })
+    cache_set("agents_fitness", result, _TTL_FITNESS)
     return result
 
 
 @protected.get("/agents/evolution/{agent_name}")
 def get_agent_evolution(agent_name: str, db: Session = Depends(get_db)):
     """Returns full prompt evolution history for a single agent."""
+    cache_key = f"agent_evolution:{agent_name}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
     history = (
         db.query(models.AgentPromptHistory)
         .filter(models.AgentPromptHistory.agent_name == agent_name)
         .order_by(models.AgentPromptHistory.generation.desc())
         .all()
     )
-    return [
+    result = [
         {
             "id":              h.id,
             "generation":      h.generation,
@@ -748,6 +807,8 @@ def get_agent_evolution(agent_name: str, db: Session = Depends(get_db)):
         }
         for h in history
     ]
+    cache_set(cache_key, result, _TTL_EVOLUTION)
+    return result
 
 # --- Agent Prompts Endpoint ---
 
@@ -787,6 +848,8 @@ def update_agent_prompt(agent_name: str, body: dict, db: Session = Depends(get_d
     agent.system_prompt = new_prompt
     agent.updated_at = datetime.utcnow()
     db.commit()
+    cache_invalidate("agents_fitness")
+    cache_invalidate(f"agent_evolution:{agent_name}")
     return {"status": "updated", "agent_name": agent_name}
 
 
@@ -795,13 +858,16 @@ def update_agent_prompt(agent_name: str, body: dict, db: Session = Depends(get_d
 @protected.get("/memory")
 def get_all_memory(db: Session = Depends(get_db)):
     """Get recent memory notes for all agents."""
+    cached = cache_get("memory_all")
+    if cached is not None:
+        return cached
     memories = (
         db.query(models.AgentMemory)
         .order_by(models.AgentMemory.created_at.desc())
         .limit(50)
         .all()
     )
-    return [
+    result = [
         {
             "id": m.id,
             "agent_name": m.agent_name,
@@ -812,6 +878,8 @@ def get_all_memory(db: Session = Depends(get_db)):
         }
         for m in memories
     ]
+    cache_set("memory_all", result, _TTL_MEMORY)
+    return result
 
 @protected.get("/memory/{agent_name}")
 def get_agent_memory(agent_name: str, db: Session = Depends(get_db)):
@@ -871,13 +939,16 @@ def search_tickers(q: str = ""):
 @protected.get("/research")
 def get_research(db: Session = Depends(get_db)):
     """Get the latest cached web research results."""
+    cached = cache_get("research")
+    if cached is not None:
+        return cached
     research = (
         db.query(models.WebResearch)
         .order_by(models.WebResearch.fetched_at.desc())
         .limit(30)
         .all()
     )
-    return [
+    result = [
         {
             "id": r.id,
             "query": r.query,
@@ -888,6 +959,8 @@ def get_research(db: Session = Depends(get_db)):
         }
         for r in research
     ]
+    cache_set("research", result, _TTL_RESEARCH)
+    return result
 
 # --- Market Config ---
 
@@ -955,6 +1028,8 @@ def approve_strategy(action: ApprovalAction, db: Session = Depends(get_db)):
     else:
         return {"error": "Invalid action. Use 'approve' or 'reject'."}
     db.commit()
+    cache_invalidate("debates")
+    cache_invalidate("pipeline_runs")
     return {"status": strategy.status, "id": strategy.id}
 
 # --- Manual Trigger & Scheduling ---
@@ -1006,6 +1081,15 @@ def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depend
 
     from pipeline import run_full_pipeline
     run_full_pipeline(run_id)
+
+    # Invalidate all caches that are affected by a pipeline run completing
+    cache_invalidate("pipeline_runs")
+    cache_invalidate("debates")
+    cache_invalidate("research")
+    cache_invalidate("memory_all")
+    cache_invalidate("agents_fitness")
+    cache_invalidate("kg_full")
+    cache_invalidate_prefix("kg_ticker:")
 
     msg = f"Focused pipeline run on: {', '.join(focus)}" if focus else "Full pipeline started."
     return {"status": "success", "message": msg, "run_id": run_id}
@@ -1097,6 +1181,8 @@ def undeploy_strategy(strategy_id: int, db: Session = Depends(get_db)):
     s.close_reason = "MANUAL"
     s.closed_at = dt.utcnow()
     db.commit()
+    cache_invalidate("debates")
+    cache_invalidate("pipeline_runs")
     return _strategy_to_dict(s)
 
 
@@ -1277,13 +1363,30 @@ def get_portfolio_pnl(db: Session = Depends(get_db)):
 @protected.get("/knowledge-graph")
 def get_knowledge_graph(db: Session = Depends(get_db)):
     """Return all nodes and deduplicated edges (capped at 500 nodes)."""
+    cached = cache_get("kg_full")
+    if cached is not None:
+        return cached
     from knowledge_graph import get_full_graph
-    return get_full_graph(db, limit_nodes=500)
+    result = get_full_graph(db, limit_nodes=500)
+    cache_set("kg_full", result, _TTL_GRAPH)
+    return result
 
 
 @protected.get("/knowledge-graph/ticker/{symbol}")
 def get_ticker_kg(symbol: str, hops: int = 2, db: Session = Depends(get_db)):
     """Return the 1–3 hop subgraph centered on a ticker."""
-    from knowledge_graph import get_ticker_subgraph
     hops = max(1, min(hops, 3))
-    return get_ticker_subgraph(db, symbol.upper(), hops=hops)
+    cache_key = f"kg_ticker:{symbol.upper()}:{hops}"
+    cached = cache_get(cache_key)
+    if cached is not None:
+        return cached
+    from knowledge_graph import get_ticker_subgraph
+    result = get_ticker_subgraph(db, symbol.upper(), hops=hops)
+    cache_set(cache_key, result, _TTL_GRAPH)
+    return result
+
+
+@protected.get("/cache/stats")
+def get_cache_stats():
+    """Return current cache state for debugging."""
+    return cache_stats()
