@@ -584,7 +584,8 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
 
 def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
                         shared_context: str, market_constraint: str,
-                        investment_focus: str = "") -> dict:
+                        investment_focus: str = "",
+                        portfolio_context: str = "") -> dict:
     """
     Run one agent in its own thread with its own DB session.
     Returns a proposal dict on success, or None on error.
@@ -609,6 +610,7 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
 
         agent_context = (
             f"{focus_block}"
+            f"{portfolio_context}\n\n"
             f"{shared_context}\n\n"
             f"ALLOWED MARKETS:\n{market_constraint}\n\n"
             f"---\n\n"
@@ -649,6 +651,44 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
         db.close()
 
 
+def _build_portfolio_context(db) -> str:
+    """
+    Build a portfolio snapshot block injected into every agent's context.
+    Agents must be aware of existing positions to avoid redundant proposals
+    and to consider position sizing / risk concentration.
+    """
+    active = (
+        db.query(models.DeployedStrategy)
+        .filter(models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"]))
+        .all()
+    )
+    budget_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "trading_budget").first()
+    total_budget = float(budget_conf.value) if budget_conf else 10000.0
+    allocated = sum(s.position_size or 0.0 for s in active)
+    available = total_budget - allocated
+
+    lines = [
+        "## Current Portfolio — MUST READ BEFORE PROPOSING",
+        f"- Total budget: ${total_budget:,.2f}  |  Allocated: ${allocated:,.2f}  |  Available: ${available:,.2f}",
+    ]
+    if active:
+        lines.append("- Open positions (DO NOT duplicate these):")
+        for s in active:
+            ret = f"  ({s.current_return:+.1f}%)" if s.current_return is not None else ""
+            lines.append(
+                f"  • {s.strategy_type} {s.symbol} @ ${s.entry_price:.4f}{ret} — status: {s.status}"
+            )
+        lines.append(
+            "⚠️  RULE: Do NOT propose a ticker already in the open positions above. "
+            "Look for a DIFFERENT opportunity. If you believe an existing position needs a direction change, "
+            "state that explicitly instead of proposing it as a new trade."
+        )
+    else:
+        lines.append("- No open positions. Full budget available.")
+
+    return "\n".join(lines)
+
+
 def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: str,
                      investment_focus: str = "") -> list:
     """
@@ -660,12 +700,16 @@ def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: st
     # Snapshot agent data before handing off to threads (avoid sharing the session)
     agents_snapshot = [(ap.agent_name, ap.system_prompt) for ap in agent_prompts]
 
+    # Build portfolio context once — all agents see the same open positions
+    portfolio_context = _build_portfolio_context(db)
+
     proposals_log = []
     with ThreadPoolExecutor(max_workers=len(agents_snapshot)) as executor:
         futures = {
             executor.submit(
                 _query_single_agent,
-                name, prompt, run_id, shared_context, market_constraint, investment_focus
+                name, prompt, run_id, shared_context, market_constraint,
+                investment_focus, portfolio_context
             ): name
             for name, prompt in agents_snapshot
         }
