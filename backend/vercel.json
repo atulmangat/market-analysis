@@ -1,25 +1,20 @@
 {
   "version": 2,
   "builds": [
-    {
-      "src": "main.py",
-      "use": "@vercel/python"
-    }
+    { "src": "main.py", "use": "@vercel/python" }
   ],
   "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "main.py"
-    }
+    { "src": "/(.*)", "dest": "main.py" }
   ],
+  "functions": {
+    "main.py": { "maxDuration": 60 },
+    "api/pipeline/research.py": { "maxDuration": 300 },
+    "api/pipeline/agents.py": { "maxDuration": 300 },
+    "api/pipeline/consensus.py": { "maxDuration": 300 },
+    "api/pipeline/deploy.py": { "maxDuration": 300 }
+  },
   "crons": [
-    {
-      "path": "/api/cron/debate",
-      "schedule": "0 9 * * *"
-    },
-    {
-      "path": "/api/cron/evaluate",
-      "schedule": "0 10 * * *"
-    }
+    { "path": "/api/cron/debate", "schedule": "0 9 * * *" },
+    { "path": "/api/cron/evaluate", "schedule": "0 10 * * *" }
   ]
 }

@@ -123,6 +123,22 @@ class AgentPromptHistory(Base):
     created_at    = Column(DateTime, default=datetime.utcnow)
 
 
+class PipelineRun(Base):
+    """Tracks state between lambda steps in the debate pipeline."""
+    __tablename__ = "pipeline_runs"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    run_id        = Column(String, unique=True, index=True)
+    step          = Column(String, default="pending")  # pending | research | agents | consensus | deploy | done | error
+    shared_context = Column(Text, nullable=True)       # cached research context JSON
+    proposals_json = Column(Text, nullable=True)       # agent proposals JSON
+    enabled_markets_json = Column(Text, nullable=True) # enabled markets snapshot
+    investment_focus = Column(String, nullable=True)
+    focus_tickers  = Column(Text, nullable=True)       # JSON list if focused run
+    created_at    = Column(DateTime, default=datetime.utcnow)
+    updated_at    = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class PipelineEvent(Base):
     """Real-time log of steps within a single run_debate() execution."""
     __tablename__ = "pipeline_events"

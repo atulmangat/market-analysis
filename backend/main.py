@@ -1,4 +1,6 @@
 import os
+import json
+import threading
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -7,6 +9,7 @@ except ImportError:
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from database import engine, Base, get_db
 import models
@@ -84,13 +87,88 @@ def _verify_cron(x_vercel_cron_signature: str = Header(default="")):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 @app.post("/api/cron/debate", dependencies=[Depends(_verify_cron)])
-def cron_debate():
-    """Vercel Cron endpoint: triggers a debate round."""
-    import threading
-    from orchestrator import run_debate
-    t = threading.Thread(target=run_debate, daemon=True)
+def cron_debate(focus_tickers: list[str] | None = None):
+    """Kick off the lambda chain pipeline."""
+    import uuid as _uuid
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        # Concurrency lock
+        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+        if lock and lock.value == "1":
+            db.close()
+            return {"status": "already_running"}
+        if not lock:
+            db.add(models.AppConfig(key="debate_running", value="1"))
+        else:
+            lock.value = "1"
+
+        run_id = str(_uuid.uuid4())
+        # Load investment focus
+        focus_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "investment_focus").first()
+        investment_focus = focus_conf.value.strip() if focus_conf and focus_conf.value else ""
+
+        run = models.PipelineRun(
+            run_id=run_id,
+            step="pending",
+            investment_focus=investment_focus,
+            focus_tickers=json.dumps(focus_tickers) if focus_tickers else None,
+        )
+        db.add(run)
+
+        # Set current_run_id
+        run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
+        if run_id_conf:
+            run_id_conf.value = run_id
+        else:
+            db.add(models.AppConfig(key="current_run_id", value=run_id))
+        db.commit()
+        db.close()
+    except Exception as e:
+        db.close()
+        raise
+
+    from pipeline import _fire_next
+    cron_secret = os.getenv("CRON_SECRET", "")
+    _fire_next("/api/pipeline/research", {"run_id": run_id}, cron_secret)
+    return {"status": "pipeline_started", "run_id": run_id}
+
+
+class PipelineStepRequest(BaseModel):
+    run_id: str
+
+
+@app.post("/api/pipeline/research", dependencies=[Depends(_verify_cron)])
+def pipeline_research_endpoint(body: PipelineStepRequest):
+    from pipeline import pipeline_research
+    t = threading.Thread(target=pipeline_research, args=(body.run_id,), daemon=True)
     t.start()
-    return {"status": "triggered"}
+    return {"status": "research_started", "run_id": body.run_id}
+
+
+@app.post("/api/pipeline/agents", dependencies=[Depends(_verify_cron)])
+def pipeline_agents_endpoint(body: PipelineStepRequest):
+    from pipeline import pipeline_agents
+    t = threading.Thread(target=pipeline_agents, args=(body.run_id,), daemon=True)
+    t.start()
+    return {"status": "agents_started", "run_id": body.run_id}
+
+
+@app.post("/api/pipeline/consensus", dependencies=[Depends(_verify_cron)])
+def pipeline_consensus_endpoint(body: PipelineStepRequest):
+    from pipeline import pipeline_consensus
+    t = threading.Thread(target=pipeline_consensus, args=(body.run_id,), daemon=True)
+    t.start()
+    return {"status": "consensus_started", "run_id": body.run_id}
+
+
+@app.post("/api/pipeline/deploy", dependencies=[Depends(_verify_cron)])
+def pipeline_deploy_endpoint(body: PipelineStepRequest):
+    from pipeline import pipeline_deploy
+    t = threading.Thread(target=pipeline_deploy, args=(body.run_id,), daemon=True)
+    t.start()
+    return {"status": "deploy_started", "run_id": body.run_id}
+
 
 @app.post("/api/cron/evaluate", dependencies=[Depends(_verify_cron)])
 def cron_evaluate():

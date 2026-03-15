@@ -641,25 +641,58 @@ def approve_strategy(action: ApprovalAction, db: Session = Depends(get_db)):
 
 # --- Manual Trigger & Scheduling ---
 
-from fastapi import BackgroundTasks
-from orchestrator import run_debate
 import threading
+import json as _json
+import uuid as _uuid
 
 class TriggerRequest(BaseModel):
     tickers: List[str] | None = None
 
 @protected.post("/trigger")
 def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depends(get_db)):
-    """Manually triggers a new debate round. Optionally pass {"tickers": ["AAPL", "NVDA"]} to focus the run."""
+    """Manually triggers a new debate round via the pipeline chain. Optionally pass {"tickers": ["AAPL", "NVDA"]} to focus the run."""
     is_running = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
     if is_running and is_running.value == "1":
         return {"status": "error", "message": "A data extraction is already running. Please wait."}
 
     focus = [t.strip().upper() for t in body.tickers if t.strip()] if body.tickers else None
-    t = threading.Thread(target=run_debate, args=(focus,), daemon=True)
-    t.start()
-    msg = f"Focused run on: {', '.join(focus)}" if focus else "Full pipeline started."
-    return {"status": "success", "message": msg}
+
+    # Acquire concurrency lock
+    lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+    if not lock:
+        db.add(models.AppConfig(key="debate_running", value="1"))
+    else:
+        lock.value = "1"
+
+    run_id = str(_uuid.uuid4())
+
+    # Load investment focus
+    focus_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "investment_focus").first()
+    investment_focus = focus_conf.value.strip() if focus_conf and focus_conf.value else ""
+
+    run = models.PipelineRun(
+        run_id=run_id,
+        step="pending",
+        investment_focus=investment_focus,
+        focus_tickers=_json.dumps(focus) if focus else None,
+    )
+    db.add(run)
+
+    # Set current_run_id
+    run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
+    if run_id_conf:
+        run_id_conf.value = run_id
+    else:
+        db.add(models.AppConfig(key="current_run_id", value=run_id))
+    db.commit()
+
+    from pipeline import _fire_next
+    import os
+    cron_secret = os.getenv("CRON_SECRET", "")
+    _fire_next("/api/pipeline/research", {"run_id": run_id}, cron_secret)
+
+    msg = f"Focused pipeline run on: {', '.join(focus)}" if focus else "Full pipeline started."
+    return {"status": "success", "message": msg, "run_id": run_id}
 
 @protected.get("/system/status")
 def get_system_status(db: Session = Depends(get_db)):
