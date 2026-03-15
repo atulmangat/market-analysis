@@ -10,7 +10,6 @@ Chain:
 
 import os
 import json
-import threading
 from database import SessionLocal
 import models
 from orchestrator import (
@@ -36,23 +35,12 @@ def _get_base_url() -> str:
     return "http://localhost:8000"
 
 
-def _fire_next(path: str, payload: dict, cron_secret: str):
-    """Fire-and-forget POST to the next pipeline step in a background thread."""
-    import httpx
-
-    base = _get_base_url()
-    url = f"{base}{path}"
-    headers = {"x-vercel-cron-signature": cron_secret, "Content-Type": "application/json"}
-
-    def _post():
-        try:
-            # Short timeout — we don't wait for the response, just trigger it
-            httpx.post(url, json=payload, headers=headers, timeout=5)
-        except Exception as e:
-            print(f"[Pipeline] Fire-and-forget to {url} failed: {e}")
-
-    t = threading.Thread(target=_post, daemon=True)
-    t.start()
+def run_full_pipeline(run_id: str):
+    """Run all pipeline steps sequentially in a single call."""
+    pipeline_research(run_id)
+    pipeline_agents(run_id)
+    pipeline_consensus(run_id)
+    pipeline_deploy(run_id)
 
 
 def _get_run(db, run_id: str) -> models.PipelineRun | None:
@@ -103,10 +91,7 @@ def pipeline_research(run_id: str):
             "research_log": research_log,
         })
         _set_step(db, run, "agents")
-        _log(db, run_id, "WEB_RESEARCH", "DONE", "Research cached — firing agents step")
-
-        cron_secret = os.getenv("CRON_SECRET", "")
-        _fire_next("/api/pipeline/agents", {"run_id": run_id}, cron_secret)
+        _log(db, run_id, "WEB_RESEARCH", "DONE", "Research cached — agents step next")
 
     except Exception as e:
         _log(db, run_id, "WEB_RESEARCH", "ERROR", str(e)[:300])
@@ -150,10 +135,7 @@ def pipeline_agents(run_id: str):
         run.proposals_json = json.dumps(proposals_log)
         _set_step(db, run, "consensus")
         _log(db, run_id, "DEBATE_PANEL", "DONE",
-             f"{len(proposals_log)} proposals — firing consensus step")
-
-        cron_secret = os.getenv("CRON_SECRET", "")
-        _fire_next("/api/pipeline/consensus", {"run_id": run_id}, cron_secret)
+             f"{len(proposals_log)} proposals — consensus step next")
 
     except Exception as e:
         _log(db, run_id, "DEBATE_PANEL", "ERROR", str(e)[:300])
@@ -210,10 +192,7 @@ def pipeline_consensus(run_id: str):
             "verdict": verdict,
         })
         _set_step(db, run, "deploy")
-        _log(db, run_id, "JUDGE", "DONE", f"Verdict: {best_action} {best_ticker} — firing deploy step")
-
-        cron_secret = os.getenv("CRON_SECRET", "")
-        _fire_next("/api/pipeline/deploy", {"run_id": run_id}, cron_secret)
+        _log(db, run_id, "JUDGE", "DONE", f"Verdict: {best_action} {best_ticker} — deploy step next")
 
     except Exception as e:
         _log(db, run_id, "JUDGE", "ERROR", str(e)[:300])
@@ -266,14 +245,41 @@ def pipeline_deploy(run_id: str):
             f"Rationale: {judge_reasoning[:200]}"
         )
 
-        strategy = models.DeployedStrategy(
-            symbol=best_ticker,
-            strategy_type=best_action,
-            entry_price=entry_price,
-            reasoning_summary=summary_text,
-            status=initial_status,
+        # Enforce 1 strategy per ticker: find any active/pending strategy for this ticker
+        from datetime import datetime as _dt
+        existing = (
+            db.query(models.DeployedStrategy)
+            .filter(
+                models.DeployedStrategy.symbol == best_ticker,
+                models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"]),
+            )
+            .order_by(models.DeployedStrategy.id.desc())
+            .first()
         )
-        db.add(strategy)
+        if existing:
+            action_changed = existing.strategy_type != best_action
+            existing.strategy_type    = best_action
+            existing.entry_price      = entry_price
+            existing.reasoning_summary = summary_text
+            existing.status           = initial_status
+            existing.notes = (
+                f"{'Direction reversed to ' + best_action + ' — ' if action_changed else 'Reaffirmed '}"
+                f"{votes_str} agents agreed."
+            )
+            # Reset any prior close fields
+            existing.exit_price   = None
+            existing.close_reason = None
+            existing.closed_at    = None
+            strategy = existing
+        else:
+            strategy = models.DeployedStrategy(
+                symbol=best_ticker,
+                strategy_type=best_action,
+                entry_price=entry_price,
+                reasoning_summary=summary_text,
+                status=initial_status,
+            )
+            db.add(strategy)
 
         debate_round = models.DebateRound(
             consensus_ticker=best_ticker,
@@ -287,6 +293,10 @@ def pipeline_deploy(run_id: str):
         db.add(debate_round)
         db.commit()
         db.refresh(debate_round)
+
+        # Link strategy back to its debate round
+        strategy.debate_round_id = debate_round.id
+        db.commit()
 
         _log(db, run_id, "DEPLOY", "DONE",
              f"Strategy saved (status={initial_status}) — Debate round #{debate_round.id}")
@@ -314,6 +324,21 @@ def pipeline_deploy(run_id: str):
             prune_old_memory(db, agent_name, keep=50)
 
         db.commit()
+
+        # Generate and store the full strategy report (chart + fundamentals) so the
+        # frontend can load it instantly without calling yfinance on-demand.
+        try:
+            from api import _build_chart, _build_fundamentals
+            _log(db, run_id, "MEMORY_WRITE", "IN_PROGRESS", f"Generating report for {best_ticker}…")
+            report = {
+                "chart":        _build_chart(best_ticker, entry_price, debate_round.timestamp),
+                "fundamentals": _build_fundamentals(best_ticker),
+            }
+            debate_round.report_json = json.dumps(report)
+            db.commit()
+        except Exception as re_err:
+            print(f"[pipeline_deploy] Report generation failed (non-fatal): {re_err}")
+
         _set_step(db, run, "done")
         _log(db, run_id, "MEMORY_WRITE", "DONE", "Pipeline complete")
 

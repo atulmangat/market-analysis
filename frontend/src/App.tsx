@@ -1,8 +1,15 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 interface Prediction { id: number; symbol: string; agent_name: string; prediction: string; reasoning: string; confidence: number; score?: number; }
-interface Strategy { id: number; symbol: string; strategy_type: string; entry_price: number; current_return: number; reasoning_summary: string; status: string; timestamp: string; position_size: number | null; exit_price: number | null; realized_pnl: number | null; close_reason: string | null; closed_at: string | null; notes: string | null; }
-interface PortfolioPnl { total_budget: number; allocated: number; available: number; realized_pnl: number; unrealized_pnl: number; total_pnl: number; total_pnl_pct: number; positions: (Strategy & { pnl_usd: number | null; pnl_pct: number | null; is_open: boolean; current_price?: number | null })[]; }
+interface Strategy { id: number; symbol: string; strategy_type: string; entry_price: number; current_return: number; reasoning_summary: string; status: string; timestamp: string; position_size: number | null; exit_price: number | null; realized_pnl: number | null; close_reason: string | null; closed_at: string | null; notes: string | null; debate_round_id?: number | null; }
+interface ReportCandle { date: string; open: number; high: number; low: number; close: number; volume: number; }
+interface StrategyReport {
+  strategy: Strategy;
+  debate: { id: number; timestamp: string; consensus_votes: string; judge_reasoning: string | null; enabled_markets: string | null; proposals: (Proposal & { matched_consensus: boolean })[]; } | null;
+  chart: { symbol: string; candles: ReportCandle[]; entry_price: number; entry_date: string | null; error?: string; };
+  fundamentals: { name: string | null; sector: string | null; industry: string | null; market_cap: number | null; pe_ratio: number | null; forward_pe: number | null; '52w_high': number | null; '52w_low': number | null; avg_volume: number | null; beta: number | null; dividend_yield: number | null; currency: string; quote_type: string | null; description?: string | null; error?: string; };
+}
+interface PortfolioPnl { total_budget: number; allocated: number; available: number; realized_pnl: number; unrealized_pnl: number; total_pnl: number; total_pnl_pct: number; using_assumed_sizes?: boolean; positions: (Strategy & { pnl_usd: number | null; pnl_pct: number | null; is_open: boolean; current_price?: number | null; assumed_size?: number | null })[]; }
 interface MarketConfig { id: number; market_name: string; is_enabled: number; }
 interface DebateRound { id: number; timestamp: string; consensus_ticker: string; consensus_action: string; consensus_votes: string; proposals_json: string; enabled_markets: string; research_context?: string; judge_reasoning?: string; }
 interface Proposal { agent_name: string; ticker: string; action: string; reasoning: string; }
@@ -12,8 +19,9 @@ interface AgentFitness { agent_name: string; generation: number; fitness_score: 
 interface AgentEvolution { id: number; generation: number; fitness_score: number | null; win_rate: number | null; avg_return: number | null; total_scored: number; evolution_reason: string | null; system_prompt: string; replaced_at: string | null; created_at: string; }
 interface WebResearch { id: number; title: string; snippet: string; source_url: string; fetched_at: string; }
 interface PipelineEvent { id: number; step: string; agent_name: string | null; status: string; detail: string | null; created_at: string; }
-interface PipelineRun { run_id: string; started_at: string; ended_at: string; event_count: number; status: 'running' | 'done' | 'error'; deploy_detail: string | null; }
-interface LiveQuote { market: string; symbol: string; name: string; price: number | null; prev_close: number | null; change_pct: number | null; volume: number | null; error?: string; }
+interface PipelineRunOutput { ticker: string; action: string; votes: string; judge_reasoning: string; proposals: { agent_name: string; ticker: string; action: string; reasoning: string }[]; strategy_id: number | null; debate_id: number | null; }
+interface PipelineRun { run_id: string; started_at: string; ended_at: string; event_count: number; status: 'running' | 'done' | 'error'; deploy_detail: string | null; output: PipelineRunOutput | null; }
+interface LiveQuote { market: string; symbol: string; name: string; price: number | null; prev_close: number | null; change_pct: number | null; volume: number | null; week_closes?: number[]; week_change_pct?: number | null; error?: string; }
 interface MarketEvent { market: string; symbol: string; name: string; event_type: string; date: string; detail: string | null; url?: string | null; title?: string | null; }
 
 const MARKET_ICONS: Record<string, string> = { US: '🇺🇸', India: '🇮🇳', Crypto: '₿', MCX: '⛏️' };
@@ -193,6 +201,518 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void 
     >
       <span className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform duration-200 ${checked ? 'translate-x-4' : 'translate-x-0.5'}`} />
     </button>
+  );
+}
+
+// ── Formatting helpers ─────────────────────────────────────────────────────
+function fmtMarketCap(n: number | null | undefined): string {
+  if (!n) return 'N/A';
+  if (n >= 1e12) return `$${(n / 1e12).toFixed(2)}T`;
+  if (n >= 1e9)  return `$${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6)  return `$${(n / 1e6).toFixed(0)}M`;
+  return `$${n.toLocaleString()}`;
+}
+function fmtVol(n: number | null | undefined): string {
+  if (!n) return 'N/A';
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  return n.toLocaleString();
+}
+
+// ── Detect asset class from symbol / quote_type ────────────────────────────
+type AssetClass = 'crypto' | 'stock' | 'commodity';
+function detectAssetClass(symbol: string, quoteType: string | null | undefined): AssetClass {
+  if (quoteType === 'CRYPTOCURRENCY' || symbol.endsWith('-USD')) return 'crypto';
+  if (quoteType === 'FUTURE' || symbol.endsWith('=F')) return 'commodity';
+  return 'stock';
+}
+
+// ── Shared: price + volume chart ───────────────────────────────────────────
+function PriceVolumeChart({ candles, entryPrice, accentColor }: {
+  candles: ReportCandle[];
+  entryPrice: number;
+  accentColor: string;
+}) {
+  if (!candles.length) return <div className="h-52 flex items-center justify-center text-textDim text-xs">No chart data</div>;
+  const closes = candles.map(c => c.close);
+  const volumes = candles.map(c => c.volume);
+  const maxVol = Math.max(...volumes) || 1;
+  const minY = Math.min(...closes) * 0.997;
+  const maxY = Math.max(...closes) * 1.003;
+  const W = 600, H = 160, VH = 32, GAP = 6;
+  const n = candles.length;
+  const toX = (i: number) => n === 1 ? W / 2 : (i / (n - 1)) * W;
+  const toY = (v: number) => H - ((v - minY) / (maxY - minY || 1)) * H;
+  const lastClose = closes[closes.length - 1];
+  const isUp = lastClose >= entryPrice;
+  const lineColor = isUp ? '#22c55e' : '#ef4444';
+  const entryY = toY(entryPrice);
+  const pathD = `M ${closes.map((c, i) => `${toX(i)},${toY(c)}`).join(' L ')} L ${W},${H} L 0,${H} Z`;
+  const pts = closes.map((c, i) => `${toX(i)},${toY(c)}`).join(' ');
+  const barW = Math.max(2, W / n - 1);
+  const totalH = H + GAP + VH;
+  return (
+    <div className="w-full">
+      <svg viewBox={`0 0 ${W} ${totalH}`} preserveAspectRatio="none" className="w-full" style={{ height: 220 }}>
+        <defs>
+          <linearGradient id={`cg-${accentColor}`} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor={lineColor} stopOpacity="0.3" />
+            <stop offset="100%" stopColor={lineColor} stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        {/* Price area */}
+        <path d={pathD} fill={`url(#cg-${accentColor})`} />
+        <polyline points={pts} fill="none" stroke={lineColor} strokeWidth="1.8" strokeLinejoin="round" />
+        {entryPrice > 0 && entryY >= 0 && entryY <= H && (
+          <>
+            <line x1="0" y1={entryY} x2={W} y2={entryY} stroke="#f59e0b" strokeWidth="1" strokeDasharray="5,3" opacity="0.8" />
+            <rect x="0" y={entryY - 11} width="60" height="11" fill="#f59e0b" opacity="0.15" rx="2" />
+            <text x="4" y={entryY - 2} fill="#f59e0b" fontSize="8.5" fontWeight="600">Entry {entryPrice.toFixed(2)}</text>
+          </>
+        )}
+        <circle cx={toX(n - 1)} cy={toY(lastClose)} r="3.5" fill={lineColor} />
+        {/* Volume bars */}
+        {candles.map((c, i) => {
+          const bh = ((c.volume / maxVol) * VH) || 1;
+          const bx = toX(i) - barW / 2;
+          const by = H + GAP + (VH - bh);
+          return <rect key={i} x={bx} y={by} width={barW} height={bh} fill={lineColor} opacity="0.35" rx="1" />;
+        })}
+      </svg>
+      <div className="flex justify-between text-[10px] text-textDim mt-0.5 px-1">
+        <span>{candles[0]?.date}</span>
+        <span className={`font-semibold tabular-nums ${isUp ? 'text-up' : 'text-down'}`}>{lastClose.toFixed(4)}</span>
+        <span>{candles[n - 1]?.date}</span>
+      </div>
+    </div>
+  );
+}
+
+// ── Shared: stat pill ──────────────────────────────────────────────────────
+function StatPill({ label, value, accent }: { label: string; value: string; accent?: string }) {
+  return (
+    <div className={`bg-surface2 border rounded-lg px-3 py-2.5 ${accent ?? 'border-borderLight'}`}>
+      <p className="text-[9px] text-textDim uppercase tracking-wider mb-0.5">{label}</p>
+      <p className="text-xs font-semibold text-textMain truncate">{value}</p>
+    </div>
+  );
+}
+
+// ── Shared: judge + proposals section ─────────────────────────────────────
+function DebateSection({ d }: { d: StrategyReport['debate'] }) {
+  return (
+    <>
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Judge Verdict</p>
+        {d ? (
+          <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-500/20 rounded-xl p-4">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-xs font-semibold text-amber-600 dark:text-amber-400">⚖ Consensus</span>
+              <span className="text-[10px] text-textDim font-mono">{d.consensus_votes} agents agreed</span>
+              {d.enabled_markets && <span className="text-[10px] text-textDim">· {d.enabled_markets}</span>}
+            </div>
+            <p className="text-[11px] text-textMuted leading-relaxed">{d.judge_reasoning ?? 'No reasoning recorded.'}</p>
+          </div>
+        ) : (
+          <p className="text-xs text-textDim">No debate linked to this strategy.</p>
+        )}
+      </div>
+      {d && d.proposals.length > 0 && (
+        <div className="px-6 py-5">
+          <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Agent Proposals</p>
+          <div className="space-y-3">
+            {d.proposals.map((p, i) => (
+              <div key={i} className={`rounded-xl border p-4 ${p.matched_consensus ? 'border-brand-500/30 bg-brand-900/10' : 'border-borderLight bg-surface2'}`}>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-semibold text-brand-400">{p.agent_name}</span>
+                    {p.matched_consensus && <span className="text-[9px] bg-brand-500/20 text-brand-300 px-1.5 py-0.5 rounded font-semibold">✓ SELECTED</span>}
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Badge type={p.action} />
+                    <span className="text-[10px] text-textDim font-mono">{p.ticker}</span>
+                  </div>
+                </div>
+                <p className="text-[11px] text-textMuted leading-relaxed">{p.reasoning}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ── Template: Crypto ───────────────────────────────────────────────────────
+function CryptoReportTemplate({ report }: { report: StrategyReport }) {
+  const { strategy: s, fundamentals: f, chart: ch, debate: d } = report;
+  const lastClose = ch.candles.at(-1)?.close ?? s.entry_price;
+  const change30d = ch.candles.length >= 2
+    ? ((ch.candles.at(-1)!.close - ch.candles[0].close) / ch.candles[0].close * 100)
+    : null;
+  const range52wLow = f['52w_low'];
+  const range52wHigh = f['52w_high'];
+  const posIn52w = (range52wLow != null && range52wHigh != null && range52wHigh > range52wLow)
+    ? ((lastClose - range52wLow) / (range52wHigh - range52wLow) * 100)
+    : null;
+
+  return (
+    <div className="divide-y divide-borderLight">
+      {/* Hero banner */}
+      <div className="px-6 py-5 bg-gradient-to-br from-violet-950/40 to-surface">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-2xl font-bold text-textMain font-mono">{s.symbol.replace('-USD','')}</span>
+              <span className="text-sm text-textDim">/USD</span>
+              <Badge type={s.strategy_type} />
+            </div>
+            <p className="text-[11px] text-textDim">{f.name ?? s.symbol} · Cryptocurrency</p>
+          </div>
+          <div className="text-right">
+            <p className="text-2xl font-light font-mono text-textMain">${lastClose.toFixed(2)}</p>
+            {change30d != null && (
+              <p className={`text-sm font-semibold ${change30d >= 0 ? 'text-up' : 'text-down'}`}>
+                {change30d >= 0 ? '+' : ''}{change30d.toFixed(2)}% (30d)
+              </p>
+            )}
+          </div>
+        </div>
+        {/* 52-week position bar */}
+        {posIn52w != null && (
+          <div className="mt-1">
+            <div className="flex justify-between text-[9px] text-textDim mb-1">
+              <span>52w Low ${range52wLow!.toFixed(2)}</span>
+              <span className="text-violet-400">{posIn52w.toFixed(0)}% of range</span>
+              <span>52w High ${range52wHigh!.toFixed(2)}</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-surface3 overflow-hidden">
+              <div className="h-full rounded-full bg-violet-500" style={{ width: `${posIn52w}%` }} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Chart */}
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Price & Volume — 30 Days</p>
+        {ch.error ? <p className="text-xs text-textDim py-4">Chart unavailable</p>
+          : <PriceVolumeChart candles={ch.candles} entryPrice={ch.entry_price} accentColor="violet" />}
+      </div>
+
+      {/* Key metrics */}
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">On-Chain & Market Metrics</p>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {f.market_cap && <StatPill label="Market Cap" value={fmtMarketCap(f.market_cap)} accent="border-violet-500/30" />}
+          {f.avg_volume && <StatPill label="Avg Daily Volume" value={fmtVol(f.avg_volume)} />}
+          {f['52w_high'] && <StatPill label="52w High" value={`$${f['52w_high']!.toFixed(2)}`} />}
+          {f['52w_low'] && <StatPill label="52w Low" value={`$${f['52w_low']!.toFixed(2)}`} />}
+          <StatPill label="Currency" value={f.currency} />
+          <StatPill label="Entry Price" value={`$${s.entry_price.toFixed(4)}`} accent="border-amber-500/30" />
+        </div>
+      </div>
+
+      <DebateSection d={d} />
+    </div>
+  );
+}
+
+// ── Template: Stock (Equity) ───────────────────────────────────────────────
+function StockReportTemplate({ report }: { report: StrategyReport }) {
+  const { strategy: s, fundamentals: f, chart: ch, debate: d } = report;
+  const lastClose = ch.candles.at(-1)?.close ?? s.entry_price;
+  const change30d = ch.candles.length >= 2
+    ? ((ch.candles.at(-1)!.close - ch.candles[0].close) / ch.candles[0].close * 100)
+    : null;
+  const range52wLow = f['52w_low'];
+  const range52wHigh = f['52w_high'];
+  const posIn52w = (range52wLow != null && range52wHigh != null && range52wHigh > range52wLow)
+    ? ((lastClose - range52wLow) / (range52wHigh - range52wLow) * 100)
+    : null;
+
+  // Valuation score — rough composite
+  const peScore = f.pe_ratio != null ? (f.pe_ratio < 15 ? 'Undervalued' : f.pe_ratio < 30 ? 'Fair' : 'Premium') : null;
+
+  return (
+    <div className="divide-y divide-borderLight">
+      {/* Hero */}
+      <div className="px-6 py-5 bg-gradient-to-br from-brand-950/40 to-surface">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-2xl font-bold text-textMain font-mono">{s.symbol.replace('.NS','')}</span>
+              <Badge type={s.strategy_type} />
+              <StatusChip status={s.status} />
+            </div>
+            <p className="text-[11px] text-textDim">{f.name ?? s.symbol}</p>
+            {(f.sector || f.industry) && (
+              <p className="text-[10px] text-brand-400 mt-0.5">{[f.sector, f.industry].filter(Boolean).join(' · ')}</p>
+            )}
+          </div>
+          <div className="text-right">
+            <p className="text-2xl font-light font-mono text-textMain">${lastClose.toFixed(2)}</p>
+            {change30d != null && (
+              <p className={`text-sm font-semibold ${change30d >= 0 ? 'text-up' : 'text-down'}`}>
+                {change30d >= 0 ? '+' : ''}{change30d.toFixed(2)}% (30d)
+              </p>
+            )}
+          </div>
+        </div>
+        {posIn52w != null && (
+          <div>
+            <div className="flex justify-between text-[9px] text-textDim mb-1">
+              <span>52w Low ${range52wLow!.toFixed(2)}</span>
+              <span className="text-brand-400">{posIn52w.toFixed(0)}% of annual range</span>
+              <span>52w High ${range52wHigh!.toFixed(2)}</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-surface3 overflow-hidden">
+              <div className="h-full rounded-full bg-brand-500" style={{ width: `${posIn52w}%` }} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Chart */}
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Price & Volume — 30 Days</p>
+        {ch.error ? <p className="text-xs text-textDim py-4">Chart unavailable</p>
+          : <PriceVolumeChart candles={ch.candles} entryPrice={ch.entry_price} accentColor="brand" />}
+      </div>
+
+      {/* Valuation */}
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Valuation & Fundamentals</p>
+        {f.description && (
+          <p className="text-[11px] text-textMuted leading-relaxed mb-3 line-clamp-3">{f.description}</p>
+        )}
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {f.market_cap && <StatPill label="Market Cap" value={fmtMarketCap(f.market_cap)} accent="border-brand-500/30" />}
+          {f.pe_ratio != null && (
+            <StatPill label="P/E (TTM)"
+              value={`${f.pe_ratio.toFixed(1)}x${peScore ? ` · ${peScore}` : ''}`}
+              accent={peScore === 'Undervalued' ? 'border-up/40' : peScore === 'Premium' ? 'border-down/40' : 'border-borderLight'}
+            />
+          )}
+          {f.forward_pe != null && <StatPill label="Fwd P/E" value={`${f.forward_pe.toFixed(1)}x`} />}
+          {f.beta != null && <StatPill label="Beta" value={`${f.beta.toFixed(2)}${f.beta > 1.5 ? ' · High vol' : f.beta < 0.8 ? ' · Low vol' : ''}`} />}
+          {f.dividend_yield != null && <StatPill label="Div Yield" value={`${(f.dividend_yield * 100).toFixed(2)}%`} accent="border-up/30" />}
+          {f.avg_volume && <StatPill label="Avg Volume" value={fmtVol(f.avg_volume)} />}
+          {f['52w_high'] && <StatPill label="52w High" value={`$${f['52w_high']!.toFixed(2)}`} />}
+          {f['52w_low'] && <StatPill label="52w Low" value={`$${f['52w_low']!.toFixed(2)}`} />}
+          <StatPill label="Entry Price" value={`$${s.entry_price.toFixed(4)}`} accent="border-amber-500/30" />
+          {s.current_return !== undefined && (
+            <StatPill label="Current Return"
+              value={`${s.current_return >= 0 ? '+' : ''}${s.current_return.toFixed(2)}%`}
+              accent={s.current_return >= 0 ? 'border-up/40' : 'border-down/40'}
+            />
+          )}
+        </div>
+      </div>
+
+      <DebateSection d={d} />
+    </div>
+  );
+}
+
+// ── Template: Commodity / Futures ──────────────────────────────────────────
+function CommodityReportTemplate({ report }: { report: StrategyReport }) {
+  const { strategy: s, fundamentals: f, chart: ch, debate: d } = report;
+  const lastClose = ch.candles.at(-1)?.close ?? s.entry_price;
+  const change30d = ch.candles.length >= 2
+    ? ((ch.candles.at(-1)!.close - ch.candles[0].close) / ch.candles[0].close * 100)
+    : null;
+  const range52wLow = f['52w_low'];
+  const range52wHigh = f['52w_high'];
+  const posIn52w = (range52wLow != null && range52wHigh != null && range52wHigh > range52wLow)
+    ? ((lastClose - range52wLow) / (range52wHigh - range52wLow) * 100)
+    : null;
+
+  // Commodity name mapping
+  const commodityLabels: Record<string, string> = {
+    'GC=F': 'Gold Futures', 'SI=F': 'Silver Futures', 'CL=F': 'Crude Oil WTI',
+    'NG=F': 'Natural Gas', 'HG=F': 'Copper Futures',
+  };
+  const commodityLabel = commodityLabels[s.symbol] ?? f.name ?? s.symbol;
+
+  // Determine if price is near support (52w low) or resistance (52w high)
+  const priceZone = posIn52w != null
+    ? posIn52w < 20 ? 'Near Support' : posIn52w > 80 ? 'Near Resistance' : 'Mid Range'
+    : null;
+
+  return (
+    <div className="divide-y divide-borderLight">
+      {/* Hero */}
+      <div className="px-6 py-5 bg-gradient-to-br from-amber-950/40 to-surface">
+        <div className="flex items-start justify-between mb-4">
+          <div>
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-2xl font-bold text-textMain font-mono">{s.symbol.replace('=F','')}</span>
+              <span className="text-xs text-amber-500 font-semibold border border-amber-500/30 px-1.5 py-0.5 rounded">FUTURES</span>
+              <Badge type={s.strategy_type} />
+            </div>
+            <p className="text-[11px] text-textDim">{commodityLabel}</p>
+            {priceZone && (
+              <p className={`text-[10px] mt-0.5 font-semibold ${priceZone === 'Near Support' ? 'text-up' : priceZone === 'Near Resistance' ? 'text-down' : 'text-amber-400'}`}>
+                ● {priceZone}
+              </p>
+            )}
+          </div>
+          <div className="text-right">
+            <p className="text-2xl font-light font-mono text-textMain">${lastClose.toFixed(2)}</p>
+            {change30d != null && (
+              <p className={`text-sm font-semibold ${change30d >= 0 ? 'text-up' : 'text-down'}`}>
+                {change30d >= 0 ? '+' : ''}{change30d.toFixed(2)}% (30d)
+              </p>
+            )}
+          </div>
+        </div>
+        {posIn52w != null && (
+          <div>
+            <div className="flex justify-between text-[9px] text-textDim mb-1">
+              <span>52w Low ${range52wLow!.toFixed(2)}</span>
+              <span className="text-amber-400">{posIn52w.toFixed(0)}% of annual range</span>
+              <span>52w High ${range52wHigh!.toFixed(2)}</span>
+            </div>
+            <div className="h-1.5 rounded-full bg-surface3 overflow-hidden">
+              <div className="h-full rounded-full bg-amber-500" style={{ width: `${posIn52w}%` }} />
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Chart */}
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Price & Volume — 30 Days</p>
+        {ch.error ? <p className="text-xs text-textDim py-4">Chart unavailable</p>
+          : <PriceVolumeChart candles={ch.candles} entryPrice={ch.entry_price} accentColor="amber" />}
+      </div>
+
+      {/* Contract & market metrics */}
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Contract & Market Data</p>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {f['52w_high'] && <StatPill label="52w High" value={`$${f['52w_high']!.toFixed(2)}`} accent="border-down/30" />}
+          {f['52w_low'] && <StatPill label="52w Low" value={`$${f['52w_low']!.toFixed(2)}`} accent="border-up/30" />}
+          {f.avg_volume && <StatPill label="Avg Volume" value={fmtVol(f.avg_volume)} />}
+          <StatPill label="Entry Price" value={`$${s.entry_price.toFixed(4)}`} accent="border-amber-500/30" />
+          <StatPill label="Currency" value={f.currency} />
+          {priceZone && <StatPill label="Price Zone"
+            value={priceZone}
+            accent={priceZone === 'Near Support' ? 'border-up/40' : priceZone === 'Near Resistance' ? 'border-down/40' : 'border-amber-500/30'}
+          />}
+          {s.current_return !== undefined && (
+            <StatPill label="Current Return"
+              value={`${s.current_return >= 0 ? '+' : ''}${s.current_return.toFixed(2)}%`}
+              accent={s.current_return >= 0 ? 'border-up/40' : 'border-down/40'}
+            />
+          )}
+        </div>
+      </div>
+
+      <DebateSection d={d} />
+    </div>
+  );
+}
+
+// ── Toast ────────────────────────────────────────────────────────────────────
+interface Toast { id: number; msg: string; type: 'ok' | 'err' | 'info'; }
+let _toastId = 0;
+function useToast() {
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const push = (msg: string, type: Toast['type'] = 'ok') => {
+    const id = ++_toastId;
+    setToasts(p => [...p, { id, msg, type }]);
+    setTimeout(() => setToasts(p => p.filter(t => t.id !== id)), 3000);
+  };
+  return { toasts, push };
+}
+function ToastList({ toasts }: { toasts: Toast[] }) {
+  if (!toasts.length) return null;
+  return (
+    <div className="fixed bottom-5 left-1/2 -translate-x-1/2 z-[200] flex flex-col items-center gap-2 pointer-events-none">
+      {toasts.map(t => (
+        <div key={t.id} className={`px-4 py-2 rounded-lg text-xs font-medium shadow-lg border animate-fade-in ${
+          t.type === 'err' ? 'bg-down-bg border-down/30 text-down-text' :
+          t.type === 'info' ? 'bg-surface2 border-borderMid text-textMain' :
+          'bg-up-bg border-up/30 text-up-text'
+        }`}>{t.msg}</div>
+      ))}
+    </div>
+  );
+}
+
+// ── Strategy Report Panel (router) ─────────────────────────────────────────
+function StrategyReportPanel({ report, loading, error, onClose }: { report: StrategyReport | null; loading: boolean; error?: string | null; onClose: () => void }) {
+  const s = report?.strategy;
+  const assetClass = s ? detectAssetClass(s.symbol, report?.fundamentals?.quote_type) : 'stock';
+
+  const assetLabel: Record<AssetClass, string> = {
+    crypto: '₿ Crypto',
+    stock: '◈ Equity',
+    commodity: '⛏ Commodity',
+  };
+  const headerAccent: Record<AssetClass, string> = {
+    crypto:    'border-violet-500/30',
+    stock:     'border-brand-500/30',
+    commodity: 'border-amber-500/30',
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex">
+      <div className="flex-1 bg-black/50 backdrop-blur-sm" onClick={onClose} />
+      <div className={`w-full max-w-2xl h-full bg-surface border-l flex flex-col shadow-2xl overflow-hidden ${s ? headerAccent[assetClass] : 'border-borderLight'}`}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-6 py-4 border-b border-borderLight bg-surface2 shrink-0">
+          {s ? (
+            <div className="flex items-center gap-3">
+              <div className={`h-9 w-9 rounded-lg border flex items-center justify-center text-xs font-bold text-textMain ${
+                assetClass === 'crypto' ? 'bg-violet-950/60 border-violet-500/30 text-violet-300' :
+                assetClass === 'commodity' ? 'bg-amber-950/60 border-amber-500/30 text-amber-300' :
+                'bg-surface3 border-borderMid'
+              }`}>
+                {s.symbol.replace(/[.\-=]/g, '').substring(0, 3).toUpperCase()}
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-semibold text-textMain">{s.symbol}</span>
+                  <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded border ${
+                    assetClass === 'crypto' ? 'text-violet-400 border-violet-500/30 bg-violet-950/40' :
+                    assetClass === 'commodity' ? 'text-amber-400 border-amber-500/30 bg-amber-950/40' :
+                    'text-brand-400 border-brand-500/30 bg-brand-950/40'
+                  }`}>{assetLabel[assetClass]}</span>
+                </div>
+                <p className="text-[11px] text-textDim mt-0.5">Strategy Report · {new Date(s.timestamp).toLocaleString()}</p>
+              </div>
+            </div>
+          ) : (
+            <span className="text-sm text-textMuted">Strategy Report</span>
+          )}
+          <button onClick={onClose} className="text-textDim hover:text-textMain text-xl leading-none ml-4">×</button>
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto">
+          {loading ? (
+            <div className="flex flex-col items-center justify-center h-64 gap-3">
+              <div className="w-6 h-6 rounded-full border-2 border-brand-500 border-t-transparent animate-spin" />
+              <p className="text-sm text-textDim">Loading report…</p>
+            </div>
+          ) : !report ? (
+            <div className="p-6 text-center space-y-2">
+              <p className="text-sm font-semibold text-down">Failed to load report</p>
+              {error && <p className="text-xs text-textDim font-mono bg-surface3 rounded p-2">{error}</p>}
+            </div>
+          ) : assetClass === 'crypto' ? (
+            <CryptoReportTemplate report={report} />
+          ) : assetClass === 'commodity' ? (
+            <CommodityReportTemplate report={report} />
+          ) : (
+            <StockReportTemplate report={report} />
+          )}
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -402,6 +922,9 @@ function LoginModal({ onLogin, onClose }: { onLogin: () => void; onClose: () => 
         const { token } = await res.json();
         setToken(token);
         onLogin();
+      } else if (res.status === 429) {
+        const data = await res.json().catch(() => ({}));
+        setError(data.detail ?? 'Too many attempts. Please wait before trying again.');
       } else {
         setError('Incorrect password. Try again.');
         setPassword('');
@@ -686,20 +1209,23 @@ function LandingPage({ onLogin }: { onLogin: () => void }) {
 // ── Main App ───────────────────────────────────────────────────────────────
 
 function AppInner() {
+  const { toasts, push: toast } = useToast();
   const [predictions, setPredictions]       = useState<Prediction[]>([]);
   const [strategies, setStrategies]         = useState<Strategy[]>([]);
-  const [markets, setMarkets]               = useState<MarketConfig[]>([]);
+  const [markets, setMarkets]               = useState<MarketConfig[]>(() => {
+    try { return JSON.parse(localStorage.getItem('markets') ?? 'null') ?? []; } catch { return []; }
+  });
   const [debates, setDebates]               = useState<DebateRound[]>([]);
   const [memories, setMemories]             = useState<AgentMemory[]>([]);
   const [agents, setAgents]                 = useState<AgentPrompt[]>([]);
   const [agentFitness, setAgentFitness]     = useState<AgentFitness[]>([]);
   const [agentEvolution, setAgentEvolution] = useState<AgentEvolution[]>([]);
   const [evolutionAgent, setEvolutionAgent] = useState<string | null>(null);
-  const [research, setResearch]             = useState<WebResearch[]>([]);
-  const [liveQuotes, setLiveQuotes]         = useState<LiveQuote[]>([]);
-  const [marketEvents, setMarketEvents]     = useState<MarketEvent[]>([]);
+  const [research, setResearch]             = useState<WebResearch[]>(() => { try { return JSON.parse(localStorage.getItem('cache_research') ?? 'null') ?? []; } catch { return []; } });
+  const [liveQuotes, setLiveQuotes]         = useState<LiveQuote[]>(() => { try { return JSON.parse(localStorage.getItem('cache_quotes') ?? 'null') ?? []; } catch { return []; } });
+  const [marketEvents, setMarketEvents]     = useState<MarketEvent[]>(() => { try { return JSON.parse(localStorage.getItem('cache_market_events') ?? 'null') ?? []; } catch { return []; } });
   const [quotesLoading, setQuotesLoading]   = useState(false);
-  const [quotesMarketTab, setQuotesMarketTab] = useState<string>('All');
+  const [quotesMarketTab, setQuotesMarketTab] = useState<string>('');
   const [quotesStockTab, setQuotesStockTab]   = useState<string | null>(null);
   const [watchlist, setWatchlist] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem('watchlist') ?? 'null') ?? []; } catch { return []; }
@@ -712,11 +1238,14 @@ function AppInner() {
   const [portfolio, setPortfolio]           = useState<PortfolioPnl | null>(null);
   const [editStratId, setEditStratId]       = useState<number | null>(null);
   const [editStratForm, setEditStratForm]   = useState<{ position_size: string; notes: string }>({ position_size: '', notes: '' });
+  const [reportStratId, setReportStratId]   = useState<number | null>(null);
+  const [reportData, setReportData]         = useState<StrategyReport | null>(null);
+  const [reportLoading, setReportLoading]   = useState(false);
   const [budgetInput, setBudgetInput]       = useState<string>('10000');
   const [approvalMode, setApprovalMode]     = useState('auto');
   const [scheduleInterval, setScheduleInterval] = useState<number>(60);
   const [isTriggering, setIsTriggering]     = useState(false);
-  const [isUpdatingSchedule, setIsUpdatingSchedule] = useState(false);
+  const isTriggeringRef = useRef(false);
   const [investmentFocus, setInvestmentFocus] = useState('');
   const [investmentFocusSaved, setInvestmentFocusSaved] = useState(false);
   const [loading, setLoading]               = useState(true);
@@ -772,11 +1301,11 @@ function AppInner() {
       ]);
       if (stratRes.ok) setStrategies(await stratRes.json());
       if (predRes.ok) setPredictions(await predRes.json());
-      if (mktRes.ok) setMarkets(await mktRes.json());
+      if (mktRes.ok) { const mktData = await mktRes.json(); setMarkets(mktData); localStorage.setItem('markets', JSON.stringify(mktData)); }
       if (debRes.ok) setDebates(await debRes.json());
       if (appRes.ok) { const d = await appRes.json(); setApprovalMode(d.approval_mode); }
       if (memRes.ok) setMemories(await memRes.json());
-      if (resRes.ok) setResearch(await resRes.json());
+      if (resRes.ok) { const d = await resRes.json(); setResearch(d); try { localStorage.setItem('cache_research', JSON.stringify(d)); } catch {} }
       if (schedRes.ok) { const d = await schedRes.json(); setScheduleInterval(d.interval_minutes); }
       if (statRes.ok) { const d = await statRes.json(); setIsTriggering(d.is_running); }
       if (agentRes.ok) setAgents(await agentRes.json());
@@ -800,19 +1329,18 @@ function AppInner() {
         apiFetch('/quotes'),
         apiFetch('/market/events'),
       ]);
-      if (qRes.ok) setLiveQuotes(await qRes.json());
-      if (eRes.ok) setMarketEvents(await eRes.json());
+      if (qRes.ok) { const d = await qRes.json(); setLiveQuotes(d); try { localStorage.setItem('cache_quotes', JSON.stringify(d)); } catch {} }
+      if (eRes.ok) { const d = await eRes.json(); setMarketEvents(d); try { localStorage.setItem('cache_market_events', JSON.stringify(d)); } catch {} }
     } catch (e) { console.error('Quotes fetch error', e); }
     finally { setQuotesLoading(false); }
   };
 
-  // Fetch quotes when Markets page is opened, refresh every 30s
+  // Fetch quotes on login and refresh every 30s in the background
   useEffect(() => {
-    if (page !== 'markets') return;
     fetchQuotes();
     const i = setInterval(fetchQuotes, 30000);
     return () => clearInterval(i);
-  }, [page]);
+  }, []);
 
   useEffect(() => { fetchData(); const i = setInterval(fetchData, 10000); return () => clearInterval(i); }, []);
 
@@ -830,6 +1358,7 @@ function AppInner() {
   }, []);
 
   // Dedicated pipeline poller — 2s while running, 8s while idle
+  // Runs once on mount; state is always read from the backend (survives page refresh)
   useEffect(() => {
     let timerId: ReturnType<typeof setTimeout>;
     const pollPipeline = async () => {
@@ -839,19 +1368,20 @@ function AppInner() {
           const data = await res.json();
           setPipelineEvents(data.events ?? []);
           setPipelineRunId(data.run_id ?? null);
-          setIsTriggering(data.is_running);
+          const running = !!data.is_running;
+          isTriggeringRef.current = running;
+          setIsTriggering(running);
         }
       } catch { /* ignore */ }
-      // Refresh run history list too
       try {
         const r = await apiFetch('/pipeline/runs');
         if (r.ok) setPipelineRuns(await r.json());
       } catch { /* ignore */ }
-      timerId = setTimeout(pollPipeline, isTriggering ? 2000 : 8000);
+      timerId = setTimeout(pollPipeline, isTriggeringRef.current ? 2000 : 8000);
     };
     pollPipeline();
     return () => clearTimeout(timerId);
-  }, [isTriggering]);
+  }, []);
 
   const loadRunEvents = async (runId: string) => {
     if (selectedRunId === runId) { setSelectedRunId(null); setSelectedRunEvents([]); return; }
@@ -862,40 +1392,66 @@ function AppInner() {
     } catch { /* ignore */ }
   };
 
-  const toggleMarket = async (name: string, enabled: number) => {
+  const toggleMarket = (name: string, enabled: number) => {
     const v = !enabled;
-    await apiFetch('/config/markets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify([{ market_name: name, is_enabled: v }]) });
-    setMarkets(p => p.map(m => m.market_name === name ? { ...m, is_enabled: v ? 1 : 0 } : m));
+    // Update UI immediately, fire API in background
+    setMarkets(p => { const updated = p.map(m => m.market_name === name ? { ...m, is_enabled: v ? 1 : 0 } : m); localStorage.setItem('markets', JSON.stringify(updated)); return updated; });
+    apiFetch('/config/markets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify([{ market_name: name, is_enabled: v }]) }).catch(console.error);
   };
 
-  const setMode = async (mode: string) => {
-    await apiFetch('/config/approval_mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approval_mode: mode }) });
+  const setMode = (mode: string) => {
     setApprovalMode(mode);
+    apiFetch('/config/approval_mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ approval_mode: mode }) }).catch(console.error);
   };
 
-  const handleApproval = async (id: number, action: string) => {
-    await apiFetch('/strategies/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ strategy_id: id, action }) });
-    fetchData();
+  const handleApproval = (id: number, action: string) => {
+    // Optimistic: remove from pending immediately
+    setStrategies(p => p.map(s => s.id === id ? { ...s, status: action === 'approve' ? 'ACTIVE' : 'REJECTED' } : s));
+    apiFetch('/strategies/approve', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ strategy_id: id, action }) })
+      .then(r => { if (r.ok) { toast(action === 'approve' ? 'Strategy approved' : 'Strategy rejected'); fetchData(); } else toast('Action failed', 'err'); })
+      .catch(() => toast('Network error', 'err'));
   };
 
-  const handleUndeploy = async (id: number) => {
+  const handleUndeploy = (id: number) => {
     if (!confirm('Close this strategy at current market price?')) return;
-    await apiFetch(`/strategies/${id}/undeploy`, { method: 'POST' });
-    fetchData();
+    setStrategies(p => p.map(s => s.id === id ? { ...s, status: 'CLOSED' } : s));
+    apiFetch(`/strategies/${id}/undeploy`, { method: 'POST' })
+      .then(r => { if (r.ok) { toast('Position closed'); fetchData(); } else toast('Failed to close', 'err'); })
+      .catch(() => toast('Network error', 'err'));
   };
 
-  const handleStrategyUpdate = async (id: number) => {
+  const handleStrategyUpdate = (id: number) => {
     const body: Record<string, unknown> = {};
     if (editStratForm.position_size !== '') body.position_size = parseFloat(editStratForm.position_size);
     if (editStratForm.notes !== '') body.notes = editStratForm.notes;
-    await apiFetch(`/strategies/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     setEditStratId(null);
-    fetchData();
+    apiFetch(`/strategies/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(r => { if (r.ok) { toast('Strategy updated'); fetchData(); } else toast('Update failed', 'err'); })
+      .catch(() => toast('Network error', 'err'));
   };
 
-  const handleBudgetSave = async (val: number) => {
-    await apiFetch('/config/budget', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trading_budget: val }) });
-    fetchData();
+  const [reportError, setReportError] = useState<string | null>(null);
+  const openReport = async (id: number) => {
+    setReportStratId(id);
+    setReportData(null);
+    setReportError(null);
+    setReportLoading(true);
+    try {
+      const res = await apiFetch(`/strategies/${id}/report`);
+      if (res.ok) {
+        setReportData(await res.json());
+      } else {
+        const body = await res.json().catch(() => ({}));
+        setReportError(body.detail ?? `HTTP ${res.status}`);
+      }
+    } catch (e: unknown) {
+      setReportError(e instanceof Error ? e.message : 'Network error');
+    }
+    finally { setReportLoading(false); }
+  };
+
+  const handleBudgetSave = (val: number) => {
+    apiFetch('/config/budget', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ trading_budget: val }) }).catch(console.error);
   };
 
   const [focusTickers, setFocusTickers] = useState<string[]>([]);
@@ -906,34 +1462,33 @@ function AppInner() {
   const [tickerSearchLoading, setTickerSearchLoading] = useState(false);
   const focusSearchTimer = useState<ReturnType<typeof setTimeout> | null>(null);
 
-  const saveInvestmentFocus = async (text: string) => {
-    await apiFetch('/config/investment_focus', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ investment_focus: text }),
-    });
+  const saveInvestmentFocus = (text: string) => {
     setInvestmentFocusSaved(true);
     setTimeout(() => setInvestmentFocusSaved(false), 2000);
+    apiFetch('/config/investment_focus', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ investment_focus: text }),
+    }).catch(console.error);
   };
 
-  const handleManualTrigger = async (tickers?: string[]) => {
+  const handleManualTrigger = (tickers?: string[]) => {
     if (isTriggering) return;
+    isTriggeringRef.current = true;
     setIsTriggering(true);
     const body = tickers && tickers.length > 0 ? { tickers } : {};
-    try {
-      const res = await apiFetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      const data = await res.json();
-      if (data.status === 'error') { alert(data.message); setIsTriggering(false); }
-      else setTimeout(fetchData, 3000);
-    } catch (e) { console.error(e); setIsTriggering(false); }
+    // Fire-and-forget — the pipeline runs synchronously on the backend (~3 min).
+    // The poller picks up is_running=true immediately and tracks progress.
+    apiFetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      .then(res => res.json())
+      .then(data => { if (data.status === 'error') { isTriggeringRef.current = false; setIsTriggering(false); alert(data.message); } else { setTimeout(fetchData, 2000); } })
+      .catch(() => { isTriggeringRef.current = false; setIsTriggering(false); });
   };
 
-  const handleScheduleUpdate = async (minutes: number) => {
-    setIsUpdatingSchedule(true);
-    try {
-      await apiFetch('/config/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ interval_minutes: minutes }) });
-      await apiFetch('/system/sync_schedule', { method: 'POST' });
-      setScheduleInterval(minutes);
-    } catch (e) { console.error(e); } finally { setIsUpdatingSchedule(false); }
+  const handleScheduleUpdate = (minutes: number) => {
+    setScheduleInterval(minutes);
+    apiFetch('/config/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ interval_minutes: minutes }) })
+      .then(() => apiFetch('/system/sync_schedule', { method: 'POST' }))
+      .catch(console.error);
   };
 
   // Timeline grouping
@@ -959,6 +1514,7 @@ function AppInner() {
   const [pipelineEvents, setPipelineEvents]       = useState<PipelineEvent[]>([]);
   const [pipelineRunId, setPipelineRunId]         = useState<string | null>(null);
   const [researchStepOpen, setResearchStepOpen]   = useState(false);
+  const [pendingDropdownOpen, setPendingDropdownOpen] = useState(false);
   const [pipelineRuns, setPipelineRuns]           = useState<PipelineRun[]>([]);
   const [selectedRunId, setSelectedRunId]         = useState<string | null>(null);
   const [selectedRunEvents, setSelectedRunEvents] = useState<PipelineEvent[]>([]);
@@ -1170,18 +1726,22 @@ function AppInner() {
                                   <p className="text-[10px] text-textDim uppercase tracking-wider mb-1">Rationale</p>
                                   <p className="text-[11px] text-textMuted leading-relaxed">{strat.reasoning_summary}</p>
                                 </div>
-                                {strat.status === 'ACTIVE' && (
-                                  <div className="shrink-0 flex gap-2">
+                                <div className="shrink-0 flex gap-2">
                                     <button
-                                      onClick={() => { setEditStratId(strat.id); setEditStratForm({ position_size: strat.position_size?.toString() ?? '', notes: strat.notes ?? '' }); }}
+                                      onClick={() => openReport(strat.id)}
                                       className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors"
-                                    >✎ Edit</button>
-                                    <button
-                                      onClick={() => handleUndeploy(strat.id)}
-                                      className="px-2 py-1 text-[10px] bg-down-bg text-down-text border border-down/20 rounded hover:opacity-80 transition-opacity font-semibold"
-                                    >✕ Undeploy</button>
+                                    >◈ Report</button>
+                                    {strat.status === 'ACTIVE' && <>
+                                      <button
+                                        onClick={() => { setEditStratId(strat.id); setEditStratForm({ position_size: strat.position_size?.toString() ?? '', notes: strat.notes ?? '' }); }}
+                                        className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors"
+                                      >✎ Edit</button>
+                                      <button
+                                        onClick={() => handleUndeploy(strat.id)}
+                                        className="px-2 py-1 text-[10px] bg-down-bg text-down-text border border-down/20 rounded hover:opacity-80 transition-opacity font-semibold"
+                                      >✕ Undeploy</button>
+                                    </>}
                                   </div>
-                                )}
                               </div>
                             </div>
                           ))}
@@ -1326,14 +1886,14 @@ function AppInner() {
   );
 
 
-  const saveAgentPrompt = async (agentName: string, prompt: string) => {
-    await apiFetch(`/agents/${encodeURIComponent(agentName)}/prompt`, {
+  const saveAgentPrompt = (agentName: string, prompt: string) => {
+    setEditingPromptAgent(null);
+    apiFetch(`/agents/${encodeURIComponent(agentName)}/prompt`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ system_prompt: prompt }),
-    });
-    setEditingPromptAgent(null);
-    fetchData();
+    }).then(r => { if (r.ok) { toast('Prompt saved'); fetchData(); } else toast('Save failed', 'err'); })
+      .catch(() => toast('Network error', 'err'));
   };
 
   const renderMemory = () => (
@@ -1472,6 +2032,9 @@ function AppInner() {
               <p className="text-[10px] text-textDim uppercase tracking-wider mb-1">{stat.label}</p>
               <p className={`text-xl font-semibold font-mono ${stat.up ? 'text-up' : 'text-down'}`}>{stat.value}</p>
               <p className="text-[11px] text-textMuted mt-0.5">{stat.sub}</p>
+              {p?.using_assumed_sizes && stat.label !== 'Realized' && (
+                <p className="text-[9px] text-amber-500 mt-1">equal-weight est.</p>
+              )}
             </Card>
           ))}
         </div>
@@ -1487,7 +2050,7 @@ function AppInner() {
               <div className="h-full bg-brand-500 transition-all" style={{ width: `${Math.min(100, (p.allocated / p.total_budget) * 100)}%` }} />
             </div>
             <div className="flex justify-between mt-1.5">
-              <span className="text-[10px] text-brand-400">{((p.allocated / p.total_budget) * 100).toFixed(0)}% allocated · ${p.allocated.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+              <span className="text-[10px] text-brand-400">{((p.allocated / p.total_budget) * 100).toFixed(0)}% allocated · ${p.allocated.toLocaleString(undefined, { maximumFractionDigits: 0 })}{p.using_assumed_sizes ? ' (equal-weight est.)' : ''}</span>
               <span className="text-[10px] text-textDim">${p.available.toLocaleString(undefined, { maximumFractionDigits: 0 })} free</span>
             </div>
           </Card>
@@ -1526,9 +2089,16 @@ function AppInner() {
                       <div className="text-right shrink-0 flex items-center gap-3">
                         <div>
                           <p className={`text-xl font-light tabular-nums ${pnlUp ? 'text-up' : 'text-down'}`}>{fmtPct(pos.pnl_pct)}</p>
-                          {pos.pnl_usd != null && <p className={`text-[11px] font-mono ${pnlUp ? 'text-up' : 'text-down'}`}>{fmtUsd(pos.pnl_usd)}</p>}
+                          {pos.pnl_usd != null
+                            ? <p className={`text-[11px] font-mono ${pnlUp ? 'text-up' : 'text-down'}`}>{fmtUsd(pos.pnl_usd)}</p>
+                            : pos.assumed_size != null && <p className="text-[9px] text-amber-500">~{fmtUsd((pos.assumed_size * (pos.pnl_pct ?? 0)) / 100)} est.</p>
+                          }
                         </div>
                         <div className="flex flex-col gap-1">
+                          <button
+                            onClick={() => openReport(pos.id)}
+                            className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors"
+                          >◈</button>
                           <button
                             onClick={() => { setEditStratId(editStratId === pos.id ? null : pos.id); setEditStratForm({ position_size: pos.position_size?.toString() ?? '', notes: pos.notes ?? '' }); }}
                             className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors"
@@ -1640,13 +2210,19 @@ function AppInner() {
                           {pos.closed_at && <span>{new Date(pos.closed_at).toLocaleDateString()}</span>}
                         </div>
                       </div>
-                      <div className="text-right shrink-0">
-                        <p className={`text-lg font-light tabular-nums ${pnlUp ? 'text-up' : 'text-down'}`}>{fmtPct(pos.pnl_pct)}</p>
-                        {pos.realized_pnl != null && (
-                          <p className={`text-[11px] font-mono ${(pos.realized_pnl ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                            {fmtUsd(pos.realized_pnl)}
-                          </p>
-                        )}
+                      <div className="flex items-center gap-3 shrink-0">
+                        <div className="text-right">
+                          <p className={`text-lg font-light tabular-nums ${pnlUp ? 'text-up' : 'text-down'}`}>{fmtPct(pos.pnl_pct)}</p>
+                          {pos.realized_pnl != null && (
+                            <p className={`text-[11px] font-mono ${(pos.realized_pnl ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                              {fmtUsd(pos.realized_pnl)}
+                            </p>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => openReport(pos.id)}
+                          className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors"
+                        >◈</button>
                       </div>
                     </div>
                   </Card>
@@ -1673,33 +2249,35 @@ function AppInner() {
       return String(v);
     };
 
-    // All default tickers across all markets
-    const allDefaultSymbols = TICKER_DB.map(t => t.symbol);
+    // Only tickers from enabled markets
+    const allDefaultSymbols = TICKER_DB.filter(t => enabledMarketNames.includes(t.market)).map(t => t.symbol);
     // User-added symbols not in defaults
     const userAddedSymbols = watchlist.filter(s => !allDefaultSymbols.includes(s));
     // Combined unique symbol list
     const allSymbols = [...new Set([...allDefaultSymbols, ...userAddedSymbols])];
 
+    // Resolve active tab — default to first enabled market
+    const activeMarketTab = (quotesMarketTab && enabledMarketNames.includes(quotesMarketTab))
+      ? quotesMarketTab
+      : (enabledMarketNames[0] ?? '');
+
     // Filter by market tab
-    const tabSymbols = quotesMarketTab === 'All'
-      ? allSymbols
-      : allSymbols.filter(sym => {
-          const meta = TICKER_META[sym];
-          if (meta) return meta.market === quotesMarketTab;
-          // For user-added symbols not in TICKER_DB, detect market from quote data
-          const q = liveQuotes.find(q => q.symbol === sym);
-          return q?.market === quotesMarketTab;
-        });
+    const tabSymbols = allSymbols.filter(sym => {
+      const meta = TICKER_META[sym];
+      if (meta) return meta.market === activeMarketTab;
+      // For user-added symbols not in TICKER_DB, detect market from quote data
+      const q = liveQuotes.find(q => q.symbol === sym);
+      return q?.market === activeMarketTab;
+    });
 
     // Symbols with active positions
     const positionSymbols = [...new Set(activeStrategies.map(s => s.symbol))];
-    const positionTabSymbols = positionSymbols.filter(sym =>
-      quotesMarketTab === 'All' || (() => {
-        const meta = TICKER_META[sym];
-        if (meta) return meta.market === quotesMarketTab;
-        const q = liveQuotes.find(q => q.symbol === sym);
-        return q?.market === quotesMarketTab;
-      })()
+    const positionTabSymbols = positionSymbols.filter(sym => {
+      const meta = TICKER_META[sym];
+      if (meta) return meta.market === activeMarketTab;
+      const q = liveQuotes.find(q => q.symbol === sym);
+      return q?.market === activeMarketTab;
+    }
     );
 
     // Non-position watchlist symbols for the current tab
@@ -1769,11 +2347,18 @@ function AppInner() {
           )}
           <div className="flex items-start justify-between gap-2 mb-2">
             <span className="text-sm font-bold font-mono text-textMain leading-none">{ticker}</span>
-            {q?.change_pct != null && (
-              <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${up ? 'bg-up-bg text-up-text' : 'bg-down-bg text-down-text'}`}>
-                {up ? '+' : ''}{q.change_pct.toFixed(2)}%
-              </span>
-            )}
+            <div className="flex flex-col items-end gap-0.5">
+              {q?.change_pct != null && (
+                <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${up ? 'bg-up-bg text-up-text' : 'bg-down-bg text-down-text'}`}>
+                  {up ? '+' : ''}{q.change_pct.toFixed(2)}% <span className="font-normal opacity-70">1d</span>
+                </span>
+              )}
+              {q?.week_change_pct != null && q?.week_closes && q.week_closes.length >= 3 && (
+                <span className={`text-[9px] font-medium px-1.5 py-0.5 rounded ${(q.week_change_pct ?? 0) >= 0 ? 'text-up/70' : 'text-down/70'}`}>
+                  {(q.week_change_pct ?? 0) >= 0 ? '+' : ''}{q.week_change_pct?.toFixed(2)}% <span className="opacity-70">5d</span>
+                </span>
+              )}
+            </div>
           </div>
           {q?.price != null ? (
             <p className="text-lg font-light font-mono text-textMain leading-none">
@@ -1782,7 +2367,21 @@ function AppInner() {
           ) : (
             <p className="text-sm text-textDim">—</p>
           )}
-          {q?.name && <p className="text-[10px] text-textDim mt-1.5 truncate">{q.name}</p>}
+          {/* 5-day sparkline */}
+          {q?.week_closes && q.week_closes.length >= 2 && (() => {
+            const pts = q.week_closes!;
+            const mn = Math.min(...pts), mx = Math.max(...pts);
+            const range = mx - mn || 1;
+            const w = 80, h = 24;
+            const coords = pts.map((v, i) => `${(i / (pts.length - 1)) * w},${h - ((v - mn) / range) * h}`).join(' ');
+            const sparkUp = pts[pts.length - 1] >= pts[0];
+            return (
+              <svg width={w} height={h} className="mt-2 overflow-visible">
+                <polyline points={coords} fill="none" stroke={sparkUp ? 'var(--color-up)' : 'var(--color-down)'} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" opacity="0.7" />
+              </svg>
+            );
+          })()}
+          {q?.name && <p className="text-[10px] text-textDim mt-0.5 truncate">{q.name}</p>}
           {/* Position return badge */}
           {activePos && posReturn !== null && (
             <div className={`mt-2 text-[10px] font-semibold px-2 py-0.5 rounded-full w-fit ${posUp ? 'bg-emerald-900/40 text-emerald-400' : 'bg-red-900/40 text-red-400'}`}>
@@ -1814,15 +2413,15 @@ function AppInner() {
 
         {/* Market filter tabs */}
         <div className="flex gap-2 flex-wrap">
-          {(['All', ...enabledMarketNames] as string[]).map(m => (
+          {enabledMarketNames.map(m => (
             <button key={m}
               onClick={() => { setQuotesMarketTab(m); setQuotesStockTab(null); }}
               className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg border transition-colors ${
-                quotesMarketTab === m
+                activeMarketTab === m
                   ? 'border-brand-500 bg-brand-900/30 text-brand-300'
                   : 'border-borderLight bg-surface2 text-textMuted hover:text-textMain hover:border-borderMid'
               }`}>
-              {m !== 'All' && <span>{MARKET_ICONS[m]}</span>}
+              <span>{MARKET_ICONS[m]}</span>
               <span>{m}</span>
             </button>
           ))}
@@ -2085,7 +2684,7 @@ function AppInner() {
               <p className="text-xs text-textMuted">Run a new debate cycle every:</p>
               <div className="grid grid-cols-4 gap-2">
                 {[15, 30, 60, 120].map(mins => (
-                  <button key={mins} onClick={() => handleScheduleUpdate(mins)} disabled={isUpdatingSchedule}
+                  <button key={mins} onClick={() => handleScheduleUpdate(mins)}
                     className={`py-2 text-xs font-medium rounded-lg border transition-colors ${scheduleInterval === mins ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface2 border-borderLight text-textMuted hover:bg-surface3 hover:text-textMain'}`}>
                     {mins >= 60 ? `${mins / 60}h` : `${mins}m`}
                   </button>
@@ -2285,9 +2884,12 @@ function AppInner() {
     );
   };
 
-  const handleStopPipeline = async () => {
-    await apiFetch('/system/stop', { method: 'POST' });
+  const handleStopPipeline = () => {
     setIsTriggering(false);
+    isTriggeringRef.current = false;
+    apiFetch('/system/stop', { method: 'POST' })
+      .then(r => { if (r.ok) toast('Pipeline stopped', 'info'); })
+      .catch(() => {});
   };
 
   const PIPELINE_STEPS = [
@@ -2373,8 +2975,9 @@ function AppInner() {
                 const isLast = idx === events.length - 1;
                 const timeStr = new Date(ev.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
                 const isAgentQuery = ev.step === 'AGENT_QUERY';
-                // If the pipeline is no longer running, treat any stuck IN_PROGRESS as DONE
-                const displayStatus = (live && !isActive && ev.status === 'IN_PROGRESS') ? 'DONE' : ev.status;
+                // Treat IN_PROGRESS as DONE if: pipeline stopped, OR a later DONE/ERROR event exists for this step
+                const hasLaterResolution = ev.status === 'IN_PROGRESS' && events.slice(idx + 1).some(e => e.step === ev.step && (e.status === 'DONE' || e.status === 'ERROR'));
+                const displayStatus = (ev.status === 'IN_PROGRESS' && (!isActive || hasLaterResolution)) ? 'DONE' : ev.status;
                 return (
                   <div key={ev.id} className={`relative ${isLast && live && isActive ? 'bg-amber-950/10' : ''}`}>
                     <div className={`flex items-start gap-4 ${isAgentQuery ? 'pl-10 pr-5 py-3' : 'px-5 py-4'}`}>
@@ -2460,216 +3063,127 @@ function AppInner() {
       );
     };
 
+    // Ticker search helpers (used in the control bar below)
+    const addFocusTicker = (sym: string) => {
+      if (!focusTickers.includes(sym)) setFocusTickers(p => [...p, sym]);
+      setFocusSearch(''); setFocusSearchOpen(false); setTickerSearchResults([]);
+    };
+    const focusVisibleResults = tickerSearchResults.filter(r => !focusTickers.includes(r.symbol));
+    const showFocusDropdown = focusSearchOpen && (tickerSearchLoading || focusVisibleResults.length > 0);
+
     return (
-      <div className="space-y-5">
-        {/* Investment Focus prompt */}
-        <Card className="p-4">
-          <div className="flex items-start justify-between gap-4 mb-3">
-            <div>
-              <p className="text-xs font-semibold text-textMain">Investment Focus <span className="text-textDim font-normal">(persisted across runs)</span></p>
-              <p className="text-[11px] text-textDim mt-0.5">
-                Describe what you're interested in — the pipeline will scrape targeted research and steer agents accordingly.
-                Leave empty for broad market coverage.
-              </p>
-            </div>
-            <button
-              onClick={() => saveInvestmentFocus(investmentFocus)}
-              className={`shrink-0 px-3 py-1.5 rounded-lg text-xs font-semibold border transition-all ${
-                investmentFocusSaved
-                  ? 'bg-up-bg text-up-text border-up/30'
-                  : 'bg-brand-600 border-brand-500 text-white hover:bg-brand-500'
-              }`}
-            >
-              {investmentFocusSaved ? '✓ Saved' : 'Save'}
-            </button>
+      <div className="space-y-4">
+        {/* ── Control bar ─────────────────────────────────────────────────── */}
+        <div className="rounded-xl border border-borderLight bg-surface overflow-hidden">
+
+          {/* Row 1: Investment focus + Run button */}
+          <div className="flex items-center gap-3 px-4 py-3 border-b border-borderLight">
+            <span className="text-[10px] font-semibold text-textDim uppercase tracking-widest shrink-0">Focus</span>
+            <input
+              type="text"
+              value={investmentFocus}
+              onChange={e => setInvestmentFocus(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') saveInvestmentFocus(investmentFocus); }}
+              placeholder="e.g. AI semiconductors, Indian IT, Bitcoin momentum… (leave empty for broad coverage)"
+              className="flex-1 bg-transparent text-xs text-textMain placeholder-textDim focus:outline-none min-w-0"
+            />
+            {investmentFocus && (
+              <button
+                onClick={() => saveInvestmentFocus(investmentFocus)}
+                className={`shrink-0 px-2.5 py-1 rounded text-[10px] font-semibold border transition-all ${investmentFocusSaved ? 'bg-up-bg text-up border-up/30' : 'bg-surface2 border-borderMid text-textMuted hover:border-brand-500 hover:text-brand-400'}`}
+              >{investmentFocusSaved ? '✓ Saved' : 'Save'}</button>
+            )}
+            <div className="h-4 w-px bg-borderLight shrink-0" />
+            {isActive ? (
+              <button onClick={handleStopPipeline} className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-down/40 bg-down-bg text-down-text hover:opacity-80 transition-opacity">
+                ■ Stop
+              </button>
+            ) : (
+              <button onClick={() => handleManualTrigger(focusTickers.length > 0 ? focusTickers : undefined)}
+                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-brand-600 border-brand-500 text-white hover:bg-brand-500 transition-colors">
+                ▶ {focusTickers.length > 0 ? `Run ${focusTickers.length} ticker${focusTickers.length !== 1 ? 's' : ''}` : 'Run Pipeline'}
+              </button>
+            )}
           </div>
-          <textarea
-            value={investmentFocus}
-            onChange={e => setInvestmentFocus(e.target.value)}
-            rows={3}
-            placeholder={`e.g. "AI and semiconductor stocks in the US — focused on NVDA, AMD, and INTC"\n"Indian IT sector — TCS, Infosys, Wipro and mid-cap IT"\n"Crypto: Bitcoin and Ethereum momentum plays"\n"US healthcare and biotech — growth stocks with upcoming catalysts"`}
-            className="w-full bg-surface2 border border-borderLight rounded-lg px-3 py-2.5 text-xs text-textMain placeholder-textDim focus:outline-none focus:border-brand-500 resize-none leading-relaxed"
-          />
-          {investmentFocus && (
-            <div className="mt-2 flex flex-wrap gap-1.5">
-              {/* Show extracted keywords as preview chips */}
-              {['tech', 'ai', 'semiconductor', 'ev', 'healthcare', 'pharma', 'crypto', 'bitcoin',
-                'energy', 'banking', 'india', 'small cap', 'growth', 'dividend'].filter(kw =>
-                  investmentFocus.toLowerCase().includes(kw)
-              ).map(kw => (
-                <span key={kw} className="text-[10px] px-2 py-0.5 rounded-full bg-brand-900/30 border border-brand-700/30 text-brand-400 dark:text-brand-300">
-                  {kw}
+
+          {/* Row 2: Sector pills + ticker search */}
+          <div className="px-4 py-2.5 flex items-center gap-3 flex-wrap">
+            {/* Market sector pills */}
+            <div className="flex items-center gap-1.5 flex-wrap flex-1 min-w-0">
+              {Object.entries(MARKET_SECTORS).map(([market, sectors]) =>
+                sectors.map(sector => {
+                  const isActiveFilter = focusSectorFilter?.market === market && focusSectorFilter?.sector === sector;
+                  return (
+                    <button key={`${market}-${sector}`}
+                      onClick={() => {
+                        if (isActiveFilter) { setFocusSectorFilter(null); } else {
+                          setFocusSectorFilter({ market, sector });
+                          const st = TICKER_DB.filter(t => t.market === market && t.sector === sector).map(t => t.symbol);
+                          setFocusTickers(prev => [...new Set([...prev, ...st])]);
+                        }
+                      }}
+                      className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${isActiveFilter ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface2 border-borderLight text-textMuted hover:border-brand-400 hover:text-brand-400'}`}
+                    >
+                      <span className="mr-1 opacity-60">{MARKET_ICONS[market]}</span>{sector}
+                    </button>
+                  );
+                })
+              )}
+            </div>
+            {/* Ticker search */}
+            <div className="relative shrink-0 w-56">
+              <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border bg-surface2 transition-colors ${focusSearchOpen ? 'border-brand-500' : 'border-borderLight'}`}>
+                <span className="text-textDim text-[10px] shrink-0">{tickerSearchLoading ? <span className="animate-spin inline-block">↻</span> : '⌕'}</span>
+                <input type="text" value={focusSearch}
+                  onChange={e => {
+                    const val = e.target.value; setFocusSearch(val); setFocusSearchOpen(true);
+                    if (focusSearchTimer[0]) clearTimeout(focusSearchTimer[0]);
+                    if (!val.trim()) { setTickerSearchResults([]); setTickerSearchLoading(false); return; }
+                    setTickerSearchLoading(true);
+                    focusSearchTimer[0] = setTimeout(async () => {
+                      try { const res = await apiFetch(`/search/tickers?q=${encodeURIComponent(val.trim())}`); if (res.ok) setTickerSearchResults(await res.json()); } catch { /**/ }
+                      setTickerSearchLoading(false);
+                    }, 350);
+                  }}
+                  onFocus={() => setFocusSearchOpen(true)}
+                  onBlur={() => setTimeout(() => setFocusSearchOpen(false), 150)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && focusVisibleResults.length > 0) addFocusTicker(focusVisibleResults[0].symbol);
+                    if (e.key === 'Escape') { setFocusSearchOpen(false); setFocusSearch(''); }
+                  }}
+                  placeholder="Add ticker…"
+                  className="flex-1 bg-transparent text-[11px] text-textMain placeholder-textDim focus:outline-none w-0 min-w-0"
+                />
+              </div>
+              {showFocusDropdown && (
+                <div className="absolute left-0 right-0 top-full mt-1 bg-surface border border-borderMid rounded-lg shadow-xl z-20 overflow-hidden max-h-60 overflow-y-auto">
+                  {tickerSearchLoading && focusVisibleResults.length === 0 && <div className="px-3 py-2 text-xs text-textDim animate-pulse">Searching…</div>}
+                  {focusVisibleResults.map(t => (
+                    <button key={t.symbol} onMouseDown={e => { e.preventDefault(); addFocusTicker(t.symbol); }}
+                      className="w-full text-left px-3 py-2 hover:bg-surface2 flex items-center justify-between gap-2 border-b border-borderLight last:border-0">
+                      <span className="text-xs font-mono font-semibold text-textMain">{t.symbol}</span>
+                      <span className="text-[10px] text-textMuted truncate flex-1 text-right">{t.name}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            {(focusTickers.length > 0 || focusSectorFilter) && (
+              <button onClick={() => { setFocusTickers([]); setFocusSectorFilter(null); }} className="text-[10px] text-textDim hover:text-textMuted transition-colors shrink-0">✕ Clear</button>
+            )}
+          </div>
+
+          {/* Row 3: Selected ticker chips (only when non-empty) */}
+          {focusTickers.length > 0 && (
+            <div className="px-4 py-2 border-t border-borderLight flex flex-wrap gap-1.5 bg-surface2/40">
+              {focusTickers.map(t => (
+                <span key={t} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono bg-brand-900/40 border border-brand-700/40 text-brand-300">
+                  {t}
+                  <button onClick={() => setFocusTickers(p => p.filter(x => x !== t))} className="hover:text-brand-200 text-[9px] leading-none ml-0.5 opacity-60 hover:opacity-100">✕</button>
                 </span>
               ))}
             </div>
           )}
-        </Card>
-
-        {/* Top bar: focus picker + run controls */}
-        <div className="flex items-start gap-4 flex-wrap">
-          <div className="flex-1 min-w-0">
-            <Card className="p-4">
-              <div className="flex items-center justify-between mb-3">
-                <div>
-                  <p className="text-xs font-semibold text-textMain">Focus Run <span className="text-textDim font-normal">(optional)</span></p>
-                  <p className="text-[11px] text-textDim mt-0.5">Search by name or ticker, or pick a market sector. Leave empty to run across all enabled markets.</p>
-                </div>
-                {(focusTickers.length > 0 || focusSectorFilter) && (
-                  <button onClick={() => { setFocusTickers([]); setFocusSectorFilter(null); }} className="text-[11px] text-textDim hover:text-textMuted px-2 py-1 rounded hover:bg-surface2 transition-colors shrink-0 ml-3">✕ Clear all</button>
-                )}
-              </div>
-
-              {/* Sector filter pills — grouped by market */}
-              <div className="mb-3 space-y-1.5">
-                {Object.entries(MARKET_SECTORS).map(([market, sectors]) => (
-                  <div key={market} className="flex items-center gap-1.5 flex-wrap">
-                    <span className="text-[10px] text-textDim w-10 shrink-0">{MARKET_ICONS[market]}</span>
-                    {sectors.map(sector => {
-                      const isActive = focusSectorFilter?.market === market && focusSectorFilter?.sector === sector;
-                      return (
-                        <button
-                          key={sector}
-                          onClick={() => {
-                            if (isActive) {
-                              setFocusSectorFilter(null);
-                            } else {
-                              setFocusSectorFilter({ market, sector });
-                              // Add all tickers in this sector that aren't already selected
-                              const sectorTickers = TICKER_DB.filter(t => t.market === market && t.sector === sector).map(t => t.symbol);
-                              setFocusTickers(prev => [...new Set([...prev, ...sectorTickers])]);
-                            }
-                          }}
-                          className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
-                            isActive
-                              ? 'bg-brand-600 border-brand-500 text-white'
-                              : 'bg-surface2 border-borderLight text-textMuted hover:border-brand-500 hover:text-brand-400'
-                          }`}
-                        >
-                          {sector}
-                        </button>
-                      );
-                    })}
-                  </div>
-                ))}
-              </div>
-
-              {/* Selected ticker tags */}
-              {focusTickers.length > 0 && (
-                <div className="flex flex-wrap gap-1.5 mb-3">
-                  {focusTickers.map(t => {
-                    const meta = TICKER_META[t];
-                    return (
-                      <span key={t} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono bg-brand-600 border border-brand-500 text-white">
-                        {t}{meta ? <span className="font-sans font-normal opacity-70 text-[10px]"> · {meta.name}</span> : null}
-                        <button onClick={() => setFocusTickers(p => p.filter(x => x !== t))} className="hover:text-brand-200 leading-none text-[10px] ml-0.5">✕</button>
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
-
-              {/* Ticker search */}
-              {(() => {
-                const addTicker = (sym: string) => {
-                  if (!focusTickers.includes(sym)) setFocusTickers(p => [...p, sym]);
-                  setFocusSearch('');
-                  setFocusSearchOpen(false);
-                  setTickerSearchResults([]);
-                };
-                const visibleResults = tickerSearchResults.filter(r => !focusTickers.includes(r.symbol));
-                const showDropdown = focusSearchOpen && (tickerSearchLoading || visibleResults.length > 0);
-                return (
-                  <div className="relative">
-                    <div className={`flex items-center gap-2 px-3 py-2 rounded-lg border bg-surface2 transition-colors ${focusSearchOpen ? 'border-brand-500' : 'border-borderLight hover:border-borderMid'}`}>
-                      {tickerSearchLoading
-                        ? <span className="text-brand-400 text-xs animate-spin shrink-0">↻</span>
-                        : <span className="text-textDim text-xs shrink-0">⌕</span>}
-                      <input
-                        type="text"
-                        value={focusSearch}
-                        onChange={e => {
-                          const val = e.target.value;
-                          setFocusSearch(val);
-                          setFocusSearchOpen(true);
-                          // Debounce API call
-                          if (focusSearchTimer[0]) clearTimeout(focusSearchTimer[0]);
-                          if (val.trim().length === 0) {
-                            setTickerSearchResults([]);
-                            setTickerSearchLoading(false);
-                            return;
-                          }
-                          setTickerSearchLoading(true);
-                          focusSearchTimer[0] = setTimeout(async () => {
-                            try {
-                              const res = await apiFetch(`/search/tickers?q=${encodeURIComponent(val.trim())}`);
-                              if (res.ok) setTickerSearchResults(await res.json());
-                            } catch { /* ignore */ }
-                            setTickerSearchLoading(false);
-                          }, 350);
-                        }}
-                        onFocus={() => setFocusSearchOpen(true)}
-                        onBlur={() => setTimeout(() => setFocusSearchOpen(false), 150)}
-                        onKeyDown={e => {
-                          if (e.key === 'Enter' && visibleResults.length > 0) addTicker(visibleResults[0].symbol);
-                          if (e.key === 'Escape') { setFocusSearchOpen(false); setFocusSearch(''); setTickerSearchResults([]); }
-                        }}
-                        placeholder="Search any ticker or company name (e.g. Intel, NVDA, Bitcoin)…"
-                        className="flex-1 bg-transparent text-xs text-textMain placeholder-textDim focus:outline-none"
-                      />
-                      {focusSearch && (
-                        <button onMouseDown={e => { e.preventDefault(); setFocusSearch(''); setTickerSearchResults([]); }} className="text-textDim hover:text-textMuted text-[10px] shrink-0">✕</button>
-                      )}
-                    </div>
-                    {showDropdown && (
-                      <div className="absolute left-0 right-0 top-full mt-1 bg-surface border border-borderMid rounded-lg shadow-xl z-20 overflow-hidden max-h-72 overflow-y-auto">
-                        {tickerSearchLoading && visibleResults.length === 0 && (
-                          <div className="px-4 py-3 text-xs text-textDim animate-pulse">Searching…</div>
-                        )}
-                        {visibleResults.map(t => {
-                          const typeColor: Record<string, string> = {
-                            equity: 'text-brand-600 dark:text-brand-400 bg-brand-50 dark:bg-brand-900/30',
-                            etf:    'text-teal-600 dark:text-teal-400 bg-teal-50 dark:bg-teal-900/30',
-                            crypto: 'text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-900/30',
-                            future: 'text-purple-600 dark:text-purple-400 bg-purple-50 dark:bg-purple-900/30',
-                          };
-                          const tc = typeColor[t.type] ?? 'text-textDim bg-surface3';
-                          return (
-                            <button
-                              key={t.symbol}
-                              onMouseDown={e => { e.preventDefault(); addTicker(t.symbol); }}
-                              className="w-full text-left px-3 py-2.5 hover:bg-surface2 transition-colors flex items-center justify-between gap-3 group border-b border-borderLight last:border-0"
-                            >
-                              <div className="flex items-center gap-2.5 min-w-0">
-                                <span className="text-xs font-mono font-semibold text-textMain group-hover:text-brand-400 transition-colors shrink-0">{t.symbol}</span>
-                                <span className="text-[11px] text-textMuted truncate">{t.name}</span>
-                              </div>
-                              <div className="flex items-center gap-1.5 shrink-0">
-                                {t.sector && <span className="text-[9px] text-textDim bg-surface3 px-1.5 py-0.5 rounded truncate max-w-[80px]">{t.sector}</span>}
-                                {t.type && <span className={`text-[9px] font-medium px-1.5 py-0.5 rounded ${tc}`}>{t.type}</span>}
-                                {t.exchange && <span className="text-[9px] text-textDim">{t.exchange}</span>}
-                              </div>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-            </Card>
-          </div>
-          <div className="flex flex-col gap-2 shrink-0 pt-1">
-            {isActive && (
-              <button onClick={handleStopPipeline}
-                className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium border border-down/40 bg-down-bg text-down-text hover:opacity-80 transition-opacity">
-                ■ Stop
-              </button>
-            )}
-            <button onClick={() => handleManualTrigger(focusTickers.length > 0 ? focusTickers : undefined)} disabled={isActive}
-              className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-xs font-medium border transition-colors ${isActive ? 'bg-surface3 border-borderLight text-textDim cursor-not-allowed' : 'bg-brand-600 border-brand-500 text-white hover:bg-brand-500'}`}>
-              {isActive ? <><span className="animate-spin">↻</span> Running</> : focusTickers.length > 0 ? <>▶ Run on {focusTickers.length} ticker{focusTickers.length !== 1 ? 's' : ''}</> : <>▶ Run Pipeline</>}
-            </button>
-          </div>
         </div>
 
         {/* Two-column layout: left = run tabs, right = event panel */}
@@ -2699,14 +3213,7 @@ function AppInner() {
               {pipelineRuns.filter(r => r.run_id !== pipelineRunId).map(run => {
                 const isSelected = selectedRunId === run.run_id;
                 const dur = Math.round((new Date(run.ended_at).getTime() - new Date(run.started_at).getTime()) / 1000);
-                // Parse ticker from deploy_detail (e.g. "NVDA LONG" or "Deployed NVDA LONG")
-                let deployTicker: string | null = null;
-                if (run.deploy_detail) {
-                  const words = run.deploy_detail.trim().split(/\s+/);
-                  // Skip leading words like "Deployed"
-                  const tickerWord = words.find(w => w === w.toUpperCase() && w.length >= 2 && w !== 'LONG' && w !== 'SHORT' && w !== 'DEPLOYED');
-                  deployTicker = tickerWord ?? null;
-                }
+                const out = run.output;
                 return (
                   <button key={run.run_id}
                     onClick={() => loadRunEvents(run.run_id)}
@@ -2716,9 +3223,14 @@ function AppInner() {
                       <span className={`text-xs shrink-0 ${run.status === 'error' ? 'text-down' : 'text-up'}`}>
                         {run.status === 'error' ? '✕' : '✓'}
                       </span>
-                      <span className="text-xs font-mono text-textMuted truncate">{run.run_id.substring(0, 8)}…</span>
-                      {deployTicker && (
-                        <span className="text-[9px] font-bold font-mono px-1.5 py-0.5 rounded bg-brand-900/40 border border-brand-700/30 text-brand-400 shrink-0">{deployTicker}</span>
+                      {out ? (
+                        <>
+                          <span className="text-xs font-bold font-mono text-textMain truncate">{out.ticker}</span>
+                          <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded shrink-0 ${out.action === 'LONG' ? 'bg-up/10 text-up' : 'bg-down/10 text-down'}`}>{out.action}</span>
+                          <span className="text-[9px] text-textDim shrink-0">{out.votes}</span>
+                        </>
+                      ) : (
+                        <span className="text-xs font-mono text-textMuted truncate">{run.run_id.substring(0, 8)}…</span>
                       )}
                     </div>
                     <p className="text-[10px] text-textDim pl-4 truncate">
@@ -2770,6 +3282,70 @@ function AppInner() {
               )}
             </div>
             {renderEventList(panelEvents, viewingLive)}
+            {/* Run output card — shown for completed past runs with output */}
+            {(() => {
+              if (viewingLive) return null;
+              const selectedRun = pipelineRuns.find(r => r.run_id === selectedRunId);
+              const out = selectedRun?.output;
+              if (!out) return null;
+              return (
+                <div className="px-5 py-5 border-t border-borderLight bg-surface">
+                  <div className="rounded-xl border border-borderLight bg-surface2 overflow-hidden">
+                    {/* Header */}
+                    <div className="px-4 py-3 border-b border-borderLight flex items-center justify-between bg-surface3">
+                      <div className="flex items-center gap-2.5">
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-textDim">Pipeline Output</span>
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${out.action === 'LONG' ? 'bg-up/15 text-up' : 'bg-down/15 text-down'}`}>
+                          {out.action}
+                        </span>
+                      </div>
+                      {out.strategy_id != null && (
+                        <button
+                          onClick={() => openReport(out.strategy_id!)}
+                          className="flex items-center gap-1 text-[10px] font-semibold text-brand-400 hover:text-brand-300 border border-brand-700/40 bg-brand-900/20 px-2.5 py-1 rounded-lg transition-colors"
+                        >
+                          ◈ View Report
+                        </button>
+                      )}
+                    </div>
+                    {/* Recommendation hero */}
+                    <div className="px-4 py-4 flex items-center gap-4 border-b border-borderLight">
+                      <div className="flex-1">
+                        <div className="flex items-center gap-2 mb-1">
+                          <span className="text-xl font-bold font-mono text-textMain">{out.ticker}</span>
+                          <span className={`text-xs font-bold px-2 py-0.5 rounded-md ${out.action === 'LONG' ? 'bg-up/15 text-up border border-up/20' : 'bg-down/15 text-down border border-down/20'}`}>
+                            {out.action}
+                          </span>
+                          <span className="text-[11px] text-textDim bg-surface3 border border-borderLight px-2 py-0.5 rounded font-mono">{out.votes}</span>
+                        </div>
+                        {out.judge_reasoning && (
+                          <p className="text-[11px] text-textMuted leading-relaxed line-clamp-3">{out.judge_reasoning}</p>
+                        )}
+                      </div>
+                    </div>
+                    {/* Agent proposals */}
+                    {out.proposals.length > 0 && (
+                      <div className="divide-y divide-borderLight">
+                        {out.proposals.map((p, i) => (
+                          <div key={i} className="px-4 py-3 flex items-start gap-3">
+                            <div className="shrink-0 mt-0.5">
+                              <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${p.action === 'LONG' ? 'bg-up/10 text-up' : 'bg-down/10 text-down'}`}>{p.action}</span>
+                            </div>
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 mb-0.5">
+                                <span className="text-[11px] font-semibold text-textMain">{p.agent_name}</span>
+                                <span className="text-[10px] font-mono text-brand-400">{p.ticker}</span>
+                              </div>
+                              <p className="text-[10px] text-textDim leading-relaxed line-clamp-2">{p.reasoning}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
 
@@ -2850,12 +3426,46 @@ function AppInner() {
           </div>
           <div className="flex items-center gap-3">
             {pendingStrategies.length > 0 && (
-              <button
-                onClick={() => setPage('dashboard')}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 text-amber-700 dark:text-amber-300 rounded-lg text-xs font-medium animate-pulse hover:bg-amber-200 dark:hover:bg-amber-900 transition-colors"
-              >
-                <span>⚠</span> {pendingStrategies.length} Pending
-              </button>
+              <div className="relative">
+                <button
+                  onClick={() => setPendingDropdownOpen(o => !o)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 text-amber-700 dark:text-amber-300 rounded-lg text-xs font-medium animate-pulse hover:bg-amber-200 dark:hover:bg-amber-900 transition-colors"
+                >
+                  <span>⚠</span> {pendingStrategies.length} pending {pendingStrategies.length === 1 ? 'strategy' : 'strategies'}
+                </button>
+                {pendingDropdownOpen && (
+                  <div className="absolute right-0 top-full mt-2 z-50 w-80 bg-surface border border-borderMid rounded-xl shadow-2xl overflow-hidden">
+                    <div className="px-4 py-3 border-b border-borderLight bg-surface2 flex items-center justify-between">
+                      <span className="text-xs font-semibold text-amber-400">Pending Approval</span>
+                      <button onClick={() => setPendingDropdownOpen(false)} className="text-textDim hover:text-textMain text-base leading-none">×</button>
+                    </div>
+                    <div className="divide-y divide-borderLight max-h-96 overflow-y-auto">
+                      {pendingStrategies.map(s => (
+                        <div key={s.id} className="px-4 py-3 space-y-2">
+                          <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                              <span className={`text-xs font-bold px-2 py-0.5 rounded ${s.strategy_type === 'LONG' ? 'bg-up/10 text-up' : 'bg-down/10 text-down'}`}>{s.strategy_type}</span>
+                              <span className="text-sm font-semibold text-textMain">{s.symbol}</span>
+                            </div>
+                            <span className="text-[10px] text-textDim">${(s.entry_price ?? 0).toFixed(2)}</span>
+                          </div>
+                          <p className="text-[11px] text-textMuted leading-relaxed line-clamp-2">{s.reasoning_summary}</p>
+                          <div className="flex gap-2 pt-1">
+                            <button
+                              onClick={() => { handleApproval(s.id, 'approve'); setPendingDropdownOpen(false); }}
+                              className="flex-1 py-1.5 text-xs font-semibold rounded-lg bg-up/10 border border-up/30 text-up hover:bg-up/20 transition-colors"
+                            >Approve</button>
+                            <button
+                              onClick={() => { handleApproval(s.id, 'reject'); setPendingDropdownOpen(false); }}
+                              className="flex-1 py-1.5 text-xs font-semibold rounded-lg bg-down/10 border border-down/30 text-down hover:bg-down/20 transition-colors"
+                            >Reject</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
             )}
             <button
               onClick={toggleDarkMode}
@@ -2888,13 +3498,32 @@ function AppInner() {
           {pageContent[page]()}
         </div>
       </main>
+
+      {/* Strategy Report Panel */}
+      {reportStratId !== null && (
+        <StrategyReportPanel
+          report={reportData}
+          loading={reportLoading}
+          error={reportError}
+          onClose={() => { setReportStratId(null); setReportData(null); setReportError(null); }}
+        />
+      )}
+      <ToastList toasts={toasts} />
     </div>
   );
 }
 
 function App() {
   const [authed, setAuthed] = useState<boolean>(() => !!getToken());
-  if (!authed) return <LandingPage onLogin={() => setAuthed(true)} />;
+  const handleLogin = () => {
+    window.history.replaceState(null, '', window.location.pathname);
+    setAuthed(true);
+  };
+  // If already authed and URL has a landing-page hash (e.g. #how-it-works), strip it
+  if (authed && window.location.hash) {
+    window.history.replaceState(null, '', window.location.pathname);
+  }
+  if (!authed) return <LandingPage onLogin={handleLogin} />;
   return <AppInner />;
 }
 

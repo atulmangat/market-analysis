@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime
+from sqlalchemy import Column, Integer, BigInteger, String, Float, Text, DateTime
 from database import Base
 from datetime import datetime
 
@@ -9,7 +9,7 @@ class MarketSignal(Base):
     symbol = Column(String, index=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
     price = Column(Float)
-    volume = Column(Integer)
+    volume = Column(BigInteger)
     
 class AgentPrediction(Base):
     __tablename__ = "agent_predictions"
@@ -41,6 +41,7 @@ class DeployedStrategy(Base):
     close_reason = Column(String, nullable=True)    # STOP_LOSS | TAKE_PROFIT | MANUAL | REJECTED
     closed_at = Column(DateTime, nullable=True)     # when the position was closed
     notes = Column(Text, nullable=True)             # user editable notes
+    debate_round_id = Column(Integer, nullable=True, index=True)  # FK → DebateRound.id
 
 
 class AgentPrompt(Base):
@@ -72,6 +73,7 @@ class DebateRound(Base):
     enabled_markets = Column(String)         # e.g. "US, Crypto, India, MCX"
     research_context = Column(Text, nullable=True) # JSON tracking what research was used
     judge_reasoning = Column(Text, nullable=True)  # Judge LLM verdict explaining the final decision
+    report_json = Column(Text, nullable=True)       # Full structured report (chart + fundamentals) generated post-deploy
 
 class AppConfig(Base):
     __tablename__ = "app_config"

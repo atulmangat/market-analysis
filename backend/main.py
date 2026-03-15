@@ -50,8 +50,10 @@ async def lifespan(app: FastAPI):
     if scheduler:
         scheduler.shutdown()
 
-# Create database tables
+# Create database tables + run migrations
 Base.metadata.create_all(bind=engine)
+from database import run_migrations
+run_migrations(engine)
 
 app = FastAPI(title="AI Stock Market Suggestion API", lifespan=lifespan)
 
@@ -128,46 +130,9 @@ def cron_debate(focus_tickers: list[str] | None = None):
         db.close()
         raise
 
-    from pipeline import _fire_next
-    cron_secret = os.getenv("CRON_SECRET", "")
-    _fire_next("/api/pipeline/research", {"run_id": run_id}, cron_secret)
+    from pipeline import run_full_pipeline
+    run_full_pipeline(run_id)
     return {"status": "pipeline_started", "run_id": run_id}
-
-
-class PipelineStepRequest(BaseModel):
-    run_id: str
-
-
-@app.post("/api/pipeline/research", dependencies=[Depends(_verify_cron)])
-def pipeline_research_endpoint(body: PipelineStepRequest):
-    from pipeline import pipeline_research
-    t = threading.Thread(target=pipeline_research, args=(body.run_id,), daemon=True)
-    t.start()
-    return {"status": "research_started", "run_id": body.run_id}
-
-
-@app.post("/api/pipeline/agents", dependencies=[Depends(_verify_cron)])
-def pipeline_agents_endpoint(body: PipelineStepRequest):
-    from pipeline import pipeline_agents
-    t = threading.Thread(target=pipeline_agents, args=(body.run_id,), daemon=True)
-    t.start()
-    return {"status": "agents_started", "run_id": body.run_id}
-
-
-@app.post("/api/pipeline/consensus", dependencies=[Depends(_verify_cron)])
-def pipeline_consensus_endpoint(body: PipelineStepRequest):
-    from pipeline import pipeline_consensus
-    t = threading.Thread(target=pipeline_consensus, args=(body.run_id,), daemon=True)
-    t.start()
-    return {"status": "consensus_started", "run_id": body.run_id}
-
-
-@app.post("/api/pipeline/deploy", dependencies=[Depends(_verify_cron)])
-def pipeline_deploy_endpoint(body: PipelineStepRequest):
-    from pipeline import pipeline_deploy
-    t = threading.Thread(target=pipeline_deploy, args=(body.run_id,), daemon=True)
-    t.start()
-    return {"status": "deploy_started", "run_id": body.run_id}
 
 
 @app.post("/api/cron/evaluate", dependencies=[Depends(_verify_cron)])

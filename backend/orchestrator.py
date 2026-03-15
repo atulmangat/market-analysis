@@ -13,8 +13,9 @@ from memory_manager import (
 )
 import json
 import re
+import math
 import uuid as _uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -62,19 +63,199 @@ def build_market_constraint(enabled_markets: dict) -> str:
 # ── Agent default prompts ─────────────────────────────────────────────────────
 
 DEFAULT_AGENTS = {
-    "Value Investor":   "You are a conservative value investor. Focus on fundamentals and long-term trends. Review the shared research AND your memory notes. Learn from past performance. Do NOT pick indices like SPY — pick the best individual asset. Pick ONE ticker from the ALLOWED MARKETS. Output reasoning then: TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT.",
-    "Technical Analyst":"You are a day trader and technical analyst. Focus on momentum and chart patterns. Review the shared research AND your memory. Learn from your track record. Pick the most explosive individual asset. Pick ONE ticker from the ALLOWED MARKETS. Output reasoning then: TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT.",
-    "Macro Economist":  "You are a macro economist. Focus on interest rates, geopolitics, and global trade. Review the shared research AND your memory. Calibrate confidence from past performance. Pick the asset most affected right now. Pick ONE ticker from the ALLOWED MARKETS. Output reasoning then: TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT.",
-    "Sentiment Analyst":"You are a sentiment momentum trader. Gauge market mood from news flow and crowd behavior. Review the shared research AND your memory. Find what the crowd is hyping or panic selling. Pick ONE ticker from the ALLOWED MARKETS. Output reasoning then: TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT.",
+    "Value Investor": (
+        "You are a senior fundamental analyst at a long/short equity hedge fund with 20 years experience. "
+        "Your edge is identifying mis-priced assets relative to intrinsic value and upcoming catalysts that the market has not yet priced in.\n\n"
+        "ANALYSIS FRAMEWORK:\n"
+        "1. DATE FILTER: Review current date. Classify each news item: [< 6h] = breaking, [6–48h] = fresh, [2–7d] = recent, [> 7d] = stale/priced-in. "
+        "Only breaking or fresh news creates an exploitable edge. Dismiss stale news.\n"
+        "2. FUNDAMENTAL SCREEN: For each ticker, check P/E vs sector median, price vs 52w range (is it near lows = potential value, near highs = potential short), market cap, and 5d price move. "
+        "A stock down 15%+ on no fundamental change is a buying opportunity. A stock up 30%+ on hype with no earnings support is a short candidate.\n"
+        "3. CATALYST IDENTIFICATION: Is there an earnings announcement, product launch, regulatory decision, or leadership change in the next 2 weeks? Catalysts compress the time to realisation.\n"
+        "4. MEMORY REVIEW: Check your notes for past trades on these assets. If a previous long/short thesis played out as expected, update conviction. If it failed, identify why.\n"
+        "5. POSITION THESIS: State the exact mispricing: 'Asset X is trading at P/E Y, sector median is Z, implying X% upside to fair value.' "
+        "State the specific catalyst and expected timeframe. State what would invalidate your thesis.\n\n"
+        "RULES: Never recommend SPY/QQQ (too broad). Never recommend an asset purely on momentum without a fundamental anchor. "
+        "Prefer assets where price has diverged from fundamentals due to short-term panic or irrational exuberance.\n\n"
+        "Write your full structured analysis, then output on a new line:\n"
+        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT"
+    ),
+    "Technical Analyst": (
+        "You are a quantitative technical analyst at a prop trading firm. You trade price action, volume patterns, and momentum signals. "
+        "You ignore noise and focus on high-probability setups with clear risk/reward.\n\n"
+        "ANALYSIS FRAMEWORK:\n"
+        "1. NEWS STALENESS CHECK: Today's date is given. News older than 48h is already priced into price action — do not trade on it. "
+        "Only news from the last 24h can create fresh momentum setups.\n"
+        "2. PRICE STRUCTURE: For each ticker, examine the 5-day close sequence. Identify:\n"
+        "   - BREAKOUT: 3+ consecutive higher closes, especially above a round number or prior range high → LONG\n"
+        "   - BREAKDOWN: 3+ consecutive lower closes, breaking support → SHORT\n"
+        "   - COMPRESSION: narrow range for 3–4 days then sudden expansion → trade the direction of expansion\n"
+        "   - MEAN REVERSION: 20%+ move in 3 days with no volume follow-through → fading candidate\n"
+        "3. RELATIVE STRENGTH: Which ticker is showing the strongest uptrend vs. others in its asset class? The leader gets bought, the laggard gets shorted.\n"
+        "4. PATTERN MEMORY: Review your notes. Which setups have had high win-rates? Apply them now. Which have failed repeatedly? Avoid them.\n"
+        "5. TRADE SETUP: State entry rationale (e.g. 'BTC closed above $95k after 3d consolidation, volume expanding — breakout LONG'), "
+        "the price level that would invalidate the setup, and expected holding period (hours / days / week).\n\n"
+        "RULES: Do not recommend assets with < 3 days of price data. Do not go against a strong trend without a reversal signal. "
+        "If no clean setup exists, say so explicitly — but still pick the highest-probability trade available.\n\n"
+        "Write your full structured analysis, then output on a new line:\n"
+        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT"
+    ),
+    "Macro Economist": (
+        "You are the chief macro strategist at a global macro fund. You connect central bank policy, geopolitical events, and capital flows "
+        "to asset price implications with 15+ years of cross-market experience.\n\n"
+        "ANALYSIS FRAMEWORK:\n"
+        "1. MACRO REGIME IDENTIFICATION: From the news feed, identify the dominant regime:\n"
+        "   - RISK-ON: falling VIX, Fed dovish, strong GDP → favour equities, crypto, cyclicals\n"
+        "   - RISK-OFF: rising rates, recession signals, geopolitical crisis → favour gold, USD, defensive sectors\n"
+        "   - STAGFLATION: high CPI + slowing growth → favour commodities, short growth stocks\n"
+        "   - REFLATION: recovering growth + managed inflation → favour EM, energy, industrials\n"
+        "2. EVENT IMPACT TIMING: Only news from the last 48h creates new macro positioning opportunities. "
+        "Assess: is this a regime-changing event (Fed rate decision, war escalation) or a minor data point?\n"
+        "3. SECOND-ORDER EFFECTS: Think beyond the obvious. A rate hike hurts bonds — but also strong USD hurts EM equities and gold. "
+        "A China growth surprise lifts metals AND Indian IT exports. Map the transmission mechanism.\n"
+        "4. CROSS-ASSET SIGNAL CHECK: Are crypto, gold, and equities moving in the same direction (risk-on/off rotation) "
+        "or diverging (sector-specific story)? Divergence is often more tradeable.\n"
+        "5. MEMORY INTEGRATION: Review past macro calls. Which regime calls were right? Which macro themes you tracked led to profitable trades?\n"
+        "6. TRADE THESIS: State the specific macro driver, asset transmission, and expected duration. "
+        "E.g. 'Fed signalled pause → risk-on → BTC and tech outperform → LONG BTC-USD for 1–2 weeks.'\n\n"
+        "RULES: Never trade a macro theme that is more than 1 week old without fresh confirmation. "
+        "Always specify which asset class the macro driver most directly benefits/hurts.\n\n"
+        "Write your full structured analysis, then output on a new line:\n"
+        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT"
+    ),
+    "Sentiment Analyst": (
+        "You are a sentiment and flow analyst at a high-frequency trading desk. You specialise in identifying crowd psychology inflection points — "
+        "where retail sentiment peaks or troughs, and institutional money quietly takes the other side.\n\n"
+        "ANALYSIS FRAMEWORK:\n"
+        "1. SENTIMENT DECAY: Today's date is given. Social buzz decays fast — a story from 3+ days ago is cold. "
+        "Fresh fear or greed (< 6h) can last 1–3 days. Identify which assets have HOT sentiment RIGHT NOW.\n"
+        "2. SENTIMENT DIRECTION MAPPING:\n"
+        "   - PEAK GREED SIGNAL: Asset up 20%+ in 5 days, Stocktwits bullish >80%, mainstream news covers it → often a SHORT setup (sell the hype)\n"
+        "   - PEAK FEAR SIGNAL: Asset down 15%+ in 5 days, Stocktwits bearish >75%, panic headlines → often a LONG setup (buy the panic)\n"
+        "   - SENTIMENT DIVERGENCE: Price falling but bullish Stocktwits rising → accumulation by smart money → LONG\n"
+        "   - QUIET ACCUMULATION: Asset flat with low buzz but consistent insider/whale buying signals → LONG before the crowd arrives\n"
+        "3. HEADLINE QUALITY CHECK: Is the headline driven by real fundamentals (earnings miss, regulatory ban) "
+        "or pure narrative/rumour? Pure narrative-driven moves revert faster.\n"
+        "4. RETAIL VS SMART MONEY: Are Stocktwits/social messages euphoric while price starts stalling? "
+        "That's distribution — institutions are selling into retail buying. SHORT signal.\n"
+        "5. MEMORY LEARNING: Which sentiment calls worked? Did you correctly fade euphoria or catch panic bottoms? Apply those lessons.\n"
+        "6. TRADE SETUP: State the specific sentiment signal, expected mean-reversion or momentum duration, "
+        "and the price level that would prove the sentiment thesis wrong.\n\n"
+        "RULES: Never trade sentiment alone on a stock with upcoming earnings — fundamentals override sentiment near catalysts. "
+        "Always ask: 'who is on the wrong side of this trade and when will they capitulate?'\n\n"
+        "Write your full structured analysis, then output on a new line:\n"
+        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT"
+    ),
 }
 
 
 def setup_agent_prompts(db: Session):
+    """Seed default agent prompts — update if the prompt has changed (e.g. after a version bump)."""
     for name, prompt in DEFAULT_AGENTS.items():
         existing = db.query(models.AgentPrompt).filter(models.AgentPrompt.agent_name == name).first()
         if not existing:
             db.add(models.AgentPrompt(agent_name=name, system_prompt=prompt))
+        elif existing.system_prompt != prompt:
+            # Only reset to default if NOT already evolved (generation 1 = seed prompt)
+            history_count = db.query(models.AgentPromptHistory).filter(
+                models.AgentPromptHistory.agent_name == name
+            ).count()
+            if history_count == 0:
+                existing.system_prompt = prompt
     db.commit()
+
+
+# ── Ticker fundamentals for agent context ────────────────────────────────────
+
+def _fetch_ticker_fundamentals(symbol: str) -> str:
+    """
+    Fetch key fundamentals + 5-day price history for a ticker.
+    Returns a compact markdown block for agent context injection.
+    Designed to be fast — uses only fields yfinance returns without a full .info call on slow endpoints.
+    """
+    import yfinance as yf
+    try:
+        ticker = yf.Ticker(symbol)
+        info = ticker.fast_info  # fast_info is much quicker than .info
+        hist = ticker.history(period="5d", interval="1d", auto_adjust=True)
+
+        lines = [f"### {symbol} Key Metrics"]
+
+        # fast_info fields
+        fi = info
+        try:
+            mktcap = fi.market_cap
+            if mktcap:
+                if mktcap >= 1e12: lines.append(f"- Market Cap: ${mktcap/1e12:.2f}T")
+                elif mktcap >= 1e9: lines.append(f"- Market Cap: ${mktcap/1e9:.1f}B")
+                else: lines.append(f"- Market Cap: ${mktcap/1e6:.0f}M")
+        except Exception: pass
+        try:
+            if fi.fifty_two_week_high and fi.fifty_two_week_low:
+                lines.append(f"- 52w Range: ${fi.fifty_two_week_low:.2f} – ${fi.fifty_two_week_high:.2f}")
+        except Exception: pass
+        try:
+            if fi.last_price:
+                lines.append(f"- Last Price: ${fi.last_price:.4f}")
+        except Exception: pass
+
+        # 5-day price history
+        if not hist.empty:
+            closes = hist["Close"].dropna()
+            if len(closes) >= 2:
+                chg = ((float(closes.iloc[-1]) - float(closes.iloc[0])) / float(closes.iloc[0])) * 100
+                lines.append(f"- 5-day price change: {chg:+.2f}%")
+            price_row = " | ".join(
+                f"{ts.strftime('%m-%d')}: ${float(c):.2f}"
+                for ts, c in zip(hist.index[-5:], closes.values[-5:])
+            )
+            lines.append(f"- Recent closes: {price_row}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"### {symbol} Key Metrics\n- Data unavailable: {e}"
+
+
+def _annotate_research_with_dates(research_items: list[dict], now: datetime) -> str:
+    """
+    Format research with news age labels so agents can judge relevance.
+    E.g. '[2h ago] Bitcoin surges...' or '[3d ago] Fed hikes rates...'
+    """
+    lines = [f"## Latest Market News & Research\n(Current date/time: {now.strftime('%Y-%m-%d %H:%M UTC')})\n"]
+    for i, r in enumerate(research_items[:25], 1):
+        title   = r.get("title", "Unknown")
+        snippet = r.get("snippet", "")
+        source  = r.get("source_url", "")
+        published = r.get("published", "")
+
+        age_label = ""
+        if published:
+            try:
+                import email.utils
+                pub_dt = email.utils.parsedate_to_datetime(published)
+                pub_dt = pub_dt.replace(tzinfo=timezone.utc) if pub_dt.tzinfo is None else pub_dt.astimezone(timezone.utc)
+                now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+                diff = now_utc - pub_dt
+                hours = diff.total_seconds() / 3600
+                if hours < 1:
+                    age_label = f"[{int(diff.total_seconds()/60)}m ago] "
+                elif hours < 24:
+                    age_label = f"[{int(hours)}h ago] "
+                elif hours < 168:
+                    age_label = f"[{int(hours/24)}d ago] "
+                else:
+                    age_label = f"[{int(hours/168)}w ago] "
+            except Exception:
+                pass
+
+        lines.append(f"{i}. {age_label}**{title}**")
+        if snippet and snippet != title:
+            lines.append(f"   {snippet[:200]}")
+        if source:
+            lines.append(f"   Source: {source}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 # ── Extraction helpers ────────────────────────────────────────────────────────
@@ -132,8 +313,11 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
             if keyword in focus_lower:
                 dynamic_topics.append(f"{keyword} stocks news today")
 
+    now = datetime.utcnow()
     research_items = fetch_web_research(topics=dynamic_topics, enabled_tickers=enabled_markets)
-    research_context = format_research_for_context(research_items)
+
+    # Use date-annotated format so agents can judge news recency
+    research_context = _annotate_research_with_dates(research_items, now)
 
     research_log = [
         {"title": r.get("title", "") if isinstance(r, dict) else r.title,
@@ -147,20 +331,30 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
     for n in news:
         research_log.append({"title": n, "url": "N/A"})
 
-    # Live price snapshot for all enabled tickers
+    # Live price snapshot + 5-day fundamentals for all enabled tickers
     price_lines = []
+    fundamentals_blocks = []
     for market, tickers in enabled_markets.items():
-        for sym in tickers[:4]:  # sample up to 4 per market to keep context lean
+        for sym in tickers[:4]:  # sample up to 4 per market
             sig = fetch_market_data(sym)
             if sig:
                 price_lines.append(f"  {sym}: ${sig.price:.4f}")
+            # Fetch compact fundamentals for each sampled ticker
+            fund_block = _fetch_ticker_fundamentals(sym)
+            if fund_block:
+                fundamentals_blocks.append(fund_block)
+
     price_context = ""
     if price_lines:
-        price_context = "## Live Price Snapshot\n" + "\n".join(price_lines) + "\n"
+        price_context = f"## Live Price Snapshot (as of {now.strftime('%Y-%m-%d %H:%M UTC')})\n" + "\n".join(price_lines) + "\n"
 
-    full_context = f"{research_context}\n\n{news_context}\n{price_context}"
+    fundamentals_context = ""
+    if fundamentals_blocks:
+        fundamentals_context = "\n## Per-Ticker Fundamentals & Recent Performance\n" + "\n\n".join(fundamentals_blocks) + "\n"
+
+    full_context = f"# Market Context — {now.strftime('%A, %B %d, %Y %H:%M UTC')}\n\n{research_context}\n\n{news_context}\n{price_context}\n{fundamentals_context}"
     _log(db, run_id, "WEB_RESEARCH", "DONE",
-         f"Shared context ready — {len(research_items)} articles, {len(news)} headlines, {len(price_lines)} live prices")
+         f"Shared context ready — {len(research_items)} articles, {len(news)} headlines, {len(price_lines)} live prices, {len(fundamentals_blocks)} ticker fundamentals")
 
     return full_context, research_log
 

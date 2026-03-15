@@ -1,12 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 from database import get_db
 from pydantic import BaseModel
 from typing import List
 from datetime import datetime
+import json
+import math
 import models
 import yfinance as yf
-from auth import require_auth, verify_password, create_token
+from auth import require_auth, verify_password, create_token, check_rate_limit, record_failed_attempt, record_success
 
 
 # Public router — no auth required
@@ -22,9 +24,12 @@ class LoginRequest(BaseModel):
     password: str
 
 @router.post("/auth/login", tags=["auth"])
-def login(body: LoginRequest):
+def login(body: LoginRequest, request: Request):
+    check_rate_limit(request)
     if not verify_password(body.password):
+        record_failed_attempt(request)
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid password")
+    record_success(request)
     return {"token": create_token()}
 
 
@@ -44,7 +49,66 @@ def _strategy_to_dict(s) -> dict:
         "close_reason":     s.close_reason,
         "closed_at":        s.closed_at.isoformat() if s.closed_at else None,
         "notes":            s.notes,
+        "debate_round_id":  s.debate_round_id,
     }
+
+
+def _build_chart(symbol: str, entry_price: float, entry_dt) -> dict:
+    """Return 1-month daily OHLCV candles + entry price marker for charting."""
+    try:
+        ticker = yf.Ticker(symbol)
+        hist = ticker.history(period="1mo", interval="1d", auto_adjust=True)
+        candles = []
+        for ts, row in hist.iterrows():
+            v = int(row["Volume"]) if not math.isnan(float(row["Volume"] or 0)) else 0
+            candles.append({
+                "date":   ts.strftime("%Y-%m-%d"),
+                "open":   round(float(row["Open"]),  4),
+                "high":   round(float(row["High"]),  4),
+                "low":    round(float(row["Low"]),   4),
+                "close":  round(float(row["Close"]), 4),
+                "volume": v,
+            })
+        return {
+            "symbol":      symbol,
+            "period":      "1mo",
+            "candles":     candles,
+            "entry_price": entry_price,
+            "entry_date":  entry_dt.strftime("%Y-%m-%d") if entry_dt else None,
+        }
+    except Exception as e:
+        return {"symbol": symbol, "period": "1mo", "candles": [], "error": str(e)}
+
+
+def _build_fundamentals(symbol: str) -> dict:
+    """Return key fundamental fields from yfinance, gracefully handling missing data."""
+    try:
+        info = yf.Ticker(symbol).info
+        return {
+            "name":           info.get("longName") or info.get("shortName"),
+            "sector":         info.get("sector"),
+            "industry":       info.get("industry"),
+            "market_cap":     info.get("marketCap"),
+            "pe_ratio":       info.get("trailingPE"),
+            "forward_pe":     info.get("forwardPE"),
+            "52w_high":       info.get("fiftyTwoWeekHigh"),
+            "52w_low":        info.get("fiftyTwoWeekLow"),
+            "avg_volume":     info.get("averageVolume"),
+            "beta":           info.get("beta"),
+            "dividend_yield": info.get("dividendYield"),
+            "currency":       info.get("currency", "USD"),
+            "exchange":       info.get("exchange"),
+            "quote_type":     info.get("quoteType"),
+            "description":    (info.get("longBusinessSummary") or "")[:400] or None,
+        }
+    except Exception as e:
+        return {
+            "name": None, "sector": None, "industry": None, "market_cap": None,
+            "pe_ratio": None, "forward_pe": None, "52w_high": None, "52w_low": None,
+            "avg_volume": None, "beta": None, "dividend_yield": None,
+            "currency": "USD", "exchange": None, "quote_type": None,
+            "description": None, "error": str(e),
+        }
 
 
 class MarketUpdate(BaseModel):
@@ -71,6 +135,111 @@ def get_predictions(db: Session = Depends(get_db)):
 def get_strategies(db: Session = Depends(get_db)):
     strategies = db.query(models.DeployedStrategy).order_by(models.DeployedStrategy.timestamp.desc()).limit(50).all()
     return [_strategy_to_dict(s) for s in strategies]
+
+@protected.get("/strategies/{strategy_id}/report")
+def get_strategy_report(strategy_id: int, db: Session = Depends(get_db)):
+    """Return full report for a strategy: chart, fundamentals, and linked debate."""
+    import traceback, logging
+    logger = logging.getLogger(__name__)
+    try:
+        s = db.query(models.DeployedStrategy).filter(
+            models.DeployedStrategy.id == strategy_id
+        ).first()
+        if not s:
+            raise HTTPException(status_code=404, detail="Strategy not found")
+
+        # Debate block
+        debate_block = None
+        dr = None
+        if s.debate_round_id:
+            dr = db.query(models.DebateRound).filter(
+                models.DebateRound.id == s.debate_round_id
+            ).first()
+            if dr:
+                try:
+                    raw_proposals = json.loads(dr.proposals_json or "[]")
+                except Exception:
+                    raw_proposals = []
+                proposals_with_match = [
+                    {**p, "matched_consensus": (
+                        p.get("ticker") == dr.consensus_ticker and
+                        p.get("action") == dr.consensus_action
+                    )}
+                    for p in raw_proposals
+                ]
+                debate_block = {
+                    "id":               dr.id,
+                    "timestamp":        dr.timestamp.isoformat(),
+                    "consensus_votes":  dr.consensus_votes,
+                    "judge_reasoning":  dr.judge_reasoning,
+                    "proposals":        proposals_with_match,
+                    "enabled_markets":  dr.enabled_markets,
+                }
+
+        # If no debate_round_id, try to find matching debate round by ticker + timestamp proximity
+        if not dr:
+            dr = db.query(models.DebateRound).filter(
+                models.DebateRound.consensus_ticker == s.symbol,
+            ).order_by(models.DebateRound.id.desc()).first()
+            if dr and debate_block is None:
+                try:
+                    raw_proposals = json.loads(dr.proposals_json or "[]")
+                except Exception:
+                    raw_proposals = []
+                proposals_with_match = [
+                    {**p, "matched_consensus": (
+                        p.get("ticker") == dr.consensus_ticker and
+                        p.get("action") == dr.consensus_action
+                    )}
+                    for p in raw_proposals
+                ]
+                debate_block = {
+                    "id":               dr.id,
+                    "timestamp":        dr.timestamp.isoformat(),
+                    "consensus_votes":  dr.consensus_votes,
+                    "judge_reasoning":  dr.judge_reasoning,
+                    "proposals":        proposals_with_match,
+                    "enabled_markets":  dr.enabled_markets,
+                }
+
+        # Use pre-generated report from debate round if available (fast path)
+        cached_chart = None
+        cached_fundamentals = None
+        if dr and dr.report_json:
+            try:
+                cached = json.loads(dr.report_json)
+                cached_chart = cached.get("chart")
+                cached_fundamentals = cached.get("fundamentals")
+            except Exception:
+                pass
+
+        # Fall back to empty stubs — never call yfinance on-demand in serverless (times out)
+        chart = cached_chart or {
+            "symbol": s.symbol, "period": "1mo", "candles": [],
+            "entry_price": s.entry_price or 0.0,
+            "entry_date": s.timestamp.strftime("%Y-%m-%d") if s.timestamp else None,
+            "error": "Chart not yet generated — run the pipeline to refresh.",
+        }
+        fundamentals = cached_fundamentals or {
+            "name": None, "sector": None, "industry": None, "market_cap": None,
+            "pe_ratio": None, "forward_pe": None, "52w_high": None, "52w_low": None,
+            "avg_volume": None, "beta": None, "dividend_yield": None,
+            "currency": "USD", "exchange": None, "quote_type": None, "description": None,
+            "error": "Fundamentals not yet generated — run the pipeline to refresh.",
+        }
+
+        return {
+            "strategy":     _strategy_to_dict(s),
+            "debate":       debate_block,
+            "chart":        chart,
+            "fundamentals": fundamentals,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Report endpoint error: %s\n%s", e, traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Report generation failed: {str(e)}")
+
 
 @protected.get("/debates")
 def get_debates(db: Session = Depends(get_db)):
@@ -162,13 +331,55 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
             )
             .first()
         )
+        # Find the DebateRound and linked strategy for this run via PipelineRun
+        pipeline_run = db.query(models.PipelineRun).filter(
+            models.PipelineRun.run_id == row.run_id
+        ).first()
+
+        debate_round = None
+        strategy_id = None
+        if pipeline_run:
+            # Find strategy linked to a debate round created near this run's time
+            strategy = (
+                db.query(models.DeployedStrategy)
+                .filter(
+                    models.DeployedStrategy.timestamp >= row.started_at,
+                    models.DeployedStrategy.timestamp <= row.ended_at,
+                )
+                .order_by(models.DeployedStrategy.timestamp.desc())
+                .first()
+            )
+            if strategy:
+                strategy_id = strategy.id
+                if strategy.debate_round_id:
+                    debate_round = db.query(models.DebateRound).filter(
+                        models.DebateRound.id == strategy.debate_round_id
+                    ).first()
+
+        output = None
+        if debate_round:
+            try:
+                proposals = json.loads(debate_round.proposals_json or "[]")
+            except Exception:
+                proposals = []
+            output = {
+                "ticker":          debate_round.consensus_ticker,
+                "action":          debate_round.consensus_action,
+                "votes":           debate_round.consensus_votes,
+                "judge_reasoning": (debate_round.judge_reasoning or "")[:300],
+                "proposals":       proposals,
+                "strategy_id":     strategy_id,
+                "debate_id":       debate_round.id,
+            }
+
         result.append({
-            "run_id":      row.run_id,
-            "started_at":  row.started_at.isoformat(),
-            "ended_at":    row.ended_at.isoformat(),
-            "event_count": row.event_count,
-            "status":      status,
+            "run_id":        row.run_id,
+            "started_at":    row.started_at.isoformat(),
+            "ended_at":      row.ended_at.isoformat(),
+            "event_count":   row.event_count,
+            "status":        status,
             "deploy_detail": deploy_event.detail if deploy_event else None,
+            "output":        output,
         })
     return result
 
@@ -262,15 +473,19 @@ def get_live_quotes():
                 import math as _math
                 vol_raw = vol_col.iloc[-1] if vol_col is not None and not vol_col.dropna().empty else None
                 vol = int(vol_raw) if vol_raw is not None and not _math.isnan(float(vol_raw)) else 0
+                week_closes = [round(float(v), 4) for v in col.tolist() if not _math.isnan(float(v))]
+                week_change_pct = round((price - week_closes[0]) / week_closes[0] * 100, 2) if len(week_closes) >= 2 else 0.0
 
                 results.append({
-                    "market":      market,
-                    "symbol":      symbol,
-                    "name":        TICKER_NAMES.get(symbol, symbol),
-                    "price":       round(price, 4),
-                    "prev_close":  round(prev, 4),
-                    "change_pct":  round(change_pct, 2),
-                    "volume":      vol,
+                    "market":           market,
+                    "symbol":           symbol,
+                    "name":             TICKER_NAMES.get(symbol, symbol),
+                    "price":            round(price, 4),
+                    "prev_close":       round(prev, 4),
+                    "change_pct":       round(change_pct, 2),
+                    "volume":           vol,
+                    "week_closes":      week_closes,
+                    "week_change_pct":  week_change_pct,
                 })
             except Exception as e:
                 results.append({
@@ -686,10 +901,8 @@ def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depend
         db.add(models.AppConfig(key="current_run_id", value=run_id))
     db.commit()
 
-    from pipeline import _fire_next
-    import os
-    cron_secret = os.getenv("CRON_SECRET", "")
-    _fire_next("/api/pipeline/research", {"run_id": run_id}, cron_secret)
+    from pipeline import run_full_pipeline
+    run_full_pipeline(run_id)
 
     msg = f"Focused pipeline run on: {', '.join(focus)}" if focus else "Full pipeline started."
     return {"status": "success", "message": msg, "run_id": run_id}
@@ -887,56 +1100,70 @@ def get_portfolio_pnl(db: Session = Depends(get_db)):
     allocated = 0.0
     positions = []
 
+    # Pre-compute per-position returns first, then derive allocations
+    active_strats_list = [s for s in all_strats if s.status == "ACTIVE"]
+    n_active = len(active_strats_list)
+
+    # If no position has a size set, assume equal-weight allocation across active positions
+    any_sized = any(s.position_size for s in active_strats_list)
+    assumed_per_pos = (total_budget / n_active) if (n_active > 0 and not any_sized) else None
+
     for s in all_strats:
-        pos_size = s.position_size or 0.0
+        explicit_size = s.position_size or 0.0
 
         if s.status == "CLOSED":
             rpnl = s.realized_pnl or 0.0
             realized_pnl += rpnl
             positions.append({
                 **_strategy_to_dict(s),
-                "pnl_usd": rpnl,
+                "pnl_usd": rpnl if explicit_size else None,
                 "pnl_pct": s.current_return,
                 "current_price": s.exit_price,
                 "is_open": False,
             })
         elif s.status == "ACTIVE":
-            allocated += pos_size
+            # Use explicit size if set, else assumed equal-weight size for portfolio math
+            effective_size = explicit_size if explicit_size else (assumed_per_pos or 0.0)
+            allocated += explicit_size  # only count explicitly sized positions toward "allocated"
+
             live_price = live_prices.get(s.symbol)
             if live_price and s.entry_price:
                 if s.strategy_type == "LONG":
                     pct = ((live_price - s.entry_price) / s.entry_price) * 100
                 else:
                     pct = ((s.entry_price - live_price) / s.entry_price) * 100
-                # Persist updated return to DB so validator has fresh value too
                 s.current_return = round(pct, 4)
-                upnl = (pos_size * pct / 100) if pos_size else None
             else:
                 pct = s.current_return or 0.0
-                upnl = (pos_size * pct / 100) if pos_size else None
 
-            if upnl is not None:
-                unrealized_pnl += upnl
+            upnl_for_summary = (effective_size * pct / 100) if effective_size else 0.0
+            upnl_for_card = (explicit_size * pct / 100) if explicit_size else None
+            unrealized_pnl += upnl_for_summary
+
             positions.append({
                 **_strategy_to_dict(s),
-                "pnl_usd": upnl,
+                "pnl_usd": upnl_for_card,
                 "pnl_pct": pct,
                 "current_price": live_price,
                 "is_open": True,
+                "assumed_size": round(assumed_per_pos, 2) if assumed_per_pos else None,
             })
 
     db.commit()  # persist updated current_return values
 
-    available = total_budget - allocated
+    # When no positions are explicitly sized, show assumed allocation figures
+    effective_allocated = total_budget if (n_active > 0 and not any_sized) else allocated
+    available = total_budget - effective_allocated
     total_pnl = realized_pnl + unrealized_pnl
 
     return {
         "total_budget":    total_budget,
-        "allocated":       allocated,
-        "available":       available,
+        "allocated":       round(effective_allocated, 2),
+        "available":       round(available, 2),
         "realized_pnl":    round(realized_pnl, 2),
         "unrealized_pnl":  round(unrealized_pnl, 2),
         "total_pnl":       round(total_pnl, 2),
         "total_pnl_pct":   round((total_pnl / total_budget * 100) if total_budget else 0, 2),
         "positions":       positions,
+        "using_assumed_sizes": not any_sized and n_active > 0,
     }

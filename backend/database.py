@@ -24,3 +24,21 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def run_migrations(engine):
+    """Run idempotent schema migrations not handled by create_all."""
+    from sqlalchemy import text
+    is_pg = not str(engine.url).startswith("sqlite")
+    if_not_exists = "IF NOT EXISTS " if is_pg else ""
+    migrations = [
+        f"ALTER TABLE deployed_strategies ADD COLUMN {if_not_exists}debate_round_id INTEGER",
+        f"ALTER TABLE debate_rounds ADD COLUMN {if_not_exists}report_json TEXT",
+    ]
+    with engine.connect() as conn:
+        for sql in migrations:
+            try:
+                conn.execute(text(sql))
+                conn.commit()
+            except Exception:
+                pass  # column already exists (SQLite) or other benign error

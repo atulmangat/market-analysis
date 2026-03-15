@@ -1,43 +1,43 @@
 import os
-from openai import OpenAI
+import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# We'll default to a free Llama 3 endpoint on OpenRouter for development, or what the user prefers.
-# The user prefers stepfun/step-3.5-flash:free with minimax/minimax-m2.5:nitro as fallback
-MODEL_NAME = os.getenv("LLM_MODEL", "stepfun/step-3.5-flash:free")
-FALLBACK_MODEL_NAME = os.getenv("FALLBACK_LLM_MODEL", "minimax/minimax-m2.5:nitro")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# OpenRouter client configuration
-client = OpenAI(
-  base_url="https://openrouter.ai/api/v1",
-  api_key=os.getenv("OPENROUTER_API_KEY", "dummy_key"), # Expecting this to be in .env
-)
+def _call_openrouter(model: str, messages: list, api_key: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://market-analysis.space",
+        "X-Title": "Market Analysis",
+    }
+    payload = {"model": model, "messages": messages}
+    with httpx.Client(timeout=120) as client:
+        res = client.post(OPENROUTER_URL, json=payload, headers=headers)
+        res.raise_for_status()
+        return res.json()["choices"][0]["message"]["content"]
+
 
 def query_agent(system_prompt: str, data_context: str) -> str:
     """
     Sends the data context to a specific agent based on its system prompt.
     Tries the primary model, falls back to the secondary model on failure.
     """
+    api_key  = os.getenv("OPENROUTER_API_KEY", "").strip()
+    model    = os.getenv("LLM_MODEL", "stepfun/step-3.5-flash:free")
+    fallback = os.getenv("FALLBACK_LLM_MODEL", "minimax/minimax-m2.5:nitro")
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": data_context}
+        {"role": "user",   "content": data_context},
     ]
     try:
-        completion = client.chat.completions.create(
-          model=MODEL_NAME,
-          messages=messages
-        )
-        return completion.choices[0].message.content
+        return _call_openrouter(model, messages, api_key)
     except Exception as e:
-        print(f"Primary model {MODEL_NAME} failed: {e}. Trying fallback {FALLBACK_MODEL_NAME}...")
+        print(f"Primary model {model} failed: {repr(e)}. Trying fallback {fallback}...")
         try:
-            completion_fallback = client.chat.completions.create(
-                model=FALLBACK_MODEL_NAME,
-                messages=messages
-            )
-            return completion_fallback.choices[0].message.content
+            return _call_openrouter(fallback, messages, api_key)
         except Exception as e2:
-            print(f"Fallback model failed too: {e2}")
-            return "Agent error: Unable to generate response."
+            print(f"Fallback model failed too: {repr(e2)}")
+            return f"Agent error: {repr(e2)}"
