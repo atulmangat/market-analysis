@@ -11,7 +11,12 @@
       "Bash(python3:*)",
       "Bash(npm run:*)",
       "Bash(kill:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(which vercel:*)",
+      "Bash(vercel inspect:*)",
+      "WebFetch(domain:kite.trade)",
+      "WebFetch(domain:api.groww.in)",
+      "WebFetch(domain:groww.in)"
     ]
   }
 }

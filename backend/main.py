@@ -5,20 +5,19 @@ try:
 except ImportError:
     pass
 
-from fastapi import FastAPI, BackgroundTasks, Depends
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from database import engine, Base, get_db
 import models
 import api
-from apscheduler.schedulers.background import BackgroundScheduler
 from contextlib import asynccontextmanager
-from orchestrator import run_debate
-from validator import evaluate_predictions
-from apscheduler.triggers.interval import IntervalTrigger
 
-# Setup Scheduler
-scheduler = BackgroundScheduler()
+# On Vercel (serverless), skip APScheduler — cron endpoints handle scheduling instead.
+# On Railway/local, use APScheduler for automatic background jobs.
+VERCEL = os.getenv("VERCEL", "") == "1"
+
+scheduler = None
 
 def get_initial_interval():
     from database import SessionLocal
@@ -29,17 +28,24 @@ def get_initial_interval():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Retrieve initial schedule interval from DB
-    interval = get_initial_interval()
-    print(f"[Scheduler] Starting jobs with an interval of {interval} minutes.")
-    
-    # Start the scheduler on app startup
-    scheduler.add_job(run_debate, 'interval', minutes=interval, id='debate_job')
-    scheduler.add_job(evaluate_predictions, 'interval', minutes=interval, id='eval_job')
-    scheduler.start()
+    global scheduler
+    if not VERCEL:
+        from apscheduler.schedulers.background import BackgroundScheduler
+        from apscheduler.triggers.interval import IntervalTrigger
+        from orchestrator import run_debate
+        from validator import evaluate_predictions
+
+        interval = get_initial_interval()
+        print(f"[Scheduler] Starting jobs with an interval of {interval} minutes.")
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(run_debate, 'interval', minutes=interval, id='debate_job')
+        scheduler.add_job(evaluate_predictions, 'interval', minutes=interval, id='eval_job')
+        scheduler.start()
+    else:
+        print("[Scheduler] Vercel mode — APScheduler disabled. Using cron endpoints.")
     yield
-    # Shutdown the scheduler on app teardown
-    scheduler.shutdown()
+    if scheduler:
+        scheduler.shutdown()
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -65,14 +71,47 @@ app.include_router(api.protected, prefix="/api")
 def read_root():
     return {"status": "ok", "message": "AI Stock Market Suggestion API is running"}
 
+
+# ── Cron endpoints (called by Vercel Cron — protected by CRON_SECRET) ────────
+
+from fastapi import Header, HTTPException
+
+def _verify_cron(x_vercel_cron_signature: str = Header(default="")):
+    """Allow Vercel cron calls (signed) or internal calls with CRON_SECRET header."""
+    secret = os.getenv("CRON_SECRET", "")
+    # Vercel sets this header automatically; for local testing pass it manually.
+    if secret and x_vercel_cron_signature != secret:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+@app.post("/api/cron/debate", dependencies=[Depends(_verify_cron)])
+def cron_debate():
+    """Vercel Cron endpoint: triggers a debate round."""
+    import threading
+    from orchestrator import run_debate
+    t = threading.Thread(target=run_debate, daemon=True)
+    t.start()
+    return {"status": "triggered"}
+
+@app.post("/api/cron/evaluate", dependencies=[Depends(_verify_cron)])
+def cron_evaluate():
+    """Vercel Cron endpoint: runs the prediction evaluator."""
+    import threading
+    from validator import evaluate_predictions
+    t = threading.Thread(target=evaluate_predictions, daemon=True)
+    t.start()
+    return {"status": "triggered"}
+
+
 @app.post("/api/system/sync_schedule")
 def sync_schedule(db: Session = Depends(get_db)):
-    """Used to sync the APScheduler interval with the database setting."""
+    """Sync APScheduler interval with the database setting (no-op on Vercel)."""
+    if VERCEL or scheduler is None:
+        return {"status": "skipped", "reason": "APScheduler not running (Vercel mode)"}
+
+    from apscheduler.triggers.interval import IntervalTrigger
     conf = db.query(models.AppConfig).filter(models.AppConfig.key == "schedule_interval_minutes").first()
     new_interval = int(conf.value) if conf else 60
-    
     print(f"[Scheduler] Rescheduling jobs to run every {new_interval} minutes.")
     scheduler.reschedule_job('debate_job', trigger=IntervalTrigger(minutes=new_interval))
     scheduler.reschedule_job('eval_job', trigger=IntervalTrigger(minutes=new_interval))
-    
     return {"status": "success", "new_interval_minutes": new_interval}

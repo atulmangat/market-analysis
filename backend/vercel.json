@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "builds": [
+    {
+      "src": "main.py",
+      "use": "@vercel/python"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/(.*)",
+      "dest": "main.py"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/debate",
+      "schedule": "0 9 * * *"
+    },
+    {
+      "path": "/api/cron/evaluate",
+      "schedule": "0 10 * * *"
+    }
+  ]
+}
