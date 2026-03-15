@@ -419,15 +419,20 @@ function LoginModal({ onLogin, onClose }: { onLogin: () => void; onClose: () => 
       onClick={onClose}
     >
       <div
-        className="w-full max-w-sm mx-4 bg-surface border border-borderMid rounded-2xl p-8 shadow-2xl space-y-6"
+        className="w-full max-w-sm mx-4 rounded-2xl p-8 shadow-2xl space-y-6"
+        style={{ background: '#161b22', border: '1px solid #374151' }}
         onClick={e => e.stopPropagation()}
       >
         <div className="flex items-center justify-between">
           <div>
-            <div className="text-xl font-bold text-textMain tracking-tight">Market<span className="text-brand-400">AI</span></div>
-            <p className="text-xs text-textMuted mt-0.5">Enter your access password</p>
+            <div className="text-xl font-bold tracking-tight" style={{ color: '#f1f5f9' }}>
+              market-analysis<span style={{ color: '#60a5fa' }}>.space</span>
+            </div>
+            <p className="text-xs mt-0.5" style={{ color: '#94a3b8' }}>Enter your access password</p>
           </div>
-          <button onClick={onClose} className="text-textDim hover:text-textMain text-xl leading-none">×</button>
+          <button onClick={onClose} className="text-xl leading-none transition-colors" style={{ color: '#64748b' }}
+            onMouseEnter={e => (e.currentTarget.style.color = '#f1f5f9')}
+            onMouseLeave={e => (e.currentTarget.style.color = '#64748b')}>×</button>
         </div>
 
         <form onSubmit={submit} className="space-y-4">
@@ -437,15 +442,21 @@ function LoginModal({ onLogin, onClose }: { onLogin: () => void; onClose: () => 
             value={password}
             onChange={e => setPassword(e.target.value)}
             placeholder="Password"
-            className="w-full px-4 py-3 rounded-xl bg-surface2 border border-borderLight focus:border-brand-500 focus:outline-none text-textMain placeholder-textDim text-sm transition-colors"
+            className="w-full px-4 py-3 rounded-xl text-sm transition-colors focus:outline-none"
+            style={{ background: '#0d1117', border: '1px solid #1e293b', color: '#f1f5f9' }}
+            onFocus={e => (e.currentTarget.style.borderColor = '#3b82f6')}
+            onBlur={e => (e.currentTarget.style.borderColor = '#1e293b')}
           />
           {error && (
-            <p className="text-xs text-red-400 bg-red-900/20 border border-red-800/40 rounded-lg px-3 py-2">{error}</p>
+            <p className="text-xs rounded-lg px-3 py-2" style={{ color: '#f87171', background: 'rgba(153,27,27,0.2)', border: '1px solid rgba(153,27,27,0.4)' }}>{error}</p>
           )}
           <button
             type="submit"
             disabled={loading || !password}
-            className="w-full py-3 rounded-xl bg-brand-500 hover:bg-brand-400 disabled:opacity-50 text-white font-semibold text-sm transition-colors">
+            className="w-full py-3 rounded-xl font-semibold text-sm transition-all disabled:opacity-50"
+            style={{ background: '#3b82f6', color: '#fff' }}
+            onMouseEnter={e => { if (!loading && password) e.currentTarget.style.background = '#60a5fa'; }}
+            onMouseLeave={e => { e.currentTarget.style.background = '#3b82f6'; }}>
             {loading ? 'Signing in…' : 'Open Dashboard →'}
           </button>
         </form>
