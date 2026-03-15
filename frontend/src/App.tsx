@@ -162,6 +162,7 @@ const NOTE_COLORS: Record<string, string> = {
 const STEP_META: Record<string, { icon: string; label: string; color: string }> = {
   START:        { icon: '▶', label: 'Pipeline Started',   color: 'text-brand-500 dark:text-brand-400'    },
   WEB_RESEARCH: { icon: '⌖', label: 'Shared Retrieval',   color: 'text-purple-600 dark:text-purple-400'  },
+  KG_INGEST:    { icon: '⬡', label: 'Knowledge Graph',    color: 'text-cyan-600 dark:text-cyan-400'      },
   DEBATE_PANEL: { icon: '◈', label: 'Debate Panel',       color: 'text-teal-600 dark:text-teal-400'      },
   AGENT_QUERY:  { icon: '◉', label: 'Agent Query',        color: 'text-teal-600 dark:text-teal-300'      },
   JUDGE:        { icon: '⚖', label: 'Judge',              color: 'text-amber-600 dark:text-amber-400'    },
@@ -1695,7 +1696,7 @@ function AppInner() {
   const isTriggeringRef = useRef(false);
   const [investmentFocus, setInvestmentFocus] = useState('');
   const [investmentFocusSaved, setInvestmentFocusSaved] = useState(false);
-  const [loading, setLoading]               = useState(true);
+  const [strategiesLoaded, setStrategiesLoaded] = useState(false);
   const [page, setPage]                     = useState<Page>('dashboard');
   const [darkMode, setDarkMode]             = useState<boolean>(() => {
     const saved = localStorage.getItem('theme');
@@ -1747,6 +1748,7 @@ function AppInner() {
         apiFetch('/agents'),
       ]);
       if (stratRes.ok) setStrategies(await stratRes.json());
+      setStrategiesLoaded(true);
       if (predRes.ok) setPredictions(await predRes.json());
       if (mktRes.ok) { const mktData = await mktRes.json(); setMarkets(mktData); localStorage.setItem('markets', JSON.stringify(mktData)); }
       if (debRes.ok) setDebates(await debRes.json());
@@ -1766,7 +1768,7 @@ function AppInner() {
       if (budgetRes.ok) { const d = await budgetRes.json(); setBudgetInput(d.trading_budget.toString()); }
       if (pnlRes.ok) setPortfolio(await pnlRes.json());
       if (focusRes.ok) { const d = await focusRes.json(); setInvestmentFocus(d.investment_focus ?? ''); }
-    } catch (e) { console.error('Fetch error', e); } finally { setLoading(false); }
+    } catch (e) { console.error('Fetch error', e); }
   };
 
   const fetchQuotes = async () => {
@@ -1815,17 +1817,28 @@ function AppInner() {
         const res = await apiFetch('/pipeline/events');
         if (res.ok) {
           const data = await res.json();
-          setPipelineEvents(data.events ?? []);
-          setPipelineRunId(data.run_id ?? null);
           const running = !!data.is_running;
           isTriggeringRef.current = running;
           setIsTriggering(running);
+          setPipelineRunId(data.run_id ?? null);
+          // Only populate live events while a run is actively in progress.
+          // When idle, live tab shows the blueprint — past runs show completed events.
+          if (running) {
+            setPipelineEvents(data.events ?? []);
+          } else {
+            setPipelineEvents([]);
+          }
         }
       } catch { /* ignore */ }
       try {
         const r = await apiFetch('/pipeline/runs');
-        if (r.ok) setPipelineRuns(await r.json());
-      } catch { /* ignore */ }
+        if (r.ok) {
+          const runs = await r.json();
+          setPipelineRuns(runs);
+        }
+      } catch { /* ignore */ } finally {
+        setPipelineRunsLoaded(true);
+      }
       // Schedule next poll — 2s when running, 8s when idle
       pollTimerRef.current = setTimeout(pollPipeline, isTriggeringRef.current ? 2000 : 8000);
     };
@@ -1843,10 +1856,14 @@ function AppInner() {
   const loadRunEvents = async (runId: string) => {
     if (selectedRunId === runId) { setSelectedRunId(null); setSelectedRunEvents([]); return; }
     setSelectedRunId(runId);
+    setSelectedRunEvents([]);
+    setSelectedRunLoading(true);
     try {
       const res = await apiFetch(`/pipeline/runs/${runId}`);
       if (res.ok) { const d = await res.json(); setSelectedRunEvents(d.events ?? []); }
-    } catch { /* ignore */ }
+    } catch { /* ignore */ } finally {
+      setSelectedRunLoading(false);
+    }
   };
 
   const toggleMarket = (name: string, enabled: number) => {
@@ -1977,9 +1994,38 @@ function AppInner() {
   const [researchStepOpen, setResearchStepOpen]   = useState(false);
   const [pendingDropdownOpen, setPendingDropdownOpen] = useState(false);
   const [pipelineRuns, setPipelineRuns]           = useState<PipelineRun[]>([]);
+  const [pipelineRunsLoaded, setPipelineRunsLoaded] = useState(false);
   const [selectedRunId, setSelectedRunId]         = useState<string | null>(null);
   const [selectedRunEvents, setSelectedRunEvents] = useState<PipelineEvent[]>([]);
+  const [selectedRunLoading, setSelectedRunLoading] = useState(false);
   const [statFocus, setStatFocus]           = useState<'active' | 'pending' | 'debates' | 'memories' | null>(null);
+
+  // Track run transitions: new run started → go to Live; run finished → show completed run
+  const prevIsTriggering = useRef(false);
+  const prevPipelineRunId = useRef<string | null>(null);
+  useEffect(() => {
+    const wasRunning = prevIsTriggering.current;
+    const isNowRunning = isTriggering;
+    if (!wasRunning && isNowRunning) {
+      // New run just started — switch to Live view and clear old state
+      setSelectedRunId(null);
+      setSelectedRunEvents([]);
+    } else if (wasRunning && !isNowRunning && pipelineRunId) {
+      // Run just finished — auto-select it in past runs, reset Live to blueprint
+      setPipelineEvents([]);
+      setSelectedRunId(pipelineRunId);
+      setSelectedRunEvents([]);
+      setSelectedRunLoading(true);
+      apiFetch(`/pipeline/runs/${pipelineRunId}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(d => { if (d) setSelectedRunEvents(d.events ?? []); })
+        .catch(() => {})
+        .finally(() => setSelectedRunLoading(false));
+    }
+
+    prevIsTriggering.current = isNowRunning;
+    prevPipelineRunId.current = pipelineRunId;
+  }, [isTriggering, pipelineRunId]);
 
   const activeStrategies = strategies.filter(s => s.status === 'ACTIVE');
   const pendingStrategies = strategies.filter(s => s.status === 'PENDING');
@@ -2045,8 +2091,20 @@ function AppInner() {
         {/* Strategies — market → ticker hierarchy */}
         <div className="xl:col-span-2 space-y-4">
           <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Deployed Strategies</h2>
-          {loading && <Card className="p-8 text-center text-textMuted text-sm">Loading…</Card>}
-          {!loading && strategies.length === 0 && (
+          {!strategiesLoaded && (
+            <Card className="p-6 space-y-3">
+              {[1,2,3].map(i => (
+                <div key={i} className="animate-pulse flex items-center gap-4">
+                  <div className="h-8 w-8 rounded-full bg-surface3 shrink-0" style={{opacity: 1 - i*0.2}} />
+                  <div className="flex-1 space-y-2">
+                    <div className="h-3 bg-surface3 rounded w-1/4" style={{opacity: 1 - i*0.2}} />
+                    <div className="h-2.5 bg-surface3 rounded w-1/2" style={{opacity: 1 - i*0.2}} />
+                  </div>
+                </div>
+              ))}
+            </Card>
+          )}
+          {strategiesLoaded && strategies.length === 0 && (
             <Card className="p-10 text-center text-textMuted text-sm">
               No strategies yet — awaiting the next debate cycle.
             </Card>
@@ -3356,6 +3414,7 @@ function AppInner() {
   const PIPELINE_STEPS = [
     { step: 'START',        label: 'Initialise',          desc: 'Acquire lock, set run ID' },
     { step: 'WEB_RESEARCH', label: 'Shared Retrieval',    desc: 'Fetch news, research & live prices once for all agents' },
+    { step: 'KG_INGEST',    label: 'Knowledge Graph',     desc: 'Extract events & relationships from research, deduplicate via embeddings' },
     { step: 'DEBATE_PANEL', label: 'Debate Panel',        desc: '4 agents each receive shared context + own memory and propose a trade' },
     { step: 'AGENT_QUERY',  label: '  ↳ Agent × 4',      desc: 'Value Investor · Technical Analyst · Macro Economist · Sentiment Analyst' },
     { step: 'JUDGE',        label: 'Judge',               desc: 'Independent LLM evaluates all 4 proposals and picks the best one' },
@@ -3411,6 +3470,21 @@ function AppInner() {
           </div>
         );
       }
+      if (events.length === 0 && !live && selectedRunLoading) {
+        return (
+          <div className="px-5 py-6 space-y-4">
+            {[1, 2, 3, 4, 5].map(i => (
+              <div key={i} className="flex items-center gap-3 animate-pulse">
+                <div className="h-7 w-7 rounded-full bg-surface3 shrink-0" style={{ opacity: 1 - i * 0.15 }} />
+                <div className="flex-1 space-y-1.5">
+                  <div className="h-3 bg-surface3 rounded" style={{ width: `${60 - i * 5}%`, opacity: 1 - i * 0.15 }} />
+                  <div className="h-2.5 bg-surface3 rounded" style={{ width: `${80 - i * 5}%`, opacity: 1 - i * 0.15 }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+      }
       if (events.length === 0) {
         return <p className="px-5 py-8 text-sm text-textMuted text-center">Loading…</p>;
       }
@@ -3419,6 +3493,7 @@ function AppInner() {
       const stepRingColor: Record<string, string> = {
         START:        'border-brand-500',
         WEB_RESEARCH: 'border-purple-500',
+        KG_INGEST:    'border-cyan-500',
         DEBATE_PANEL: 'border-teal-500',
         AGENT_QUERY:  'border-teal-400',
         JUDGE:        'border-amber-500',
@@ -3671,7 +3746,7 @@ function AppInner() {
               </button>
 
               {/* Past run tabs */}
-              {pipelineRuns.filter(r => r.run_id !== pipelineRunId).map(run => {
+              {pipelineRuns.map(run => {
                 const isSelected = selectedRunId === run.run_id;
                 const dur = Math.round((new Date(run.ended_at).getTime() - new Date(run.started_at).getTime()) / 1000);
                 const out = run.output;
@@ -3701,7 +3776,17 @@ function AppInner() {
                 );
               })}
 
-              {pipelineRuns.length === 0 && (
+              {!pipelineRunsLoaded && (
+                <div className="px-4 py-5 space-y-2">
+                  {[1, 2, 3].map(i => (
+                    <div key={i} className="animate-pulse space-y-1.5">
+                      <div className="h-2.5 bg-surface3 rounded w-3/4" style={{ opacity: 1 - i * 0.2 }} />
+                      <div className="h-2 bg-surface3 rounded w-1/2" style={{ opacity: 1 - i * 0.2 }} />
+                    </div>
+                  ))}
+                </div>
+              )}
+              {pipelineRunsLoaded && pipelineRuns.length === 0 && (
                 <p className="px-4 py-4 text-[11px] text-textDim">No past runs yet.</p>
               )}
             </div>
