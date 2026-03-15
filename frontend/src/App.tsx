@@ -379,9 +379,9 @@ function StatDrawer({
   );
 }
 
-// ── Login Screen ───────────────────────────────────────────────────────────
+// ── Login modal (used inside landing page) ────────────────────────────────
 
-function LoginScreen({ onLogin }: { onLogin: () => void }) {
+function LoginModal({ onLogin, onClose }: { onLogin: () => void; onClose: () => void }) {
   const [password, setPassword] = useState('');
   const [error, setError]       = useState('');
   const [loading, setLoading]   = useState(false);
@@ -412,45 +412,467 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
   };
 
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center p-4">
-      <div className="w-full max-w-sm space-y-8">
-        {/* Logo / title */}
-        <div className="text-center space-y-2">
-          <div className="text-4xl font-bold text-textMain tracking-tight">
-            Market<span className="text-brand-400">AI</span>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-sm mx-4 bg-surface border border-borderMid rounded-2xl p-8 shadow-2xl space-y-6"
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-xl font-bold text-textMain tracking-tight">Market<span className="text-brand-400">AI</span></div>
+            <p className="text-xs text-textMuted mt-0.5">Enter your access password</p>
           </div>
-          <p className="text-sm text-textMuted">Multi-agent stock analysis system</p>
+          <button onClick={onClose} className="text-textDim hover:text-textMain text-xl leading-none">×</button>
         </div>
 
-        <form onSubmit={submit} className="bg-surface border border-borderLight rounded-2xl p-6 space-y-5 shadow-xl">
-          <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-textMuted uppercase tracking-wider">Password</label>
-            <input
-              autoFocus
-              type="password"
-              value={password}
-              onChange={e => setPassword(e.target.value)}
-              placeholder="Enter access password"
-              className="w-full px-4 py-3 rounded-xl bg-surface2 border border-borderLight focus:border-brand-500 focus:outline-none text-textMain placeholder-textDim text-sm transition-colors"
-            />
-          </div>
-
+        <form onSubmit={submit} className="space-y-4">
+          <input
+            autoFocus
+            type="password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            placeholder="Password"
+            className="w-full px-4 py-3 rounded-xl bg-surface2 border border-borderLight focus:border-brand-500 focus:outline-none text-textMain placeholder-textDim text-sm transition-colors"
+          />
           {error && (
             <p className="text-xs text-red-400 bg-red-900/20 border border-red-800/40 rounded-lg px-3 py-2">{error}</p>
           )}
-
           <button
             type="submit"
             disabled={loading || !password}
             className="w-full py-3 rounded-xl bg-brand-500 hover:bg-brand-400 disabled:opacity-50 text-white font-semibold text-sm transition-colors">
-            {loading ? 'Signing in…' : 'Sign In →'}
+            {loading ? 'Signing in…' : 'Open Dashboard →'}
           </button>
         </form>
-
-        <p className="text-center text-[11px] text-textDim">
-          Set <code className="bg-surface2 px-1 rounded">APP_PASSWORD</code> env var on the backend to change the password.
-        </p>
       </div>
+    </div>
+  );
+}
+
+// ── Landing page ────────────────────────────────────────────────────────────
+
+function LandingPage({ onLogin }: { onLogin: () => void }) {
+  const [showLogin, setShowLogin] = useState(false);
+
+  // Ticker data for the tape
+  const tickers = [
+    { sym: 'NVDA',        price: '$875.40',  chg: '+3.21%', up: true  },
+    { sym: 'AAPL',        price: '$192.35',  chg: '−0.84%', up: false },
+    { sym: 'BTC-USD',     price: '$67,420',  chg: '+2.15%', up: true  },
+    { sym: 'MSFT',        price: '$415.20',  chg: '+1.02%', up: true  },
+    { sym: 'ETH-USD',     price: '$3,512',   chg: '−1.40%', up: false },
+    { sym: 'RELIANCE.NS', price: '₹2,890',   chg: '+0.76%', up: true  },
+    { sym: 'GC=F',        price: '$2,145',   chg: '+0.32%', up: true  },
+    { sym: 'META',        price: '$512.80',  chg: '+2.67%', up: true  },
+    { sym: 'TCS.NS',      price: '₹3,945',   chg: '−0.55%', up: false },
+    { sym: 'SOL-USD',     price: '$168.90',  chg: '+4.12%', up: true  },
+    { sym: 'TSLA',        price: '$248.60',  chg: '−2.10%', up: false },
+    { sym: 'CL=F',        price: '$82.40',   chg: '+0.91%', up: true  },
+  ];
+
+  const TickerTape = () => (
+    <div className="w-full overflow-hidden border-y border-borderLight bg-surface">
+      <div className="flex animate-[ticker_30s_linear_infinite] hover:[animation-play-state:paused] py-3 whitespace-nowrap">
+        {[...tickers, ...tickers].map((t, i) => (
+          <div key={i} className="inline-flex items-center gap-2.5 px-6 border-r border-borderLight shrink-0">
+            <span className="text-[13px] font-bold font-mono text-textMain">{t.sym}</span>
+            <span className="text-[13px] font-mono text-textMuted">{t.price}</span>
+            <span className={`text-[11px] font-bold font-mono ${t.up ? 'text-up' : 'text-down'}`}>
+              {t.up ? '▲' : '▼'} {t.chg}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  const agents = [
+    { emoji: '💼', name: 'Value Investor',    role: 'Fundamental Analysis',     color: 'text-brand-400',  border: 'border-t-brand-500',  fitness: 72 },
+    { emoji: '📈', name: 'Technical Analyst', role: 'Price Action & Momentum',  color: 'text-teal-400',   border: 'border-t-teal-500',   fitness: 68 },
+    { emoji: '🌍', name: 'Macro Economist',   role: 'Global Macro & Policy',    color: 'text-amber-400',  border: 'border-t-amber-500',  fitness: 81 },
+    { emoji: '📰', name: 'Sentiment Analyst', role: 'News & Social Signals',    color: 'text-purple-400', border: 'border-t-purple-500', fitness: 65 },
+  ];
+
+  const features = [
+    { icon: '⟳', title: 'Live Pipeline View',     desc: 'Watch every debate step in real-time — research, agent queries, judge verdict, and deployment — with step-by-step event logs.',  bg: 'bg-brand-900/30' },
+    { icon: '$', title: 'Portfolio P&L Tracking',  desc: 'Track unrealized and realized P&L across all positions with visual SL/TP progress bars and per-trade breakdown.',                bg: 'bg-emerald-900/30' },
+    { icon: '◉', title: 'Agent Memory Feed',       desc: 'Every agent accumulates persistent INSIGHTS, LESSONS, and OBSERVATIONS across rounds, shaping future decisions automatically.', bg: 'bg-purple-900/30' },
+    { icon: '🧬', title: 'Darwinian Evolution',    desc: 'Low-fitness agents have their prompts auto-rewritten via mutation or crossover with elite agents — no manual intervention needed.', bg: 'bg-amber-900/30' },
+    { icon: '◈', title: 'Markets & Watchlist',     desc: 'Track US, India NSE, crypto, and MCX futures. Search and add any ticker via Yahoo Finance. Active positions float to the top.',  bg: 'bg-teal-900/30' },
+    { icon: '⚙', title: 'Full Configuration',     desc: 'Enable markets, set schedule, switch approval mode, edit agent prompts, and set trading budget — all from the dashboard.',       bg: 'bg-rose-900/30' },
+  ];
+
+  const steps = [
+    { n: '01', icon: '⌖', title: 'Web Research',    desc: 'Real-time news from Google News RSS, Yahoo Finance, and earnings calendars builds a shared context for all agents.' },
+    { n: '02', icon: '◉', title: 'Agent Debate',    desc: 'All four agents run in parallel. Each reads shared research + their own memory, then proposes a ticker and LONG/SHORT action.' },
+    { n: '03', icon: '⚖', title: 'Consensus Vote',  desc: 'A Judge LLM weighs all proposals, picks a consensus, and records the reasoning for full transparency.' },
+    { n: '04', icon: '◆', title: 'Deploy Strategy', desc: 'The winning strategy is deployed with automatic −10% stop-loss and +15% take-profit enforcement.' },
+    { n: '05', icon: '◈', title: 'Learn & Evolve',  desc: 'After each strategy closes, agents receive personalised WIN/LOSS feedback and low performers evolve automatically.' },
+  ];
+
+  return (
+    <div className="bg-[#0d1117] text-textMain font-sans antialiased overflow-x-hidden">
+      <style>{`
+        @keyframes ticker { from { transform: translateX(0); } to { transform: translateX(-50%); } }
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .5; transform: scale(.8); } }
+        @keyframes fade-up { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        .landing-section { max-width: 1200px; margin: 0 auto; padding: 96px 24px; }
+        .animate-fade-up { animation: fade-up .6s ease both; }
+        .delay-100 { animation-delay: .1s; }
+        .delay-200 { animation-delay: .2s; }
+        .delay-300 { animation-delay: .3s; }
+        .delay-400 { animation-delay: .4s; }
+        .delay-500 { animation-delay: .5s; }
+      `}</style>
+
+      {/* ── Nav ──────────────────────────────────────────────────────────── */}
+      <nav className="fixed top-0 left-0 right-0 z-40 flex items-center justify-between px-8 h-16 bg-[#0d1117]/90 backdrop-blur-md border-b border-borderLight">
+        <div className="text-xl font-extrabold tracking-tight">Market<span className="text-brand-400">AI</span></div>
+        <div className="hidden md:flex items-center gap-8 text-sm text-textMuted">
+          {['How it works', 'Features', 'Agents', 'Markets'].map(l => (
+            <a key={l} href={`#${l.toLowerCase().replace(/ /g,'-')}`} className="hover:text-textMain transition-colors">{l}</a>
+          ))}
+        </div>
+        <button
+          onClick={() => setShowLogin(true)}
+          className="px-5 py-2 rounded-lg bg-brand-500 hover:bg-brand-400 text-white text-sm font-semibold transition-all hover:-translate-y-px">
+          Open Dashboard →
+        </button>
+      </nav>
+
+      {/* ── Hero ─────────────────────────────────────────────────────────── */}
+      <section className="relative min-h-screen flex flex-col items-center justify-center text-center px-6 pt-28 pb-20 overflow-hidden">
+        {/* radial glow */}
+        <div className="absolute top-[-200px] left-1/2 -translate-x-1/2 w-[900px] h-[600px] pointer-events-none"
+          style={{ background: 'radial-gradient(ellipse at center, rgba(59,130,246,.18) 0%, transparent 70%)' }} />
+        <div className="absolute bottom-0 left-0 right-0 h-40 pointer-events-none"
+          style={{ background: 'linear-gradient(to bottom, transparent, #0d1117)' }} />
+
+        <div className="animate-fade-up inline-flex items-center gap-2 text-[11px] font-semibold tracking-widest uppercase text-brand-400 bg-brand-900/40 border border-brand-700/40 rounded-full px-4 py-1.5 mb-8">
+          <span className="w-1.5 h-1.5 rounded-full bg-brand-400 inline-block" style={{ animation: 'pulse-dot 2s infinite' }}></span>
+          Live · Four AI Agents Debating Now
+        </div>
+
+        <h1 className="animate-fade-up delay-100 text-[clamp(40px,6vw,80px)] font-extrabold tracking-[-2px] leading-[1.07] max-w-4xl mb-6">
+          Four AI Agents.<br/>
+          One{' '}
+          <span style={{ background: 'linear-gradient(135deg,#60a5fa,#818cf8,#a78bfa)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>
+            Market Consensus.
+          </span>
+        </h1>
+
+        <p className="animate-fade-up delay-200 text-[clamp(16px,2vw,20px)] text-textMuted leading-relaxed max-w-xl mb-12">
+          A multi-agent system where AI analysts debate every trade — Value, Technical, Macro, and Sentiment — then vote on a LONG or SHORT strategy. Continuously evolving through Darwinian selection.
+        </p>
+
+        <div className="animate-fade-up delay-300 flex items-center gap-4 flex-wrap justify-center mb-20">
+          <button
+            onClick={() => setShowLogin(true)}
+            className="inline-flex items-center gap-2 px-8 py-4 rounded-xl bg-brand-500 hover:bg-brand-400 text-white font-semibold text-[15px] transition-all hover:-translate-y-0.5 hover:shadow-[0_8px_30px_rgba(59,130,246,.35)]">
+            Open Dashboard
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          </button>
+          <a href="#how-it-works" className="inline-flex items-center gap-2 px-7 py-4 rounded-xl border border-borderMid text-textMuted hover:text-textMain hover:border-textDim font-medium text-[15px] transition-all hover:-translate-y-0.5">
+            See how it works
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M4 9l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          </a>
+        </div>
+
+        {/* Stats */}
+        <div className="animate-fade-up delay-400 flex items-center gap-10 flex-wrap justify-center">
+          {[['4', 'AI Agents'], ['28+', 'Tracked Tickers'], ['4', 'Markets'], ['∞', 'Evolution Cycles']].map(([n, l], i) => (
+            <div key={i} className="flex items-center gap-10">
+              {i > 0 && <div className="w-px h-9 bg-borderLight hidden sm:block" />}
+              <div className="text-center">
+                <div className={`text-3xl font-extrabold tracking-tight ${i === 0 || i === 3 ? 'text-brand-400' : 'text-textMain'}`}>{n}</div>
+                <div className="text-[11px] text-textDim uppercase tracking-widest mt-0.5">{l}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ── Ticker tape ──────────────────────────────────────────────────── */}
+      <TickerTape />
+
+      {/* ── Dashboard UI preview ─────────────────────────────────────────── */}
+      <div className="max-w-[1100px] mx-auto px-6 py-20">
+        <p className="text-center text-[11px] font-semibold uppercase tracking-widest text-brand-400 mb-5">Live Dashboard</p>
+        <div className="rounded-2xl border border-borderLight overflow-hidden shadow-[0_40px_120px_rgba(0,0,0,.6)]">
+          {/* Titlebar */}
+          <div className="flex items-center gap-2 px-4 py-3 bg-surface2 border-b border-borderLight">
+            <div className="w-3 h-3 rounded-full bg-[#ff5f57]" />
+            <div className="w-3 h-3 rounded-full bg-[#ffbd2e]" />
+            <div className="w-3 h-3 rounded-full bg-[#27c840]" />
+            <span className="flex-1 text-center text-[11px] text-textDim font-mono">app.marketai.io — Dashboard</span>
+          </div>
+          {/* Body */}
+          <div className="grid grid-cols-[180px_1fr] bg-surface min-h-[420px]">
+            {/* Sidebar */}
+            <div className="bg-surface2 border-r border-borderLight py-4 hidden sm:block">
+              <div className="px-4 pb-5 text-[15px] font-extrabold">Market<span className="text-brand-400">AI</span></div>
+              {[['▦','Dashboard',true],['◈','Markets',false],['$','Portfolio',false],['◉','Agent Memory',false],['⟳','Live Pipeline',false],['⚙','Settings',false]].map(([icon, label, active]) => (
+                <div key={label as string} className={`flex items-center gap-2.5 px-4 py-2.5 text-[12px] ${active ? 'text-brand-400 bg-brand-900/20 border-r-2 border-brand-500 font-medium' : 'text-textMuted'}`}>
+                  <span className="opacity-70 text-[13px]">{icon}</span>{label}
+                </div>
+              ))}
+            </div>
+            {/* Main */}
+            <div className="p-5 flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase tracking-widest text-textDim">Dashboard</span>
+                <div className="flex gap-2">
+                  <span className="text-[10px] px-2 py-1 rounded bg-emerald-900/40 text-emerald-400 font-semibold">● Live</span>
+                  <span className="text-[10px] px-2 py-1 rounded bg-surface3 text-brand-400 font-semibold font-mono">▶ Run Pipeline</span>
+                </div>
+              </div>
+              {/* Stats */}
+              <div className="grid grid-cols-4 gap-2">
+                {[['Active Strategies','7','text-up'],['Pending Approval','2','text-brand-400'],['Total P&L','+$840','text-up'],['Debate Rounds','34','text-textMuted']].map(([l,v,c]) => (
+                  <div key={l as string} className="bg-surface2 border border-borderLight rounded-lg p-3">
+                    <div className="text-[9px] uppercase tracking-wider text-textDim mb-1.5">{l}</div>
+                    <div className={`text-xl font-bold font-mono ${c}`}>{v}</div>
+                  </div>
+                ))}
+              </div>
+              {/* Two cards */}
+              <div className="grid grid-cols-2 gap-2">
+                <div className="bg-surface2 border border-borderLight rounded-lg p-3">
+                  <div className="text-[9px] uppercase tracking-wider text-textDim mb-2.5">Last Debate · 2 min ago</div>
+                  {[['#3b82f6','text-brand-400','Value','NVDA',true],['#14b8a6','text-teal-400','Technical','NVDA',true],['#f59e0b','text-amber-400','Macro','MSFT',true],['#8b5cf6','text-purple-400','Sentiment','TSLA',false]].map(([dot,tc,name,ticker,long]) => (
+                    <div key={name as string} className="flex items-center gap-2 mb-1.5">
+                      <div className="w-2 h-2 rounded-full shrink-0" style={{ background: dot as string }} />
+                      <span className={`text-[11px] font-bold font-mono w-20 ${tc}`}>{name}</span>
+                      <span className="text-[11px] text-textDim flex-1 font-mono">{ticker}</span>
+                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${long ? 'bg-up-bg text-up-text' : 'bg-down-bg text-down-text'}`}>{long ? '▲ LONG' : '▼ SHORT'}</span>
+                    </div>
+                  ))}
+                  <div className="mt-2 px-2.5 py-2 rounded-lg bg-brand-900/20 border border-brand-800/40">
+                    <div className="text-[8px] uppercase tracking-wider text-textDim mb-0.5">Consensus · 3/4</div>
+                    <div className="text-[13px] font-bold font-mono text-brand-400">NVDA · LONG</div>
+                  </div>
+                </div>
+                <div className="bg-surface2 border border-borderLight rounded-lg p-3">
+                  <div className="text-[9px] uppercase tracking-wider text-textDim mb-2.5">Active Strategies</div>
+                  {[['NVDA',true,'+4.82%'],['BTC-USD',true,'+2.14%'],['TSLA',false,'−1.20%']].map(([sym,up,ret]) => (
+                    <div key={sym as string} className={`flex items-center justify-between px-2 py-1.5 rounded-lg mb-1.5 border ${up ? 'bg-up-bg/20 border-up/20 border-l-2 border-l-up' : 'bg-down-bg/20 border-down/20 border-l-2 border-l-down'}`}>
+                      <span className="text-[12px] font-bold font-mono">{sym}</span>
+                      <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${up ? 'bg-up-bg text-up-text' : 'bg-down-bg text-down-text'}`}>{up ? '▲ LONG' : '▼ SHORT'}</span>
+                      <span className={`text-[11px] font-mono ${up ? 'text-up' : 'text-down'}`}>{ret}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              {/* Pipeline bar */}
+              <div className="bg-surface2 border border-borderLight rounded-lg overflow-hidden">
+                <div className="text-[9px] uppercase tracking-wider text-textDim px-3 py-2 border-b border-borderLight">Pipeline Progress</div>
+                <div className="grid grid-cols-6">
+                  {[['Start',true,false],['Research',true,false],['Agents',true,false],['Judge',false,true],['Deploy',false,false],['Memory',false,false]].map(([step, done, active]) => (
+                    <div key={step as string} className={`text-center text-[9px] uppercase tracking-wider py-2 relative ${done ? 'text-brand-400' : active ? 'text-textMain' : 'text-textDim'}`}>
+                      {step}
+                      {(done || active) && <div className={`absolute bottom-0 left-0 right-0 h-[2px] ${done ? 'bg-brand-500' : 'bg-brand-400'} ${active ? 'animate-pulse' : ''}`} />}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── How it works ─────────────────────────────────────────────────── */}
+      <div id="how-it-works" className="border-t border-borderLight">
+        <div className="landing-section">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-brand-400 mb-4">How it works</p>
+          <h2 className="text-[clamp(28px,4vw,48px)] font-extrabold tracking-tight leading-tight mb-5">From market data to<br/>deployed strategy in minutes</h2>
+          <p className="text-[17px] text-textMuted leading-relaxed max-w-lg mb-14">Every cycle, the system automatically researches the market, debates it, and deploys a consensus strategy — then learns from the outcome.</p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-px bg-borderLight rounded-2xl overflow-hidden">
+            {steps.map(s => (
+              <div key={s.n} className="bg-[#0d1117] p-8">
+                <div className="text-[10px] font-bold font-mono text-brand-400 uppercase tracking-widest mb-4">Step {s.n}</div>
+                <div className="text-3xl mb-4">{s.icon}</div>
+                <h3 className="text-[16px] font-bold mb-2.5">{s.title}</h3>
+                <p className="text-[13px] text-textMuted leading-relaxed">{s.desc}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Features ─────────────────────────────────────────────────────── */}
+      <div id="features" className="border-t border-borderLight">
+        <div className="landing-section">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-brand-400 mb-4">Features</p>
+          <h2 className="text-[clamp(28px,4vw,48px)] font-extrabold tracking-tight leading-tight mb-14">Everything you need to<br/>track AI-driven strategies</h2>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {features.map(f => (
+              <div key={f.title} className="bg-surface border border-borderLight rounded-2xl p-8 hover:border-borderMid hover:-translate-y-1 transition-all">
+                <div className={`w-11 h-11 rounded-xl flex items-center justify-center text-xl mb-5 ${f.bg}`}>{f.icon}</div>
+                <h3 className="text-[16px] font-bold mb-2.5">{f.title}</h3>
+                <p className="text-[13px] text-textMuted leading-relaxed">{f.desc}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Agents ───────────────────────────────────────────────────────── */}
+      <div id="agents" className="border-t border-borderLight">
+        <div className="landing-section">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-brand-400 mb-4">The Debate Panel</p>
+          <h2 className="text-[clamp(28px,4vw,48px)] font-extrabold tracking-tight leading-tight mb-5">Four agents. Four perspectives.<br/>One consensus.</h2>
+          <p className="text-[17px] text-textMuted leading-relaxed max-w-lg mb-14">Each agent brings a distinct analytical lens. They argue, disagree, and vote — producing a more robust signal than any single model.</p>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            {agents.map(a => (
+              <div key={a.name} className="bg-surface border border-borderLight rounded-2xl p-7 hover:border-borderMid hover:-translate-y-1 transition-all relative overflow-hidden">
+                <div className={`absolute top-0 left-0 right-0 h-[3px] ${a.border}`} />
+                <div className="text-[26px] mb-4">{a.emoji}</div>
+                <h3 className="text-[15px] font-bold mb-1">{a.name}</h3>
+                <div className={`text-[10px] font-semibold uppercase tracking-wider mb-3 ${a.color}`}>{a.role}</div>
+                <div className="mt-4">
+                  <div className="flex justify-between text-[10px] text-textDim mb-1.5">
+                    <span>Fitness Score</span>
+                    <span className={`font-mono ${a.color}`}>{a.fitness}.0</span>
+                  </div>
+                  <div className="h-1 bg-surface3 rounded-full overflow-hidden">
+                    <div className="h-full rounded-full bg-brand-500 transition-all" style={{ width: `${a.fitness}%` }} />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── Evolution ────────────────────────────────────────────────────── */}
+      <div className="border-t border-borderLight">
+        <div className="landing-section">
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-16 items-center">
+            <div>
+              <p className="text-[11px] font-semibold uppercase tracking-widest text-brand-400 mb-4">Darwinian Selection</p>
+              <h2 className="text-[clamp(28px,4vw,48px)] font-extrabold tracking-tight leading-tight mb-5">Agents that lose<br/>learn to win</h2>
+              <p className="text-[17px] text-textMuted leading-relaxed mb-8">Every evaluation cycle scores predictions against live prices. Agents with a fitness score below 45 are automatically evolved.</p>
+              <ul className="space-y-4">
+                {[
+                  ['text-brand-400', 'bg-brand-400', 'Mutation', 'When no elite donor exists, the LLM rewrites the failing agent\'s prompt guided by its recent loss record.'],
+                  ['text-up', 'bg-up', 'Crossover', 'When an elite agent (fitness > 65) exists, the weak agent\'s prompt inherits its analytical rigour.'],
+                  ['text-textMuted', 'bg-textDim', 'History', 'Every previous prompt version is archived with its fitness score and evolution reason.'],
+                ].map(([_tc, bc, label, desc]) => (
+                  <li key={label as string} className="flex gap-3 items-start">
+                    <span className={`w-1.5 h-1.5 rounded-full ${bc} mt-[7px] shrink-0`} />
+                    <p className="text-[14px] text-textMuted leading-relaxed"><strong className="text-textMain">{label}</strong> — {desc}</p>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="bg-surface border border-borderLight rounded-2xl p-7">
+              <div className="text-[10px] font-semibold uppercase tracking-wider text-textDim pb-4 mb-4 border-b border-borderLight">
+                Sentiment Analyst · Evolution History
+              </div>
+              <div className="space-y-2">
+                {[
+                  { gen: 'Gen 1', label: 'Seed prompt',      w: 38, score: '38.2', color: '#f43f5e', reason: 'SEED',      rc: 'text-down'     },
+                  { gen: 'Gen 2', label: 'After mutation',   w: 49, score: '48.6', color: '#f59e0b', reason: 'MUTATION',  rc: 'text-amber-400' },
+                  { gen: 'Gen 3', label: 'Cross w/ Macro',   w: 59, score: '58.9', color: '#3b82f6', reason: 'CROSSOVER', rc: 'text-brand-400' },
+                  { gen: 'Gen 4 ✦', label: 'Elite candidate', w: 65, score: '64.8', color: '#10b981', reason: 'CURRENT',   rc: 'text-up'       },
+                ].map(r => (
+                  <div key={r.gen} className="flex items-center gap-2">
+                    <div className="w-16 text-[10px] font-mono text-textDim shrink-0">{r.gen}</div>
+                    <div className="flex-1 h-6 bg-surface2 rounded overflow-hidden">
+                      <div className="h-full rounded flex items-center px-2 text-[10px] font-semibold text-white/70 transition-all"
+                        style={{ width: `${r.w}%`, background: `linear-gradient(90deg, ${r.color}66, ${r.color}33)` }}>
+                        {r.label}
+                      </div>
+                    </div>
+                    <div className={`w-12 text-right text-[12px] font-bold font-mono ${r.rc}`}>{r.score}</div>
+                    <div className={`w-20 text-[9px] font-semibold uppercase tracking-wider ${r.rc}`}>{r.reason}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── Markets ──────────────────────────────────────────────────────── */}
+      <div id="markets" className="border-t border-borderLight">
+        <div className="landing-section">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-brand-400 mb-4">Market Coverage</p>
+          <h2 className="text-[clamp(28px,4vw,48px)] font-extrabold tracking-tight leading-tight mb-5">US · India · Crypto · MCX</h2>
+          <p className="text-[17px] text-textMuted leading-relaxed max-w-xl mb-14">28+ default tickers with live Yahoo Finance data refreshing every 30s. Add any stock, ETF, or crypto via search.</p>
+
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-4 gap-3">
+            {[
+              { sym: 'NVDA',        price: '$875.40', chg: '+3.21%', up: true,  flag: '🇺🇸', accentColor: '#3b82f6', name: 'NVIDIA · NASDAQ' },
+              { sym: 'TCS.NS',      price: '₹3,945',  chg: '−0.55%', up: false, flag: '🇮🇳', accentColor: '#14b8a6', name: 'Tata Consultancy · NSE' },
+              { sym: 'BTC-USD',     price: '$67,420', chg: '+2.15%', up: true,  flag: '₿',   accentColor: '#f59e0b', name: 'Bitcoin · Crypto' },
+              { sym: 'GC=F',        price: '$2,145',  chg: '+0.32%', up: true,  flag: '⛏️', accentColor: '#8b5cf6', name: 'Gold Futures · MCX' },
+              { sym: 'MSFT',        price: '$415.20', chg: '+1.02%', up: true,  flag: '🇺🇸', accentColor: '#3b82f6', name: 'Microsoft · NASDAQ' },
+              { sym: 'ETH-USD',     price: '$3,512',  chg: '−1.40%', up: false, flag: '₿',   accentColor: '#f59e0b', name: 'Ethereum · Crypto' },
+              { sym: 'RELIANCE.NS', price: '₹2,890',  chg: '+0.76%', up: true,  flag: '🇮🇳', accentColor: '#14b8a6', name: 'Reliance Industries · NSE' },
+              { sym: 'CL=F',        price: '$82.40',  chg: '+0.91%', up: true,  flag: '⛏️', accentColor: '#8b5cf6', name: 'Crude Oil · MCX' },
+            ].map(m => (
+              <div key={m.sym} className="bg-surface border border-borderLight rounded-xl p-5 hover:border-borderMid hover:-translate-y-0.5 transition-all"
+                style={{ borderTop: `2px solid ${m.accentColor}` }}>
+                <div className="flex items-center justify-between mb-3">
+                  <span className="text-[13px] font-bold font-mono">{m.sym}</span>
+                  <span className="text-base">{m.flag}</span>
+                </div>
+                <div className="text-[18px] font-bold font-mono mb-1.5">{m.price}</div>
+                <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${m.up ? 'bg-up-bg text-up-text' : 'bg-down-bg text-down-text'}`}>
+                  {m.up ? '▲' : '▼'} {m.chg}
+                </span>
+                <div className="text-[10px] text-textDim mt-2">{m.name}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* ── CTA ──────────────────────────────────────────────────────────── */}
+      <div className="border-t border-borderLight relative overflow-hidden">
+        <div className="absolute inset-0 pointer-events-none"
+          style={{ background: 'radial-gradient(ellipse at 50% 50%, rgba(59,130,246,.1) 0%, transparent 70%)' }} />
+        <div className="landing-section text-center relative">
+          <p className="text-[11px] font-semibold uppercase tracking-widest text-brand-400 mb-5">Get started</p>
+          <h2 className="text-[clamp(32px,5vw,56px)] font-extrabold tracking-tight leading-tight mb-5">
+            Ready to let AI<br/>
+            <span style={{ background: 'linear-gradient(135deg,#60a5fa,#a78bfa)', WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent', backgroundClip: 'text' }}>
+              debate your trades?
+            </span>
+          </h2>
+          <p className="text-[18px] text-textMuted leading-relaxed max-w-md mx-auto mb-12">
+            Self-hosted, fully configurable, and powered by OpenRouter LLMs. Deploy your own instance in minutes.
+          </p>
+          <button
+            onClick={() => setShowLogin(true)}
+            className="inline-flex items-center gap-2 px-10 py-5 rounded-xl bg-brand-500 hover:bg-brand-400 text-white font-semibold text-[16px] transition-all hover:-translate-y-0.5 hover:shadow-[0_12px_40px_rgba(59,130,246,.4)]">
+            Open Dashboard
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8h10M9 4l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          </button>
+        </div>
+      </div>
+
+      {/* ── Footer ───────────────────────────────────────────────────────── */}
+      <footer className="border-t border-borderLight px-8 py-10 flex items-center justify-between flex-wrap gap-5">
+        <div className="text-[16px] font-extrabold">Market<span className="text-brand-400">AI</span></div>
+        <ul className="flex gap-7 list-none">
+          {['How it works','Features','Agents','Markets'].map(l => (
+            <li key={l}><a href={`#${l.toLowerCase().replace(/ /g,'-')}`} className="text-[13px] text-textDim hover:text-textMuted transition-colors">{l}</a></li>
+          ))}
+        </ul>
+        <div className="text-[12px] text-textDim">Built with FastAPI · React · OpenRouter LLMs</div>
+      </footer>
+
+      {/* ── Login modal ──────────────────────────────────────────────────── */}
+      {showLogin && <LoginModal onLogin={onLogin} onClose={() => setShowLogin(false)} />}
     </div>
   );
 }
@@ -458,11 +880,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
 
 // ── Main App ───────────────────────────────────────────────────────────────
 
-function App() {
-  const [authed, setAuthed] = useState<boolean>(() => !!getToken());
-
-  if (!authed) return <LoginScreen onLogin={() => setAuthed(true)} />;
-
+function AppInner() {
   const [predictions, setPredictions]       = useState<Prediction[]>([]);
   const [strategies, setStrategies]         = useState<Strategy[]>([]);
   const [markets, setMarkets]               = useState<MarketConfig[]>([]);
@@ -2638,7 +3056,7 @@ function App() {
               {darkMode ? '☀️' : '🌙'}
             </button>
             <button
-              onClick={() => { clearToken(); setAuthed(false); }}
+              onClick={() => { clearToken(); window.location.reload(); }}
               className="h-8 w-8 flex items-center justify-center rounded-lg bg-surface2 border border-borderLight hover:bg-red-900/40 hover:border-red-700/50 hover:text-red-400 text-textDim transition-colors text-sm"
               title="Sign out"
             >⏻</button>
@@ -2663,6 +3081,12 @@ function App() {
       </main>
     </div>
   );
+}
+
+function App() {
+  const [authed, setAuthed] = useState<boolean>(() => !!getToken());
+  if (!authed) return <LandingPage onLogin={() => setAuthed(true)} />;
+  return <AppInner />;
 }
 
 export default App;
