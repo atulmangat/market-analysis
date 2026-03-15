@@ -169,51 +169,147 @@ def setup_agent_prompts(db: Session):
 
 def _fetch_ticker_fundamentals(symbol: str) -> str:
     """
-    Fetch key fundamentals + 5-day price history for a ticker.
-    Returns a compact markdown block for agent context injection.
-    Designed to be fast — uses only fields yfinance returns without a full .info call on slow endpoints.
+    Fetch rich fundamentals + price history + momentum signals for a ticker.
+    Uses yfinance .info for full data, fast_info as fallback.
+    Returns a structured markdown block for agent context injection.
     """
     import yfinance as yf
+    import math as _math
     try:
         ticker = yf.Ticker(symbol)
-        info = ticker.fast_info  # fast_info is much quicker than .info
-        hist = ticker.history(period="5d", interval="1d", auto_adjust=True)
 
-        lines = [f"### {symbol} Key Metrics"]
+        # Try full .info first, fall back to fast_info
+        try:
+            info = ticker.info
+        except Exception:
+            info = {}
+        fi = ticker.fast_info
 
-        # fast_info fields
-        fi = info
+        hist_20d = ticker.history(period="1mo", interval="1d", auto_adjust=True)
+        hist_5d  = hist_20d.tail(5) if not hist_20d.empty else hist_20d
+
+        lines = [f"### {symbol}"]
+
+        # ── Identity
+        name = info.get("longName") or info.get("shortName", symbol)
+        sector   = info.get("sector", "")
+        industry = info.get("industry", "")
+        currency = info.get("currency", "USD")
+        qtype    = info.get("quoteType", "")
+        if name != symbol: lines.append(f"**{name}** ({qtype}) · {currency}")
+        if sector:         lines.append(f"Sector: {sector}" + (f" › {industry}" if industry else ""))
+
+        # ── Valuation
+        def _safe(d, *keys, fmt=None):
+            for k in keys:
+                v = d.get(k)
+                if v is not None and not (isinstance(v, float) and _math.isnan(v)):
+                    return fmt(v) if fmt else v
+            return None
+
         try:
-            mktcap = fi.market_cap
-            if mktcap:
-                if mktcap >= 1e12: lines.append(f"- Market Cap: ${mktcap/1e12:.2f}T")
-                elif mktcap >= 1e9: lines.append(f"- Market Cap: ${mktcap/1e9:.1f}B")
-                else: lines.append(f"- Market Cap: ${mktcap/1e6:.0f}M")
-        except Exception: pass
-        try:
-            if fi.fifty_two_week_high and fi.fifty_two_week_low:
-                lines.append(f"- 52w Range: ${fi.fifty_two_week_low:.2f} – ${fi.fifty_two_week_high:.2f}")
-        except Exception: pass
-        try:
-            if fi.last_price:
-                lines.append(f"- Last Price: ${fi.last_price:.4f}")
+            mc = fi.market_cap
+            if mc:
+                if mc >= 1e12:   lines.append(f"Market Cap: ${mc/1e12:.2f}T")
+                elif mc >= 1e9:  lines.append(f"Market Cap: ${mc/1e9:.1f}B")
+                else:            lines.append(f"Market Cap: ${mc/1e6:.0f}M")
         except Exception: pass
 
-        # 5-day price history
-        if not hist.empty:
-            closes = hist["Close"].dropna()
+        pe   = _safe(info, "trailingPE", "forwardPE")
+        fpe  = _safe(info, "forwardPE")
+        pb   = _safe(info, "priceToBook")
+        ps   = _safe(info, "priceToSalesTrailing12Months")
+        ev_e = _safe(info, "enterpriseToEbitda")
+        if pe:   lines.append(f"P/E (trailing): {pe:.1f}" + (f"  |  Forward P/E: {fpe:.1f}" if fpe else ""))
+        if pb:   lines.append(f"P/B: {pb:.2f}" + (f"  |  P/S: {ps:.2f}" if ps else ""))
+        if ev_e: lines.append(f"EV/EBITDA: {ev_e:.1f}")
+
+        # ── Growth & Profitability
+        rev_g = _safe(info, "revenueGrowth")
+        earn_g = _safe(info, "earningsGrowth")
+        margins = _safe(info, "profitMargins")
+        roe    = _safe(info, "returnOnEquity")
+        debt_eq = _safe(info, "debtToEquity")
+        if rev_g is not None:   lines.append(f"Revenue Growth (YoY): {rev_g*100:+.1f}%" + (f"  |  Earnings Growth: {earn_g*100:+.1f}%" if earn_g else ""))
+        if margins is not None: lines.append(f"Profit Margin: {margins*100:.1f}%" + (f"  |  ROE: {roe*100:.1f}%" if roe else ""))
+        if debt_eq is not None: lines.append(f"Debt/Equity: {debt_eq:.2f}")
+
+        # ── Analyst consensus
+        target   = _safe(info, "targetMeanPrice")
+        rec      = info.get("recommendationKey", "")
+        analysts = _safe(info, "numberOfAnalystOpinions")
+        try:
+            lp = fi.last_price or info.get("currentPrice") or info.get("regularMarketPrice")
+        except Exception:
+            lp = info.get("currentPrice") or info.get("regularMarketPrice")
+        if lp and target:
+            upside = (target - lp) / lp * 100
+            lines.append(f"Analyst Target: ${target:.2f} ({upside:+.1f}% vs current)" +
+                         (f"  |  Consensus: {rec.upper()}" if rec else "") +
+                         (f"  |  {int(analysts)} analysts" if analysts else ""))
+        elif rec:
+            lines.append(f"Analyst Consensus: {rec.upper()}")
+
+        # ── Short interest
+        short_pct = _safe(info, "shortPercentOfFloat")
+        if short_pct:
+            lines.append(f"Short Interest: {short_pct*100:.1f}% of float")
+
+        # ── 52-week range & position
+        try:
+            hi52 = fi.fifty_two_week_high
+            lo52 = fi.fifty_two_week_low
+            if hi52 and lo52 and lp:
+                pct_from_low  = (lp - lo52) / (hi52 - lo52) * 100 if hi52 != lo52 else 50
+                lines.append(f"52w Range: ${lo52:.2f} – ${hi52:.2f}  |  Current at {pct_from_low:.0f}% of range")
+        except Exception: pass
+
+        # ── Price momentum (20d)
+        if not hist_20d.empty:
+            closes = hist_20d["Close"].dropna()
+            vols   = hist_20d["Volume"].dropna()
             if len(closes) >= 2:
-                chg = ((float(closes.iloc[-1]) - float(closes.iloc[0])) / float(closes.iloc[0])) * 100
-                lines.append(f"- 5-day price change: {chg:+.2f}%")
-            price_row = " | ".join(
+                chg_5d  = (float(closes.iloc[-1]) - float(closes.iloc[-min(5, len(closes))])) / float(closes.iloc[-min(5, len(closes))]) * 100
+                chg_20d = (float(closes.iloc[-1]) - float(closes.iloc[0])) / float(closes.iloc[0]) * 100
+                lines.append(f"Price momentum: 5d {chg_5d:+.2f}%  |  20d {chg_20d:+.2f}%")
+            # Average volume vs recent volume
+            if len(vols) >= 5:
+                avg_vol = float(vols.iloc[:-1].mean())
+                last_vol = float(vols.iloc[-1])
+                if avg_vol > 0:
+                    vol_ratio = last_vol / avg_vol
+                    lines.append(f"Volume: {last_vol:,.0f}  ({vol_ratio:.1f}x avg) — {'surge' if vol_ratio > 1.5 else 'below avg' if vol_ratio < 0.7 else 'normal'}")
+            # Recent daily closes
+            price_row = "  ".join(
                 f"{ts.strftime('%m-%d')}: ${float(c):.2f}"
-                for ts, c in zip(hist.index[-5:], closes.values[-5:])
+                for ts, c in zip(closes.index[-5:], closes.values[-5:])
             )
-            lines.append(f"- Recent closes: {price_row}")
+            lines.append(f"Recent closes: {price_row}")
+
+            # RSI (14-period approximation)
+            if len(closes) >= 14:
+                deltas = closes.diff().dropna()
+                gains  = deltas.clip(lower=0)
+                losses = (-deltas).clip(lower=0)
+                avg_gain = gains.rolling(14).mean().iloc[-1]
+                avg_loss = losses.rolling(14).mean().iloc[-1]
+                if avg_loss > 0:
+                    rs  = avg_gain / avg_loss
+                    rsi = 100 - (100 / (1 + rs))
+                    lines.append(f"RSI(14): {rsi:.0f} — {'overbought' if rsi > 70 else 'oversold' if rsi < 30 else 'neutral'}")
+
+        # ── Upcoming earnings
+        try:
+            cal = ticker.calendar
+            if cal is not None and not cal.empty:
+                earn_date = cal.get("Earnings Date", [None])[0] if hasattr(cal, 'get') else None
+                if earn_date:
+                    lines.append(f"Next Earnings: {earn_date}")
+        except Exception: pass
 
         return "\n".join(lines)
     except Exception as e:
-        return f"### {symbol} Key Metrics\n- Data unavailable: {e}"
+        return f"### {symbol}\n- Data unavailable: {e}"
 
 
 def _annotate_research_with_dates(research_items: list[dict], now: datetime) -> str:
@@ -222,7 +318,7 @@ def _annotate_research_with_dates(research_items: list[dict], now: datetime) -> 
     E.g. '[2h ago] Bitcoin surges...' or '[3d ago] Fed hikes rates...'
     """
     lines = [f"## Latest Market News & Research\n(Current date/time: {now.strftime('%Y-%m-%d %H:%M UTC')})\n"]
-    for i, r in enumerate(research_items[:25], 1):
+    for i, r in enumerate(research_items[:40], 1):
         title   = r.get("title", "Unknown")
         snippet = r.get("snippet", "")
         source  = r.get("source_url", "")
@@ -280,43 +376,125 @@ def extract_proposal(text: str):
 
 # ── Layer 1: Shared Retrieval ─────────────────────────────────────────────────
 
+def _fetch_macro_indicators() -> str:
+    """
+    Fetch key macro indicators via yfinance: VIX, DXY, US 10Y yield, Gold, Oil.
+    Returns a formatted markdown block. Non-fatal on failure.
+    """
+    import yfinance as yf
+    import math as _math
+    MACRO_TICKERS = {
+        "VIX (Fear Index)":     "^VIX",
+        "DXY (Dollar Index)":   "DX-Y.NYB",
+        "US 10Y Yield":         "^TNX",
+        "Gold (GC=F)":          "GC=F",
+        "Crude Oil (CL=F)":     "CL=F",
+        "S&P 500 (SPY)":        "SPY",
+        "Nasdaq (QQQ)":         "QQQ",
+        "Bitcoin (BTC-USD)":    "BTC-USD",
+    }
+    lines = ["## Macro Indicators (Live)\n"]
+    for label, sym in MACRO_TICKERS.items():
+        try:
+            fi = yf.Ticker(sym).fast_info
+            price = fi.last_price
+            if price is None or (isinstance(price, float) and _math.isnan(price)):
+                continue
+            # 5d change
+            hist = yf.Ticker(sym).history(period="5d", interval="1d", auto_adjust=True)
+            if not hist.empty and len(hist) >= 2:
+                closes = hist["Close"].dropna()
+                chg = (float(closes.iloc[-1]) - float(closes.iloc[0])) / float(closes.iloc[0]) * 100
+                lines.append(f"- **{label}**: {price:.2f}  ({chg:+.2f}% 5d)")
+            else:
+                lines.append(f"- **{label}**: {price:.2f}")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def _fetch_per_ticker_news(symbol: str, max_items: int = 5) -> str:
+    """
+    Fetch recent news specifically for one ticker via yfinance.
+    Returns a short markdown block. Non-fatal.
+    """
+    try:
+        import yfinance as yf
+        ticker = yf.Ticker(symbol)
+        news = ticker.news
+        if not news:
+            return ""
+        lines = [f"**{symbol} Recent News:**"]
+        for item in news[:max_items]:
+            title = item.get("title", "")
+            pub = item.get("providerPublishTime", 0)
+            if pub:
+                from datetime import datetime as _dt
+                age_h = (datetime.utcnow() - _dt.utcfromtimestamp(pub)).total_seconds() / 3600
+                if age_h < 1:
+                    age = f"{int(age_h*60)}m ago"
+                elif age_h < 24:
+                    age = f"{int(age_h)}h ago"
+                elif age_h < 168:
+                    age = f"{int(age_h/24)}d ago"
+                else:
+                    age = f"{int(age_h/168)}w ago"
+                lines.append(f"  - [{age}] {title}")
+            else:
+                lines.append(f"  - {title}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
                                     investment_focus: str = "") -> tuple[str, list]:
     """
-    Fetches web research + news + live price snapshot ONCE.
+    Exhaustive research layer — fetches ALL of the following ONCE and shares with all agents:
+      1. Macro indicators (VIX, DXY, yields, commodities, indices)
+      2. Broad market news (Google News RSS, multiple topics)
+      3. Per-ticker news from yfinance for EVERY enabled ticker
+      4. Live price snapshot for every enabled ticker
+      5. Full fundamental data for every enabled ticker
     Returns (context_string, research_log).
-    All 4 agents receive the exact same retrieval context — no duplicated fetches.
     """
     markets_str = ", ".join(enabled_markets.keys()) if enabled_markets else "none"
     focus_str = f" | focus: {investment_focus[:60]}" if investment_focus else ""
+    all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
     _log(db, run_id, "WEB_RESEARCH", "IN_PROGRESS",
-         f"Fetching shared research for: {markets_str}{focus_str}")
+         f"Exhaustive research for {len(all_tickers)} tickers across {markets_str}{focus_str}")
 
-    # Web research — seed topics from markets + investment focus
-    dynamic_topics = ["global stock market updates", "top market gainers and losers today"]
+    now = datetime.utcnow()
+
+    # ── 1. Macro indicators ───────────────────────────────────────────────────
+    macro_context = _fetch_macro_indicators()
+
+    # ── 2. Broad market news topics ──────────────────────────────────────────
+    dynamic_topics = [
+        "global stock market outlook today",
+        "top market movers gainers losers",
+        "Federal Reserve interest rates policy",
+        "earnings season results surprises",
+        "geopolitical risk markets",
+    ]
     for market, tickers in enabled_markets.items():
-        if tickers:
-            dynamic_topics.append(f"{market} market news {tickers[0]}")
+        dynamic_topics.append(f"{market} market news today")
+        # Add a news search for a specific ticker sample from each market
+        for sym in tickers[:2]:
+            clean = sym.replace(".NS", "").replace("-USD", "").replace("=F", "")
+            dynamic_topics.append(f"{clean} stock news analysis")
 
-    # Add investment-focus-derived topics so research is targeted
     if investment_focus:
         focus_lower = investment_focus.lower()
-        # Break the prompt into meaningful search phrases (up to 3 extra topics)
-        words = [w.strip(".,;:") for w in focus_lower.split() if len(w) > 3]
-        # Build topic from full focus text (trimmed)
         dynamic_topics.append(investment_focus[:120])
-        # Add sector/theme sub-queries derived from the focus text
         for keyword in ["tech", "ai", "semiconductor", "ev", "electric vehicle",
                         "healthcare", "pharma", "biotech", "energy", "oil", "renewable",
                         "banking", "finance", "crypto", "bitcoin", "india", "emerging market",
-                        "small cap", "growth", "dividend", "etf"]:
+                        "small cap", "growth", "dividend"]:
             if keyword in focus_lower:
-                dynamic_topics.append(f"{keyword} stocks news today")
+                dynamic_topics.append(f"{keyword} sector news catalyst today")
 
-    now = datetime.utcnow()
     research_items = fetch_web_research(topics=dynamic_topics, enabled_tickers=enabled_markets)
-
-    # Use date-annotated format so agents can judge news recency
     research_context = _annotate_research_with_dates(research_items, now)
 
     research_log = [
@@ -327,34 +505,77 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
 
     # News headlines
     news = fetch_news()
-    news_context = "## Additional News Headlines\n" + "".join(f"- {n}\n" for n in news)
+    news_context = "## Additional Market Headlines\n" + "".join(f"- {n}\n" for n in news)
     for n in news:
         research_log.append({"title": n, "url": "N/A"})
 
-    # Live price snapshot + 5-day fundamentals for all enabled tickers
+    # ── 3 & 4 & 5. Per-ticker: price + fundamentals + news (parallelised) ────
     price_lines = []
     fundamentals_blocks = []
-    for market, tickers in enabled_markets.items():
-        for sym in tickers[:4]:  # sample up to 4 per market
+    per_ticker_news_blocks = []
+
+    def _fetch_one_ticker(sym: str):
+        price_line = None
+        fund_block = None
+        news_block = None
+        try:
             sig = fetch_market_data(sym)
             if sig:
-                price_lines.append(f"  {sym}: ${sig.price:.4f}")
-            # Fetch compact fundamentals for each sampled ticker
+                price_line = f"  {sym}: ${sig.price:.4f}"
+        except Exception:
+            pass
+        try:
             fund_block = _fetch_ticker_fundamentals(sym)
-            if fund_block:
-                fundamentals_blocks.append(fund_block)
+        except Exception:
+            pass
+        try:
+            news_block = _fetch_per_ticker_news(sym)
+        except Exception:
+            pass
+        return sym, price_line, fund_block, news_block
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = {ex.submit(_fetch_one_ticker, sym): sym for sym in all_tickers}
+        for fut in as_completed(futs):
+            try:
+                sym, price_line, fund_block, news_block = fut.result()
+                if price_line:
+                    price_lines.append(price_line)
+                if fund_block:
+                    fundamentals_blocks.append(fund_block)
+                if news_block:
+                    per_ticker_news_blocks.append(news_block)
+            except Exception:
+                pass
 
     price_context = ""
     if price_lines:
-        price_context = f"## Live Price Snapshot (as of {now.strftime('%Y-%m-%d %H:%M UTC')})\n" + "\n".join(price_lines) + "\n"
+        # Sort for consistent ordering
+        price_lines.sort()
+        price_context = f"## Live Price Snapshot ({now.strftime('%Y-%m-%d %H:%M UTC')})\n" + "\n".join(price_lines) + "\n"
 
     fundamentals_context = ""
     if fundamentals_blocks:
-        fundamentals_context = "\n## Per-Ticker Fundamentals & Recent Performance\n" + "\n\n".join(fundamentals_blocks) + "\n"
+        fundamentals_context = "\n## Per-Ticker Deep Fundamentals\n" + "\n\n".join(fundamentals_blocks) + "\n"
 
-    full_context = f"# Market Context — {now.strftime('%A, %B %d, %Y %H:%M UTC')}\n\n{research_context}\n\n{news_context}\n{price_context}\n{fundamentals_context}"
+    per_ticker_news_context = ""
+    if per_ticker_news_blocks:
+        per_ticker_news_context = "\n## Per-Ticker Recent News\n" + "\n\n".join(per_ticker_news_blocks) + "\n"
+
+    full_context = (
+        f"# Market Intelligence Report — {now.strftime('%A, %B %d, %Y %H:%M UTC')}\n\n"
+        f"{macro_context}\n\n"
+        f"{research_context}\n\n"
+        f"{news_context}\n"
+        f"{price_context}\n"
+        f"{per_ticker_news_context}\n"
+        f"{fundamentals_context}"
+    )
+
     _log(db, run_id, "WEB_RESEARCH", "DONE",
-         f"Shared context ready — {len(research_items)} articles, {len(news)} headlines, {len(price_lines)} live prices, {len(fundamentals_blocks)} ticker fundamentals")
+         f"Research complete — {len(research_items)} articles, {len(news)} headlines, "
+         f"{len(price_lines)} prices, {len(fundamentals_blocks)} fundamentals, "
+         f"{len(per_ticker_news_blocks)} ticker news blocks")
 
     return full_context, research_log
 
@@ -417,7 +638,7 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
             "agent_name": agent_name,
             "ticker":     ticker,
             "action":     action,
-            "reasoning":  response[:600],
+            "reasoning":  response,
         }
     except Exception as e:
         print(f"[Debate] Agent {agent_name} error: {e}")
@@ -462,20 +683,44 @@ def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: st
 
 # ── Layer 3: Judge ────────────────────────────────────────────────────────────
 
-JUDGE_SYSTEM_PROMPT = """You are an independent trading committee judge with deep expertise in global markets.
+JUDGE_SYSTEM_PROMPT = """You are the Chief Investment Officer of a quantitative hedge fund, acting as the final decision-maker in a multi-agent trading committee. You have reviewed thousands of trade proposals over your career and you know exactly how to separate signal from noise.
 
-You will receive proposals from 4 specialist agents, plus the current portfolio budget context.
-Your job is to:
-1. Evaluate each proposal on its merits: quality of reasoning, alignment with market data, risk/reward
-2. Consider the available budget — do NOT recommend a trade if the portfolio has insufficient capital
-3. Identify the strongest proposal — not necessarily the most popular one
-4. Output your verdict in this EXACT format:
+You will receive:
+- A full market intelligence report (macro environment, news, live prices, fundamentals)
+- Structured proposals from 4 specialist agents (Value Investor, Technical Analyst, Macro Economist, Sentiment Analyst)
+- The current portfolio budget and open positions
 
-WINNER_TICKER: <SYMBOL>
-WINNER_ACTION: LONG or SHORT
-JUDGE_REASONING: <2-4 sentences explaining why this is the best trade and what risks to watch>
+## YOUR SCORING FRAMEWORK
 
-Be decisive. Do not hedge. Pick exactly one winner."""
+For each agent proposal, evaluate it on these 5 dimensions (score each 1–10):
+
+1. **THESIS QUALITY** — Is the core argument specific, data-backed, and non-obvious? (Generic "bullish on AI" = 2; Specific "NVDA P/E contracted 30% while forward estimates held — mispricing" = 9)
+2. **CATALYST SPECIFICITY** — Is there a clear, near-term (< 2 weeks) catalyst? Earnings, product launch, regulatory event, macro release? (No catalyst = 2; Named catalyst with date = 9)
+3. **NEWS FRESHNESS** — Is the thesis supported by news from the last 48 hours? (Only stale news = 2; Multiple fresh headlines directly supporting the thesis = 9)
+4. **RISK/REWARD CLARITY** — Does the agent define what would invalidate the thesis? Is there a stated stop level or timeframe? (Vague = 2; Clear invalidation + timeframe = 9)
+5. **CROSS-AGENT CONFIRMATION** — Do other agents' analyses corroborate this pick directionally? (All disagree = 1; 2+ agents aligned = 8; unanimous = 10)
+
+## DECISION RULES
+
+- **DO NOT** pick a trade with a composite score below 25/50
+- **DO NOT** duplicate an existing open position (check open_positions in budget context)
+- **DO** prefer high-conviction single-agent picks over weak consensus if the thesis is tight
+- **DO** consider macro regime: in risk-off environments, short candidates score higher
+- **DO** flag if no proposal meets the quality bar — output HOLD instead
+
+## OUTPUT FORMAT (exact format required)
+
+PROPOSAL_SCORES:
+- Value Investor: [score]/50 — [1 sentence rationale]
+- Technical Analyst: [score]/50 — [1 sentence rationale]
+- Macro Economist: [score]/50 — [1 sentence rationale]
+- Sentiment Analyst: [score]/50 — [1 sentence rationale]
+
+WINNER_TICKER: <SYMBOL or HOLD>
+WINNER_ACTION: LONG or SHORT (omit if HOLD)
+JUDGE_REASONING: <3-5 sentences: why this is the best proposal, the specific edge it has, the key risk to watch, and what would trigger an early exit>
+
+Be decisive. One winner per committee session."""
 
 
 def run_judge(db, run_id: str, proposals_log: list, shared_context: str, budget_context: str = "") -> tuple[str, str, str]:
@@ -487,21 +732,21 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str, budget_
     _log(db, run_id, "JUDGE", "IN_PROGRESS",
          f"Judge evaluating {len(proposals_log)} proposals…")
 
-    # Build the judge's input
+    # Build the judge's input — pass full reasoning (no truncation)
     proposals_text = "\n\n".join(
         f"--- {p['agent_name']} ---\n"
         f"Proposal: {p['action']} {p['ticker']}\n"
-        f"Reasoning: {p['reasoning']}"
+        f"Full Analysis:\n{p['reasoning']}"
         for p in proposals_log
     )
 
     judge_input = (
-        f"## Current Market Context (shared by all agents)\n"
-        f"{shared_context[:3000]}\n\n"
+        f"## Current Market Intelligence Report (shared by all agents)\n"
+        f"{shared_context[:6000]}\n\n"
         f"{budget_context}\n\n"
-        f"## Agent Proposals\n"
+        f"## Agent Proposals (Full Analysis)\n"
         f"{proposals_text}\n\n"
-        f"Now deliver your verdict."
+        f"Now score each proposal and deliver your verdict."
     )
 
     response = query_agent(JUDGE_SYSTEM_PROMPT, judge_input)
@@ -513,11 +758,17 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str, budget_
 
     winner_ticker  = ticker_match.group(1).upper().strip() if ticker_match else None
     winner_action  = action_match.group(1).upper().strip() if action_match else None
-    judge_reasoning = reason_match.group(1).strip()[:1000] if reason_match else response[:500]
+    judge_reasoning = reason_match.group(1).strip()[:2000] if reason_match else response[:1000]
+
+    # HOLD case — judge decided no proposal meets the quality bar
+    if winner_ticker == "HOLD":
+        print("[Judge] Verdict: HOLD — no proposal met quality threshold. Falling back to plurality vote.")
+        _log(db, run_id, "JUDGE", "DONE", "Judge issued HOLD — using plurality fallback")
+        winner_ticker = None
 
     # Validate the judge picked a ticker that was actually proposed
     proposed_tickers = {p["ticker"] for p in proposals_log}
-    if winner_ticker not in proposed_tickers:
+    if winner_ticker and winner_ticker not in proposed_tickers:
         print(f"[Judge] Picked {winner_ticker} which wasn't proposed — falling back to plurality vote.")
         winner_ticker = None
 
