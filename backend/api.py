@@ -81,25 +81,128 @@ def _build_chart(symbol: str, entry_price: float, entry_dt) -> dict:
 
 
 def _build_fundamentals(symbol: str) -> dict:
-    """Return key fundamental fields from yfinance, gracefully handling missing data."""
+    """Return rich fundamental fields from yfinance for the report template."""
+    def _safe(d, *keys):
+        for k in keys:
+            v = d.get(k)
+            if v is not None and not (isinstance(v, float) and math.isnan(v)):
+                return v
+        return None
+
     try:
-        info = yf.Ticker(symbol).info
+        ticker = yf.Ticker(symbol)
+        try:
+            info = ticker.info
+        except Exception:
+            info = {}
+        fi = ticker.fast_info
+
+        # Price history for technical signals
+        hist = ticker.history(period="1mo", interval="1d", auto_adjust=True)
+        closes = hist["Close"].dropna() if not hist.empty else None
+        vols   = hist["Volume"].dropna() if not hist.empty else None
+
+        # RSI(14)
+        rsi = None
+        if closes is not None and len(closes) >= 14:
+            deltas = closes.diff().dropna()
+            avg_gain = deltas.clip(lower=0).rolling(14).mean().iloc[-1]
+            avg_loss = (-deltas).clip(lower=0).rolling(14).mean().iloc[-1]
+            if avg_loss > 0:
+                rsi = round(float(100 - (100 / (1 + avg_gain / avg_loss))), 1)
+
+        # Volume ratio (last day vs 20-day avg)
+        vol_ratio = None
+        if vols is not None and len(vols) >= 2:
+            avg_vol = float(vols.iloc[:-1].mean())
+            if avg_vol > 0:
+                vol_ratio = round(float(vols.iloc[-1]) / avg_vol, 2)
+
+        # Price momentum
+        chg_5d = chg_20d = None
+        if closes is not None and len(closes) >= 2:
+            n5 = min(5, len(closes))
+            chg_5d  = round((float(closes.iloc[-1]) - float(closes.iloc[-n5])) / float(closes.iloc[-n5]) * 100, 2)
+            chg_20d = round((float(closes.iloc[-1]) - float(closes.iloc[0])) / float(closes.iloc[0]) * 100, 2)
+
+        # Recent closes (last 5 days)
+        recent_closes = []
+        if closes is not None:
+            for ts, c in zip(closes.index[-5:], closes.values[-5:]):
+                recent_closes.append({"date": ts.strftime("%m-%d"), "close": round(float(c), 4)})
+
+        # Next earnings
+        next_earnings = None
+        try:
+            cal = ticker.calendar
+            if cal is not None and not (hasattr(cal, 'empty') and cal.empty):
+                ed = cal.get("Earnings Date", [None])[0] if hasattr(cal, 'get') else None
+                if ed:
+                    next_earnings = str(ed)
+        except Exception:
+            pass
+
+        # Analyst target
+        target = _safe(info, "targetMeanPrice")
+        target_low = _safe(info, "targetLowPrice")
+        target_high = _safe(info, "targetHighPrice")
+        lp = None
+        try:
+            lp = fi.last_price
+        except Exception:
+            pass
+        lp = lp or _safe(info, "currentPrice", "regularMarketPrice")
+        analyst_upside = round((target - lp) / lp * 100, 1) if target and lp and lp > 0 else None
+
         return {
+            # Identity
             "name":           info.get("longName") or info.get("shortName"),
             "sector":         info.get("sector"),
             "industry":       info.get("industry"),
-            "market_cap":     info.get("marketCap"),
-            "pe_ratio":       info.get("trailingPE"),
-            "forward_pe":     info.get("forwardPE"),
-            "52w_high":       info.get("fiftyTwoWeekHigh"),
-            "52w_low":        info.get("fiftyTwoWeekLow"),
-            "avg_volume":     info.get("averageVolume"),
-            "beta":           info.get("beta"),
-            "dividend_yield": info.get("dividendYield"),
-            "currency":       info.get("currency", "USD"),
             "exchange":       info.get("exchange"),
+            "currency":       info.get("currency", "USD"),
             "quote_type":     info.get("quoteType"),
-            "description":    (info.get("longBusinessSummary") or "")[:400] or None,
+            "description":    (info.get("longBusinessSummary") or "")[:500] or None,
+            # Size
+            "market_cap":     _safe(info, "marketCap"),
+            "enterprise_value": _safe(info, "enterpriseValue"),
+            # Valuation
+            "pe_ratio":       _safe(info, "trailingPE"),
+            "forward_pe":     _safe(info, "forwardPE"),
+            "pb_ratio":       _safe(info, "priceToBook"),
+            "ps_ratio":       _safe(info, "priceToSalesTrailing12Months"),
+            "ev_ebitda":      _safe(info, "enterpriseToEbitda"),
+            # Growth & profitability
+            "revenue_growth": _safe(info, "revenueGrowth"),
+            "earnings_growth": _safe(info, "earningsGrowth"),
+            "profit_margin":  _safe(info, "profitMargins"),
+            "operating_margin": _safe(info, "operatingMargins"),
+            "roe":            _safe(info, "returnOnEquity"),
+            "roa":            _safe(info, "returnOnAssets"),
+            "debt_equity":    _safe(info, "debtToEquity"),
+            # Price history
+            "52w_high":       _safe(info, "fiftyTwoWeekHigh") or (fi.fifty_two_week_high if hasattr(fi, 'fifty_two_week_high') else None),
+            "52w_low":        _safe(info, "fiftyTwoWeekLow") or (fi.fifty_two_week_low if hasattr(fi, 'fifty_two_week_low') else None),
+            "avg_volume":     _safe(info, "averageVolume"),
+            "beta":           _safe(info, "beta"),
+            "dividend_yield": _safe(info, "dividendYield"),
+            # Analyst consensus
+            "analyst_target":       target,
+            "analyst_target_low":   target_low,
+            "analyst_target_high":  target_high,
+            "analyst_upside":       analyst_upside,
+            "analyst_recommendation": info.get("recommendationKey"),
+            "analyst_count":        _safe(info, "numberOfAnalystOpinions"),
+            # Short interest
+            "short_pct_float":    _safe(info, "shortPercentOfFloat"),
+            # Technical signals
+            "rsi_14":         rsi,
+            "vol_ratio":      vol_ratio,
+            "chg_5d":         chg_5d,
+            "chg_20d":        chg_20d,
+            "recent_closes":  recent_closes,
+            # Catalyst
+            "next_earnings":  next_earnings,
         }
     except Exception as e:
         return {

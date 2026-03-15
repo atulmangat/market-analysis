@@ -7,7 +7,21 @@ interface StrategyReport {
   strategy: Strategy;
   debate: { id: number; timestamp: string; consensus_votes: string; judge_reasoning: string | null; enabled_markets: string | null; proposals: (Proposal & { matched_consensus: boolean })[]; } | null;
   chart: { symbol: string; candles: ReportCandle[]; entry_price: number; entry_date: string | null; error?: string; };
-  fundamentals: { name: string | null; sector: string | null; industry: string | null; market_cap: number | null; pe_ratio: number | null; forward_pe: number | null; '52w_high': number | null; '52w_low': number | null; avg_volume: number | null; beta: number | null; dividend_yield: number | null; currency: string; quote_type: string | null; description?: string | null; error?: string; };
+  fundamentals: {
+    name: string | null; sector: string | null; industry: string | null; exchange: string | null;
+    market_cap: number | null; enterprise_value: number | null;
+    pe_ratio: number | null; forward_pe: number | null; pb_ratio: number | null; ps_ratio: number | null; ev_ebitda: number | null;
+    revenue_growth: number | null; earnings_growth: number | null; profit_margin: number | null; operating_margin: number | null;
+    roe: number | null; roa: number | null; debt_equity: number | null;
+    '52w_high': number | null; '52w_low': number | null; avg_volume: number | null; beta: number | null; dividend_yield: number | null;
+    analyst_target: number | null; analyst_target_low: number | null; analyst_target_high: number | null;
+    analyst_upside: number | null; analyst_recommendation: string | null; analyst_count: number | null;
+    short_pct_float: number | null;
+    rsi_14: number | null; vol_ratio: number | null; chg_5d: number | null; chg_20d: number | null;
+    recent_closes: { date: string; close: number }[];
+    next_earnings: string | null;
+    currency: string; quote_type: string | null; description?: string | null; error?: string;
+  };
 }
 interface PortfolioPnl { total_budget: number; allocated: number; available: number; realized_pnl: number; unrealized_pnl: number; total_pnl: number; total_pnl_pct: number; using_assumed_sizes?: boolean; positions: (Strategy & { pnl_usd: number | null; pnl_pct: number | null; is_open: boolean; current_price?: number | null; assumed_size?: number | null })[]; }
 interface MarketConfig { id: number; market_name: string; is_enabled: number; }
@@ -299,6 +313,35 @@ function StatPill({ label, value, accent }: { label: string; value: string; acce
 }
 
 // ── Shared: judge + proposals section ─────────────────────────────────────
+function AgentProposalCard({ p }: { p: StrategyReport['debate'] extends null ? never : NonNullable<StrategyReport['debate']>['proposals'][0] }) {
+  const [expanded, setExpanded] = useState(false);
+  const preview = p.reasoning.slice(0, 320);
+  const hasMore = p.reasoning.length > 320;
+  return (
+    <div className={`rounded-xl border p-4 ${p.matched_consensus ? 'border-brand-500/30 bg-brand-900/10' : 'border-borderLight bg-surface2'}`}>
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-brand-400">{p.agent_name}</span>
+          {p.matched_consensus && <span className="text-[9px] bg-brand-500/20 text-brand-300 px-1.5 py-0.5 rounded font-semibold">✓ SELECTED</span>}
+        </div>
+        <div className="flex items-center gap-1.5">
+          <Badge type={p.action} />
+          <span className="text-[10px] text-textDim font-mono">{p.ticker}</span>
+        </div>
+      </div>
+      <p className="text-[11px] text-textMuted leading-relaxed whitespace-pre-wrap">
+        {expanded ? p.reasoning : preview}{!expanded && hasMore ? '…' : ''}
+      </p>
+      {hasMore && (
+        <button onClick={() => setExpanded(e => !e)}
+          className="mt-2 text-[10px] text-brand-400 hover:text-brand-300 font-semibold">
+          {expanded ? '▲ Show less' : '▼ Read full analysis'}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function DebateSection({ d }: { d: StrategyReport['debate'] }) {
   return (
     <>
@@ -307,11 +350,11 @@ function DebateSection({ d }: { d: StrategyReport['debate'] }) {
         {d ? (
           <div className="bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-500/20 rounded-xl p-4">
             <div className="flex items-center gap-2 mb-2">
-              <span className="text-xs font-semibold text-amber-600 dark:text-amber-400">⚖ Consensus</span>
-              <span className="text-[10px] text-textDim font-mono">{d.consensus_votes} agents agreed</span>
+              <span className="text-xs font-semibold text-amber-600 dark:text-amber-400">⚖ Committee Decision</span>
+              <span className="text-[10px] text-textDim font-mono">{d.consensus_votes} agents aligned</span>
               {d.enabled_markets && <span className="text-[10px] text-textDim">· {d.enabled_markets}</span>}
             </div>
-            <p className="text-[11px] text-textMuted leading-relaxed">{d.judge_reasoning ?? 'No reasoning recorded.'}</p>
+            <p className="text-[11px] text-textMuted leading-relaxed whitespace-pre-wrap">{d.judge_reasoning ?? 'No reasoning recorded.'}</p>
           </div>
         ) : (
           <p className="text-xs text-textDim">No debate linked to this strategy.</p>
@@ -319,23 +362,9 @@ function DebateSection({ d }: { d: StrategyReport['debate'] }) {
       </div>
       {d && d.proposals.length > 0 && (
         <div className="px-6 py-5">
-          <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Agent Proposals</p>
+          <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Agent Analysis ({d.proposals.length} analysts)</p>
           <div className="space-y-3">
-            {d.proposals.map((p, i) => (
-              <div key={i} className={`rounded-xl border p-4 ${p.matched_consensus ? 'border-brand-500/30 bg-brand-900/10' : 'border-borderLight bg-surface2'}`}>
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-semibold text-brand-400">{p.agent_name}</span>
-                    {p.matched_consensus && <span className="text-[9px] bg-brand-500/20 text-brand-300 px-1.5 py-0.5 rounded font-semibold">✓ SELECTED</span>}
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <Badge type={p.action} />
-                    <span className="text-[10px] text-textDim font-mono">{p.ticker}</span>
-                  </div>
-                </div>
-                <p className="text-[11px] text-textMuted leading-relaxed">{p.reasoning}</p>
-              </div>
-            ))}
+            {d.proposals.map((p, i) => <AgentProposalCard key={i} p={p} />)}
           </div>
         </div>
       )}
@@ -402,14 +431,32 @@ function CryptoReportTemplate({ report }: { report: StrategyReport }) {
 
       {/* Key metrics */}
       <div className="px-6 py-5">
-        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">On-Chain & Market Metrics</p>
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Market Metrics</p>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           {f.market_cap && <StatPill label="Market Cap" value={fmtMarketCap(f.market_cap)} accent="border-violet-500/30" />}
           {f.avg_volume && <StatPill label="Avg Daily Volume" value={fmtVol(f.avg_volume)} />}
           {f['52w_high'] && <StatPill label="52w High" value={`$${f['52w_high']!.toFixed(2)}`} />}
           {f['52w_low'] && <StatPill label="52w Low" value={`$${f['52w_low']!.toFixed(2)}`} />}
-          <StatPill label="Currency" value={f.currency} />
           <StatPill label="Entry Price" value={`$${s.entry_price.toFixed(4)}`} accent="border-amber-500/30" />
+          {s.current_return != null && (
+            <StatPill label="Current P&L"
+              value={`${s.current_return >= 0 ? '+' : ''}${s.current_return.toFixed(2)}%`}
+              accent={s.current_return >= 0 ? 'border-up/40' : 'border-down/40'}
+            />
+          )}
+          {f.chg_5d != null && <StatPill label="5d Change" value={`${f.chg_5d >= 0 ? '+' : ''}${f.chg_5d.toFixed(2)}%`} accent={f.chg_5d >= 0 ? 'border-up/30' : 'border-down/30'} />}
+          {f.chg_20d != null && <StatPill label="20d Change" value={`${f.chg_20d >= 0 ? '+' : ''}${f.chg_20d.toFixed(2)}%`} accent={f.chg_20d >= 0 ? 'border-up/30' : 'border-down/30'} />}
+          {f.rsi_14 != null && (
+            <StatPill label="RSI (14)"
+              value={`${f.rsi_14.toFixed(0)} · ${f.rsi_14 > 70 ? 'Overbought' : f.rsi_14 < 30 ? 'Oversold' : 'Neutral'}`}
+              accent={f.rsi_14 > 70 ? 'border-down/40' : f.rsi_14 < 30 ? 'border-up/40' : 'border-borderLight'}
+            />
+          )}
+          {f.vol_ratio != null && (
+            <StatPill label="Volume vs Avg"
+              value={`${f.vol_ratio.toFixed(1)}x ${f.vol_ratio > 1.5 ? '↑ Surge' : f.vol_ratio < 0.7 ? '↓ Quiet' : '– Normal'}`}
+            />
+          )}
         </div>
       </div>
 
@@ -480,14 +527,19 @@ function StockReportTemplate({ report }: { report: StrategyReport }) {
           : <PriceVolumeChart candles={ch.candles} entryPrice={ch.entry_price} accentColor="brand" />}
       </div>
 
+      {/* Description */}
+      {f.description && (
+        <div className="px-6 py-4 border-t border-borderLight">
+          <p className="text-[11px] text-textMuted leading-relaxed">{f.description}</p>
+        </div>
+      )}
+
       {/* Valuation */}
       <div className="px-6 py-5">
-        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Valuation & Fundamentals</p>
-        {f.description && (
-          <p className="text-[11px] text-textMuted leading-relaxed mb-3 line-clamp-3">{f.description}</p>
-        )}
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Valuation</p>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           {f.market_cap && <StatPill label="Market Cap" value={fmtMarketCap(f.market_cap)} accent="border-brand-500/30" />}
+          {f.enterprise_value && <StatPill label="Enterprise Value" value={fmtMarketCap(f.enterprise_value)} />}
           {f.pe_ratio != null && (
             <StatPill label="P/E (TTM)"
               value={`${f.pe_ratio.toFixed(1)}x${peScore ? ` · ${peScore}` : ''}`}
@@ -495,18 +547,98 @@ function StockReportTemplate({ report }: { report: StrategyReport }) {
             />
           )}
           {f.forward_pe != null && <StatPill label="Fwd P/E" value={`${f.forward_pe.toFixed(1)}x`} />}
+          {f.pb_ratio != null && <StatPill label="P/B" value={`${f.pb_ratio.toFixed(2)}x`} />}
+          {f.ps_ratio != null && <StatPill label="P/S" value={`${f.ps_ratio.toFixed(2)}x`} />}
+          {f.ev_ebitda != null && <StatPill label="EV/EBITDA" value={`${f.ev_ebitda.toFixed(1)}x`} />}
           {f.beta != null && <StatPill label="Beta" value={`${f.beta.toFixed(2)}${f.beta > 1.5 ? ' · High vol' : f.beta < 0.8 ? ' · Low vol' : ''}`} />}
           {f.dividend_yield != null && <StatPill label="Div Yield" value={`${(f.dividend_yield * 100).toFixed(2)}%`} accent="border-up/30" />}
-          {f.avg_volume && <StatPill label="Avg Volume" value={fmtVol(f.avg_volume)} />}
-          {f['52w_high'] && <StatPill label="52w High" value={`$${f['52w_high']!.toFixed(2)}`} />}
-          {f['52w_low'] && <StatPill label="52w Low" value={`$${f['52w_low']!.toFixed(2)}`} />}
+        </div>
+      </div>
+
+      {/* Growth & Profitability */}
+      {(f.revenue_growth != null || f.earnings_growth != null || f.profit_margin != null || f.roe != null || f.debt_equity != null) && (
+        <div className="px-6 py-5">
+          <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Growth & Profitability</p>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+            {f.revenue_growth != null && <StatPill label="Revenue Growth (YoY)" value={`${(f.revenue_growth * 100).toFixed(1)}%`} accent={f.revenue_growth >= 0 ? 'border-up/30' : 'border-down/30'} />}
+            {f.earnings_growth != null && <StatPill label="Earnings Growth" value={`${(f.earnings_growth * 100).toFixed(1)}%`} accent={f.earnings_growth >= 0 ? 'border-up/30' : 'border-down/30'} />}
+            {f.profit_margin != null && <StatPill label="Net Margin" value={`${(f.profit_margin * 100).toFixed(1)}%`} />}
+            {f.operating_margin != null && <StatPill label="Operating Margin" value={`${(f.operating_margin * 100).toFixed(1)}%`} />}
+            {f.roe != null && <StatPill label="ROE" value={`${(f.roe * 100).toFixed(1)}%`} />}
+            {f.roa != null && <StatPill label="ROA" value={`${(f.roa * 100).toFixed(1)}%`} />}
+            {f.debt_equity != null && <StatPill label="Debt/Equity" value={`${f.debt_equity.toFixed(2)}x`} accent={f.debt_equity > 2 ? 'border-down/30' : 'border-borderLight'} />}
+          </div>
+        </div>
+      )}
+
+      {/* Analyst Consensus */}
+      {(f.analyst_target != null || f.analyst_recommendation) && (
+        <div className="px-6 py-5">
+          <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Analyst Consensus</p>
+          <div className="bg-surface2 rounded-xl border border-borderLight p-4">
+            <div className="flex items-center justify-between mb-3">
+              {f.analyst_recommendation && (
+                <div>
+                  <p className="text-[10px] text-textDim mb-0.5">Consensus Rating</p>
+                  <span className={`text-sm font-bold uppercase ${f.analyst_recommendation.includes('buy') ? 'text-up' : f.analyst_recommendation.includes('sell') ? 'text-down' : 'text-amber-400'}`}>
+                    {f.analyst_recommendation.replace(/_/g, ' ')}
+                  </span>
+                  {f.analyst_count && <span className="text-[10px] text-textDim ml-2">({f.analyst_count} analysts)</span>}
+                </div>
+              )}
+              {f.analyst_target != null && (
+                <div className="text-right">
+                  <p className="text-[10px] text-textDim mb-0.5">Price Target</p>
+                  <p className="text-lg font-light font-mono text-textMain">${f.analyst_target.toFixed(2)}</p>
+                  {f.analyst_upside != null && (
+                    <p className={`text-xs font-semibold ${f.analyst_upside >= 0 ? 'text-up' : 'text-down'}`}>
+                      {f.analyst_upside >= 0 ? '+' : ''}{f.analyst_upside.toFixed(1)}% upside
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+            {(f.analyst_target_low != null || f.analyst_target_high != null) && (
+              <div className="flex justify-between text-[10px] text-textDim border-t border-borderLight pt-2">
+                {f.analyst_target_low != null && <span>Bear: ${f.analyst_target_low.toFixed(2)}</span>}
+                {f.analyst_target != null && <span className="text-textMuted">Base: ${f.analyst_target.toFixed(2)}</span>}
+                {f.analyst_target_high != null && <span>Bull: ${f.analyst_target_high.toFixed(2)}</span>}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Technical Signals */}
+      <div className="px-6 py-5">
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Technical Signals</p>
+        <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           <StatPill label="Entry Price" value={`$${s.entry_price.toFixed(4)}`} accent="border-amber-500/30" />
-          {s.current_return !== undefined && (
-            <StatPill label="Current Return"
+          {s.current_return != null && (
+            <StatPill label="Current P&L"
               value={`${s.current_return >= 0 ? '+' : ''}${s.current_return.toFixed(2)}%`}
               accent={s.current_return >= 0 ? 'border-up/40' : 'border-down/40'}
             />
           )}
+          {f.chg_5d != null && <StatPill label="5d Change" value={`${f.chg_5d >= 0 ? '+' : ''}${f.chg_5d.toFixed(2)}%`} accent={f.chg_5d >= 0 ? 'border-up/30' : 'border-down/30'} />}
+          {f.chg_20d != null && <StatPill label="20d Change" value={`${f.chg_20d >= 0 ? '+' : ''}${f.chg_20d.toFixed(2)}%`} accent={f.chg_20d >= 0 ? 'border-up/30' : 'border-down/30'} />}
+          {f.rsi_14 != null && (
+            <StatPill label="RSI (14)"
+              value={`${f.rsi_14.toFixed(0)} · ${f.rsi_14 > 70 ? 'Overbought' : f.rsi_14 < 30 ? 'Oversold' : 'Neutral'}`}
+              accent={f.rsi_14 > 70 ? 'border-down/40' : f.rsi_14 < 30 ? 'border-up/40' : 'border-borderLight'}
+            />
+          )}
+          {f.vol_ratio != null && (
+            <StatPill label="Volume vs Avg"
+              value={`${f.vol_ratio.toFixed(1)}x ${f.vol_ratio > 1.5 ? '↑ Surge' : f.vol_ratio < 0.7 ? '↓ Quiet' : '– Normal'}`}
+              accent={f.vol_ratio > 1.5 ? 'border-brand-500/30' : 'border-borderLight'}
+            />
+          )}
+          {f.avg_volume && <StatPill label="Avg Volume" value={fmtVol(f.avg_volume)} />}
+          {f['52w_high'] && <StatPill label="52w High" value={`$${f['52w_high']!.toFixed(2)}`} />}
+          {f['52w_low'] && <StatPill label="52w Low" value={`$${f['52w_low']!.toFixed(2)}`} />}
+          {f.short_pct_float != null && <StatPill label="Short Interest" value={`${(f.short_pct_float * 100).toFixed(1)}% of float`} accent={f.short_pct_float > 0.1 ? 'border-down/30' : 'border-borderLight'} />}
+          {f.next_earnings && <StatPill label="Next Earnings" value={f.next_earnings.slice(0, 10)} accent="border-amber-500/20" />}
         </div>
       </div>
 
@@ -590,21 +722,33 @@ function CommodityReportTemplate({ report }: { report: StrategyReport }) {
 
       {/* Contract & market metrics */}
       <div className="px-6 py-5">
-        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Contract & Market Data</p>
+        <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Contract & Technical Data</p>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           {f['52w_high'] && <StatPill label="52w High" value={`$${f['52w_high']!.toFixed(2)}`} accent="border-down/30" />}
           {f['52w_low'] && <StatPill label="52w Low" value={`$${f['52w_low']!.toFixed(2)}`} accent="border-up/30" />}
           {f.avg_volume && <StatPill label="Avg Volume" value={fmtVol(f.avg_volume)} />}
           <StatPill label="Entry Price" value={`$${s.entry_price.toFixed(4)}`} accent="border-amber-500/30" />
-          <StatPill label="Currency" value={f.currency} />
           {priceZone && <StatPill label="Price Zone"
             value={priceZone}
             accent={priceZone === 'Near Support' ? 'border-up/40' : priceZone === 'Near Resistance' ? 'border-down/40' : 'border-amber-500/30'}
           />}
-          {s.current_return !== undefined && (
-            <StatPill label="Current Return"
+          {s.current_return != null && (
+            <StatPill label="Current P&L"
               value={`${s.current_return >= 0 ? '+' : ''}${s.current_return.toFixed(2)}%`}
               accent={s.current_return >= 0 ? 'border-up/40' : 'border-down/40'}
+            />
+          )}
+          {f.chg_5d != null && <StatPill label="5d Change" value={`${f.chg_5d >= 0 ? '+' : ''}${f.chg_5d.toFixed(2)}%`} accent={f.chg_5d >= 0 ? 'border-up/30' : 'border-down/30'} />}
+          {f.chg_20d != null && <StatPill label="20d Change" value={`${f.chg_20d >= 0 ? '+' : ''}${f.chg_20d.toFixed(2)}%`} accent={f.chg_20d >= 0 ? 'border-up/30' : 'border-down/30'} />}
+          {f.rsi_14 != null && (
+            <StatPill label="RSI (14)"
+              value={`${f.rsi_14.toFixed(0)} · ${f.rsi_14 > 70 ? 'Overbought' : f.rsi_14 < 30 ? 'Oversold' : 'Neutral'}`}
+              accent={f.rsi_14 > 70 ? 'border-down/40' : f.rsi_14 < 30 ? 'border-up/40' : 'border-borderLight'}
+            />
+          )}
+          {f.vol_ratio != null && (
+            <StatPill label="Volume vs Avg"
+              value={`${f.vol_ratio.toFixed(1)}x ${f.vol_ratio > 1.5 ? '↑ Surge' : f.vol_ratio < 0.7 ? '↓ Quiet' : '– Normal'}`}
             />
           )}
         </div>
@@ -1442,7 +1586,7 @@ function AppInner() {
         setReportData(await res.json());
       } else {
         const body = await res.json().catch(() => ({}));
-        setReportError(body.detail ?? `HTTP ${res.status}`);
+        setReportError(`${body.detail ?? `HTTP ${res.status}`} (strategy #${id})`);
       }
     } catch (e: unknown) {
       setReportError(e instanceof Error ? e.message : 'Network error');
