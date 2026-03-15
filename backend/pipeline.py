@@ -10,8 +10,11 @@ Chain:
 
 import os
 import json
-from database import SessionLocal
+from database import SessionLocal, engine, ensure_tables
 import models
+
+# Ensure all tables exist on every invocation (critical for serverless cold starts)
+ensure_tables(engine)
 from orchestrator import (
     _log,
     get_enabled_markets,
@@ -89,15 +92,16 @@ def pipeline_research(run_id: str):
         # ── Knowledge Graph: upsert asset nodes + ingest compressed facts ─────
         all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
         try:
+            import traceback as _tb
             upsert_asset_nodes(db, all_tickers)
             _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
                  f"Extracting graph facts from {len(research_items)} research items…")
-            # Pass full research_items (with snippets) for richer LLM extraction
             edges_added = ingest_retrieval_to_graph(db, research_items, run_id)
             _log(db, run_id, "KG_INGEST", "DONE",
                  f"Knowledge graph updated — {edges_added} new edges (semantic dedup applied)")
         except Exception as kg_err:
-            _log(db, run_id, "KG_INGEST", "ERROR", f"KG ingest failed (non-fatal): {str(kg_err)[:200]}")
+            _log(db, run_id, "KG_INGEST", "ERROR",
+                 f"KG ingest failed: {str(kg_err)[:300]} | {_tb.format_exc()[-300:]}")
 
         # Save context to DB for the next lambda to pick up
         run.shared_context = json.dumps({

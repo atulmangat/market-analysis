@@ -26,6 +26,13 @@ def get_db():
         db.close()
 
 
+def ensure_tables(engine):
+    """Create all tables if they don't exist. Safe to call multiple times."""
+    from models import Base
+    Base.metadata.create_all(bind=engine)
+    run_migrations(engine)
+
+
 def run_migrations(engine):
     """Run idempotent schema migrations not handled by create_all."""
     from sqlalchemy import text
