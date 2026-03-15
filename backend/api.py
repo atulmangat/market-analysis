@@ -1270,3 +1270,20 @@ def get_portfolio_pnl(db: Session = Depends(get_db)):
         "positions":       positions,
         "using_assumed_sizes": not any_sized and n_active > 0,
     }
+
+
+# ── Knowledge Graph endpoints ─────────────────────────────────────────────────
+
+@protected.get("/knowledge-graph")
+def get_knowledge_graph(db: Session = Depends(get_db)):
+    """Return all nodes and deduplicated edges (capped at 500 nodes)."""
+    from knowledge_graph import get_full_graph
+    return get_full_graph(db, limit_nodes=500)
+
+
+@protected.get("/knowledge-graph/ticker/{symbol}")
+def get_ticker_kg(symbol: str, hops: int = 2, db: Session = Depends(get_db)):
+    """Return the 1–3 hop subgraph centered on a ticker."""
+    from knowledge_graph import get_ticker_subgraph
+    hops = max(1, min(hops, 3))
+    return get_ticker_subgraph(db, symbol.upper(), hops=hops)

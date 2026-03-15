@@ -31,6 +31,9 @@ interface AgentMemory { id: number; agent_name: string; note_type: string; conte
 interface AgentPrompt { id: number; agent_name: string; system_prompt: string; updated_at: string | null; }
 interface AgentFitness { agent_name: string; generation: number; fitness_score: number | null; win_rate: number | null; avg_return: number | null; total_scored: number; updated_at: string | null; }
 interface AgentEvolution { id: number; generation: number; fitness_score: number | null; win_rate: number | null; avg_return: number | null; total_scored: number; evolution_reason: string | null; system_prompt: string; replaced_at: string | null; created_at: string; }
+interface KGNode { id: string; type: 'ASSET' | 'EVENT' | 'ENTITY' | 'INDICATOR'; label: string; symbol: string | null; last_seen_at: string | null; metadata: Record<string, unknown>; }
+interface KGEdge { source: string; target: string; relation: string; confidence: number; created_at: string | null; }
+interface KnowledgeGraph { nodes: KGNode[]; edges: KGEdge[]; center?: string; }
 interface WebResearch { id: number; title: string; snippet: string; source_url: string; fetched_at: string; }
 interface PipelineEvent { id: number; step: string; agent_name: string | null; status: string; detail: string | null; created_at: string; }
 interface PipelineRunOutput { ticker: string; action: string; votes: string; judge_reasoning: string; proposals: { agent_name: string; ticker: string; action: string; reasoning: string }[]; strategy_id: number | null; debate_id: number | null; }
@@ -136,11 +139,12 @@ function applyTheme(dark: boolean) {
 }
 
 // ── Nav pages ──────────────────────────────────────────────────────────────
-type Page = 'dashboard' | 'markets' | 'portfolio' | 'memory' | 'pipeline' | 'settings';
+type Page = 'dashboard' | 'markets' | 'graph' | 'portfolio' | 'memory' | 'pipeline' | 'settings';
 
 const NAV: { id: Page; label: string; icon: string }[] = [
   { id: 'dashboard', label: 'Dashboard',    icon: '▦' },
   { id: 'markets',   label: 'Markets',      icon: '◈' },
+  { id: 'graph',     label: 'Knowledge Graph', icon: '◎' },
   { id: 'portfolio', label: 'Portfolio',    icon: '$' },
   { id: 'memory',    label: 'Agent Memory', icon: '◉' },
   { id: 'pipeline',  label: 'Live Pipeline', icon: '⟳' },
@@ -755,6 +759,279 @@ function CommodityReportTemplate({ report }: { report: StrategyReport }) {
       </div>
 
       <DebateSection d={d} />
+    </div>
+  );
+}
+
+// ── Knowledge Graph ──────────────────────────────────────────────────────────
+
+const KG_COLORS: Record<string, string> = {
+  ASSET:     '#3b82f6',
+  ENTITY:    '#8b5cf6',
+  EVENT:     '#f59e0b',
+  INDICATOR: '#10b981',
+};
+
+function runForceLayout(
+  nodes: KGNode[], edges: KGEdge[], W: number, H: number
+): Record<string, { x: number; y: number }> {
+  const pos: Record<string, { x: number; y: number }> = {};
+  nodes.forEach((n, i) => {
+    const angle = (i / Math.max(nodes.length, 1)) * 2 * Math.PI;
+    pos[n.id] = {
+      x: W / 2 + Math.cos(angle) * W * 0.33,
+      y: H / 2 + Math.sin(angle) * H * 0.33,
+    };
+  });
+  for (let iter = 0; iter < 100; iter++) {
+    const forces: Record<string, { fx: number; fy: number }> = {};
+    nodes.forEach(n => { forces[n.id] = { fx: 0, fy: 0 }; });
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        const dx = pos[a.id].x - pos[b.id].x;
+        const dy = pos[a.id].y - pos[b.id].y;
+        const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const f = 3500 / (dist * dist);
+        forces[a.id].fx += (dx / dist) * f; forces[a.id].fy += (dy / dist) * f;
+        forces[b.id].fx -= (dx / dist) * f; forces[b.id].fy -= (dy / dist) * f;
+      }
+    }
+    edges.forEach(e => {
+      const sp = pos[e.source], tp = pos[e.target];
+      if (!sp || !tp) return;
+      const dx = tp.x - sp.x, dy = tp.y - sp.y;
+      const dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const f = (dist - 130) * 0.04 * e.confidence;
+      forces[e.source].fx += (dx / dist) * f; forces[e.source].fy += (dy / dist) * f;
+      forces[e.target].fx -= (dx / dist) * f; forces[e.target].fy -= (dy / dist) * f;
+    });
+    nodes.forEach(n => {
+      pos[n.id].x = Math.max(48, Math.min(W - 48, pos[n.id].x + forces[n.id].fx * 0.12));
+      pos[n.id].y = Math.max(48, Math.min(H - 48, pos[n.id].y + forces[n.id].fy * 0.12));
+    });
+  }
+  return pos;
+}
+
+function KnowledgeGraphViewer() {
+  const [graph, setGraph] = useState<KnowledgeGraph | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [filter, setFilter] = useState<'ALL' | 'ASSET' | 'ENTITY' | 'EVENT' | 'INDICATOR'>('ALL');
+  const [selectedNode, setSelectedNode] = useState<KGNode | null>(null);
+  const [positions, setPositions] = useState<Record<string, { x: number; y: number }>>({});
+  const [tickerSearch, setTickerSearch] = useState('');
+  const W = 800, H = 480;
+
+  const loadGraph = async () => {
+    setLoading(true);
+    try {
+      const res = await apiFetch('/knowledge-graph');
+      if (res.ok) {
+        const data = await res.json();
+        setGraph(data);
+        setPositions(runForceLayout(data.nodes.slice(0, 150), data.edges, W, H));
+      }
+    } finally { setLoading(false); }
+  };
+
+  const loadSubgraph = async (symbol: string) => {
+    setLoading(true);
+    try {
+      const res = await apiFetch(`/knowledge-graph/ticker/${encodeURIComponent(symbol)}?hops=2`);
+      if (res.ok) {
+        const data = await res.json();
+        setGraph(data);
+        setPositions(runForceLayout(data.nodes, data.edges, W, H));
+        setFilter('ALL');
+      }
+    } finally { setLoading(false); }
+  };
+
+  useEffect(() => { loadGraph(); }, []);
+
+  const displayNodes = (graph?.nodes ?? []).slice(0, 150).filter(
+    n => filter === 'ALL' || n.type === filter
+  );
+  const displayNodeIds = new Set(displayNodes.map(n => n.id));
+  const displayEdges = (graph?.edges ?? []).filter(
+    e => displayNodeIds.has(e.source) && displayNodeIds.has(e.target)
+  );
+
+  const relLabel = (r: string) => r.replace(/_/g, ' ');
+
+  return (
+    <div className="space-y-4">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div>
+          <h2 className="text-base font-semibold text-textMain">Knowledge Graph</h2>
+          <p className="text-[11px] text-textDim mt-0.5">
+            {graph ? `${graph.nodes.length} nodes · ${graph.edges.length} edges` : 'Persistent market intelligence network — updated each pipeline run'}
+          </p>
+        </div>
+        <button onClick={loadGraph} disabled={loading}
+          className="text-xs px-3 py-1.5 rounded-lg border border-borderMid bg-surface2 text-textMuted hover:text-textMain hover:border-brand-500/40 transition-colors disabled:opacity-50">
+          {loading ? '…' : '↺ Refresh'}
+        </button>
+      </div>
+
+      {/* Search + ticker subgraph */}
+      <div className="flex gap-2">
+        <input
+          value={tickerSearch}
+          onChange={e => setTickerSearch(e.target.value.toUpperCase())}
+          onKeyDown={e => e.key === 'Enter' && tickerSearch && loadSubgraph(tickerSearch)}
+          placeholder="Focus on ticker (e.g. NVDA)"
+          className="flex-1 text-xs px-3 py-1.5 rounded-lg border border-borderMid bg-surface2 text-textMain placeholder:text-textDim focus:outline-none focus:border-brand-500/60"
+        />
+        <button onClick={() => tickerSearch ? loadSubgraph(tickerSearch) : loadGraph()}
+          className="text-xs px-3 py-1.5 rounded-lg border border-brand-500/40 bg-brand-500/10 text-brand-300 hover:bg-brand-500/20 transition-colors">
+          {tickerSearch ? `Subgraph: ${tickerSearch}` : 'Full graph'}
+        </button>
+      </div>
+
+      {/* Filter bar */}
+      <div className="flex gap-2 flex-wrap">
+        {(['ALL', 'ASSET', 'ENTITY', 'EVENT', 'INDICATOR'] as const).map(t => (
+          <button key={t} onClick={() => setFilter(t)}
+            className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
+              filter === t
+                ? 'border-brand-500 bg-brand-500/20 text-brand-300'
+                : 'border-borderLight bg-surface2 text-textMuted hover:border-brand-400'
+            }`}>
+            {t === 'ALL' ? 'All types' : t}
+            {t !== 'ALL' && graph && (
+              <span className="ml-1 opacity-60">({graph.nodes.filter(n => n.type === t).length})</span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Legend */}
+      <div className="flex gap-4 flex-wrap">
+        {Object.entries(KG_COLORS).map(([type, color]) => (
+          <div key={type} className="flex items-center gap-1.5">
+            <span className="w-2.5 h-2.5 rounded-full flex-shrink-0" style={{ background: color }} />
+            <span className="text-[10px] text-textDim">{type}</span>
+          </div>
+        ))}
+      </div>
+
+      {/* SVG Graph */}
+      <div className="rounded-xl border border-borderLight overflow-hidden bg-surface2">
+        {loading ? (
+          <div className="h-64 flex items-center justify-center text-textDim text-sm">Loading graph…</div>
+        ) : !graph || graph.nodes.length === 0 ? (
+          <div className="h-64 flex flex-col items-center justify-center text-center gap-2 px-6">
+            <span className="text-3xl opacity-30">◎</span>
+            <p className="text-sm text-textDim">No graph data yet</p>
+            <p className="text-[11px] text-textDim">Run a pipeline to populate the knowledge graph. Nodes and relationships are extracted from market news automatically.</p>
+          </div>
+        ) : (
+          <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ maxHeight: 480 }}>
+            <defs>
+              <marker id="arrowhead" markerWidth="6" markerHeight="4" refX="5" refY="2" orient="auto">
+                <polygon points="0 0, 6 2, 0 4" fill="#475569" />
+              </marker>
+            </defs>
+            {/* Edges */}
+            {displayEdges.map((e, i) => {
+              const sp = positions[e.source], tp = positions[e.target];
+              if (!sp || !tp) return null;
+              const mx = (sp.x + tp.x) / 2, my = (sp.y + tp.y) / 2;
+              return (
+                <g key={i}>
+                  <line x1={sp.x} y1={sp.y} x2={tp.x} y2={tp.y}
+                    stroke="#334155" strokeWidth={e.confidence * 2 + 0.5}
+                    opacity={0.55} markerEnd="url(#arrowhead)" />
+                  <text x={mx} y={my} fontSize="7" fill="#475569" textAnchor="middle" dominantBaseline="middle">
+                    {relLabel(e.relation)}
+                  </text>
+                </g>
+              );
+            })}
+            {/* Nodes */}
+            {displayNodes.map(n => {
+              const p = positions[n.id];
+              if (!p) return null;
+              const r = n.type === 'ASSET' ? 14 : n.type === 'INDICATOR' ? 12 : 10;
+              const isSelected = selectedNode?.id === n.id;
+              const color = KG_COLORS[n.type] ?? '#6b7280';
+              return (
+                <g key={n.id} onClick={() => setSelectedNode(isSelected ? null : n)}
+                  className="cursor-pointer" style={{ userSelect: 'none' }}>
+                  <circle cx={p.x} cy={p.y} r={r + (isSelected ? 3 : 0)}
+                    fill={color} fillOpacity={0.85}
+                    stroke={isSelected ? '#fff' : color} strokeWidth={isSelected ? 2 : 0.5} strokeOpacity={0.4} />
+                  <text x={p.x} y={p.y + r + 11} fontSize="8" fill="#94a3b8"
+                    textAnchor="middle" dominantBaseline="middle">
+                    {n.label.length > 14 ? n.label.slice(0, 13) + '…' : n.label}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+        )}
+      </div>
+
+      {/* Selected node detail */}
+      {selectedNode && graph && (
+        <div className="bg-surface2 border border-borderLight rounded-xl p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <span className="text-sm font-semibold text-textMain">{selectedNode.label}</span>
+              <span className="text-[10px] text-textDim ml-2 font-mono">{selectedNode.id}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                style={{ background: KG_COLORS[selectedNode.type] + '22', color: KG_COLORS[selectedNode.type] }}>
+                {selectedNode.type}
+              </span>
+              <button onClick={() => setSelectedNode(null)}
+                className="text-textDim hover:text-textMain text-sm leading-none">×</button>
+            </div>
+          </div>
+
+          {/* Edges from/to this node */}
+          {(() => {
+            const nodeEdges = graph.edges.filter(
+              e => e.source === selectedNode.id || e.target === selectedNode.id
+            );
+            if (!nodeEdges.length) return <p className="text-[11px] text-textDim">No relationships found.</p>;
+            const nodesById = Object.fromEntries(graph.nodes.map(n => [n.id, n]));
+            return (
+              <div className="space-y-1">
+                <p className="text-[10px] text-textDim uppercase tracking-wider font-semibold">Relationships ({nodeEdges.length})</p>
+                {nodeEdges.slice(0, 10).map((e, i) => {
+                  const isOutbound = e.source === selectedNode.id;
+                  const otherId = isOutbound ? e.target : e.source;
+                  const other = nodesById[otherId];
+                  return (
+                    <div key={i} className="flex items-center gap-2 text-[11px] text-textMuted">
+                      <span className="font-mono text-textDim w-4 text-center">{isOutbound ? '→' : '←'}</span>
+                      <button onClick={() => other && setSelectedNode(other)}
+                        className="text-brand-400 hover:underline truncate max-w-[140px]">
+                        {other?.label ?? otherId}
+                      </button>
+                      <span className="text-textDim text-[10px]">{relLabel(e.relation)}</span>
+                      <span className="ml-auto text-textDim text-[10px]">{(e.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
+
+          {/* Subgraph shortcut for assets */}
+          {selectedNode.type === 'ASSET' && selectedNode.symbol && (
+            <button onClick={() => loadSubgraph(selectedNode.symbol!)}
+              className="text-[11px] text-brand-400 hover:text-brand-300 hover:underline">
+              Focus 2-hop subgraph on {selectedNode.symbol} →
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -3500,6 +3777,7 @@ function AppInner() {
   const pageContent = {
     dashboard: renderDashboard,
     markets:   renderMarkets,
+    graph:     () => <KnowledgeGraphViewer />,
     portfolio: renderPortfolio,
     memory:    renderMemory,
     pipeline:  renderPipeline,

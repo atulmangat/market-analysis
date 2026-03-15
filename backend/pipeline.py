@@ -23,6 +23,7 @@ from orchestrator import (
 )
 from data_ingestion import fetch_market_data
 from memory_manager import write_agent_memory, prune_old_memory
+from knowledge_graph import upsert_asset_nodes, ingest_news_to_graph
 
 
 def _get_base_url() -> str:
@@ -84,6 +85,18 @@ def pipeline_research(run_id: str):
         shared_context, research_log = build_shared_retrieval_context(
             db, run_id, enabled_markets, investment_focus=investment_focus
         )
+
+        # ── Knowledge Graph: upsert asset nodes + ingest news ─────────────────
+        all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
+        try:
+            upsert_asset_nodes(db, all_tickers)
+            _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
+                 f"Ingesting {len(research_log)} research items into knowledge graph…")
+            edges_added = ingest_news_to_graph(db, research_log, run_id)
+            _log(db, run_id, "KG_INGEST", "DONE",
+                 f"Knowledge graph updated — {edges_added} new edges added")
+        except Exception as kg_err:
+            _log(db, run_id, "KG_INGEST", "ERROR", f"KG ingest failed (non-fatal): {str(kg_err)[:200]}")
 
         # Save context to DB for the next lambda to pick up
         run.shared_context = json.dumps({

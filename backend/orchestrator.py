@@ -608,10 +608,38 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
                 f"Prioritise assets and sectors that align with this focus when making your proposal.\n\n"
             )
 
+        # Fetch KG subgraph context for this agent's proposed ticker (if available)
+        kg_context = ""
+        try:
+            from knowledge_graph import build_kg_context_for_ticker
+            # We don't know the ticker yet (agent hasn't responded) — inject graph for all
+            # market tickers is too large; instead inject after first agent response.
+            # For now: inject a general market KG query using the most active asset nodes.
+            from database import SessionLocal as _SL
+            _kgdb = _SL()
+            try:
+                import models as _m
+                asset_nodes = _kgdb.query(_m.KGNode).filter(
+                    _m.KGNode.node_type == "ASSET"
+                ).order_by(_m.KGNode.last_seen_at.desc()).limit(5).all()
+                kg_parts = []
+                for node in asset_nodes:
+                    sym = node.symbol or node.node_id.replace("asset:", "")
+                    ctx = build_kg_context_for_ticker(_kgdb, sym)
+                    if ctx:
+                        kg_parts.append(ctx)
+                if kg_parts:
+                    kg_context = "## Knowledge Graph Context\n" + "\n".join(kg_parts[:3])
+            finally:
+                _kgdb.close()
+        except Exception:
+            pass
+
         agent_context = (
             f"{focus_block}"
             f"{portfolio_context}\n\n"
             f"{shared_context}\n\n"
+            f"{kg_context}\n\n"
             f"ALLOWED MARKETS:\n{market_constraint}\n\n"
             f"---\n\n"
             f"{memory_context}\n\n"

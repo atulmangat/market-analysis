@@ -153,3 +153,31 @@ class PipelineEvent(Base):
     detail     = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
+class KGNode(Base):
+    """A node in the persistent knowledge graph."""
+    __tablename__ = "kg_nodes"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    node_id       = Column(String, unique=True, index=True)  # e.g. "asset:NVDA"
+    node_type     = Column(String, index=True)               # ASSET | EVENT | ENTITY | INDICATOR
+    label         = Column(String)
+    symbol        = Column(String, nullable=True, index=True)
+    metadata_json = Column(Text, nullable=True)
+    last_seen_at  = Column(DateTime, default=datetime.utcnow)
+    created_at    = Column(DateTime, default=datetime.utcnow)
+
+
+class KGEdge(Base):
+    """A directed, typed relationship between two KG nodes."""
+    __tablename__ = "kg_edges"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    source_node_id = Column(String, index=True)
+    target_node_id = Column(String, index=True)
+    relation       = Column(String, index=True)  # affects | correlated_with | caused_by | related_to | sector_peer
+    confidence     = Column(Float, default=0.5)
+    source_run_id  = Column(String, nullable=True, index=True)
+    expires_at     = Column(DateTime, nullable=True)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+
