@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl:*)",
+      "Bash(cd:*)",
+      "Bash(npx tsc:*)",
+      "Bash(grep:*)",
+      "Bash(source:*)",
+      "Bash(sleep:*)",
+      "Bash(cat:*)",
+      "Bash(python3:*)",
+      "Bash(npm run:*)",
+      "Bash(kill:*)",
+      "Bash(ls:*)"
+    ]
+  }
+}

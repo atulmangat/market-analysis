@@ -1,0 +1,14 @@
+fastapi==0.115.7
+uvicorn[standard]==0.34.2
+sqlalchemy==2.0.38
+pydantic==2.10.6
+pydantic-settings==2.10.1
+APScheduler==3.10.4
+python-jose[cryptography]==3.4.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.3.0
+httpx==0.28.1
+yfinance==1.2.0
+openai==1.93.0
+feedparser
+python-dotenv
