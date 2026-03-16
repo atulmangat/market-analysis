@@ -447,29 +447,18 @@ def _fetch_per_ticker_news(symbol: str, max_items: int = 5) -> str:
         return ""
 
 
-def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
-                                    investment_focus: str = "") -> tuple[str, list]:
+def fetch_research_items(db, run_id: str, enabled_markets: dict,
+                          investment_focus: str = "") -> list:
     """
-    Exhaustive research layer — fetches ALL of the following ONCE and shares with all agents:
-      1. Macro indicators (VIX, DXY, yields, commodities, indices)
-      2. Broad market news (Google News RSS, multiple topics)
-      3. Per-ticker news from yfinance for EVERY enabled ticker
-      4. Live price snapshot for every enabled ticker
-      5. Full fundamental data for every enabled ticker
-    Returns (context_string, research_log).
+    Fetch raw research articles for the given markets/focus.
+    Returns research_items list. Called before KG ingest so the graph is built first.
     """
     markets_str = ", ".join(enabled_markets.keys()) if enabled_markets else "none"
     focus_str = f" | focus: {investment_focus[:60]}" if investment_focus else ""
     all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
     _log(db, run_id, "WEB_RESEARCH", "IN_PROGRESS",
-         f"Exhaustive research for {len(all_tickers)} tickers across {markets_str}{focus_str}")
+         f"Fetching research for {len(all_tickers)} tickers across {markets_str}{focus_str}")
 
-    now = datetime.utcnow()
-
-    # ── 1. Macro indicators ───────────────────────────────────────────────────
-    macro_context = _fetch_macro_indicators()
-
-    # ── 2. Broad market news topics ──────────────────────────────────────────
     dynamic_topics = [
         "global stock market outlook today",
         "top market movers gainers losers",
@@ -479,7 +468,6 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
     ]
     for market, tickers in enabled_markets.items():
         dynamic_topics.append(f"{market} market news today")
-        # Add a news search for a specific ticker sample from each market
         for sym in tickers[:2]:
             clean = sym.replace(".NS", "").replace("-USD", "").replace("=F", "")
             dynamic_topics.append(f"{clean} stock news analysis")
@@ -494,7 +482,28 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
             if keyword in focus_lower:
                 dynamic_topics.append(f"{keyword} sector news catalyst today")
 
-    research_items = fetch_web_research(topics=dynamic_topics, enabled_tickers=enabled_markets)
+    return fetch_web_research(topics=dynamic_topics, enabled_tickers=enabled_markets)
+
+
+def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
+                                    investment_focus: str = "",
+                                    research_items: list = None) -> tuple[str, list, list]:
+    """
+    Build the full shared context string for agents from pre-fetched research items.
+    If research_items is None, fetches them internally (backward-compat).
+    Returns (context_string, research_log, research_items).
+    """
+    all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
+
+    now = datetime.utcnow()
+
+    # ── 1. Macro indicators ───────────────────────────────────────────────────
+    macro_context = _fetch_macro_indicators()
+
+    # ── 2. Web research articles ──────────────────────────────────────────────
+    if research_items is None:
+        research_items = fetch_research_items(db, run_id, enabled_markets, investment_focus)
+
     research_context = _annotate_research_with_dates(research_items, now)
 
     research_log = [
@@ -890,7 +899,8 @@ JUDGE_REASONING: <3-5 sentences: why this is the best proposal, the specific edg
 Be decisive. One winner per committee session."""
 
 
-def run_judge(db, run_id: str, proposals_log: list, shared_context: str, budget_context: str = "") -> tuple[str, str, str]:
+def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
+              budget_context: str = "", market_constraint: str = "") -> tuple[str, str, str]:
     """
     The Judge reviews all 4 proposals + shared market context and picks the best one.
     Returns (winner_ticker, winner_action, judge_reasoning).
@@ -907,10 +917,18 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str, budget_
         for p in proposals_log
     )
 
+    market_block = (
+        f"## Enabled Markets (HARD CONSTRAINT)\n"
+        f"{market_constraint}\n"
+        f"**You MUST only select a WINNER_TICKER from the enabled markets above. "
+        f"Any proposal from a disabled market must be rejected regardless of quality.**\n\n"
+    ) if market_constraint else ""
+
     judge_input = (
         f"## Current Market Intelligence Report (shared by all agents)\n"
         f"{shared_context[:6000]}\n\n"
         f"{budget_context}\n\n"
+        f"{market_block}"
         f"## Agent Proposals (Full Analysis)\n"
         f"{proposals_text}\n\n"
         f"Now score each proposal and deliver your verdict."
@@ -939,18 +957,42 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str, budget_
         print(f"[Judge] Picked {winner_ticker} which wasn't proposed — falling back to plurality vote.")
         winner_ticker = None
 
+    # Validate the winner is from an enabled market
+    if winner_ticker and market_constraint:
+        all_enabled_tickers = set()
+        for tickers in MARKET_TICKERS.values():
+            # check if this market appears in the constraint
+            for t in tickers:
+                if t in market_constraint:
+                    all_enabled_tickers.add(t)
+        if all_enabled_tickers and winner_ticker not in all_enabled_tickers:
+            print(f"[Judge] Picked {winner_ticker} from a disabled market — falling back to plurality vote.")
+            _log(db, run_id, "JUDGE", "IN_PROGRESS",
+                 f"Judge picked {winner_ticker} from disabled market — using plurality fallback")
+            winner_ticker = None
+
     if winner_ticker and winner_action:
         print(f"[Judge] Verdict: {winner_action} {winner_ticker}")
         _log(db, run_id, "JUDGE", "DONE",
              f"Judge verdict: {winner_action} {winner_ticker} — {judge_reasoning[:120]}…")
         return winner_ticker, winner_action, judge_reasoning
 
-    # Fallback: plurality vote
-    print("[Judge] LLM parse failed — using plurality vote as fallback.")
+    # Fallback: plurality vote (only from enabled tickers)
+    print("[Judge] LLM parse failed or disabled market — using plurality vote as fallback.")
     vote_counts: dict[str, int] = {}
     for p in proposals_log:
+        # Skip proposals from disabled markets if constraint is set
+        if market_constraint:
+            all_enabled = [t for tickers in MARKET_TICKERS.values() for t in tickers if t in market_constraint]
+            if all_enabled and p["ticker"] not in all_enabled:
+                continue
         key = f"{p['ticker']}_{p['action']}"
         vote_counts[key] = vote_counts.get(key, 0) + 1
+    if not vote_counts:
+        # All proposals were from disabled markets — use unfiltered
+        for p in proposals_log:
+            key = f"{p['ticker']}_{p['action']}"
+            vote_counts[key] = vote_counts.get(key, 0) + 1
     best_key = max(vote_counts, key=vote_counts.get)
     ft, fa = best_key.split("_")
     fallback_reason = f"Plurality vote fallback ({vote_counts[best_key]}/{len(proposals_log)} votes). Judge output could not be parsed."
@@ -1017,9 +1059,28 @@ def run_debate(focus_tickers: list[str] | None = None):
         if investment_focus:
             _log(db, run_id, "START", "DONE", f"Investment focus: {investment_focus[:100]}")
 
-        # ── 1. Shared Retrieval ───────────────────────────────────────────────
+        # ── 1a. Fetch raw research articles ──────────────────────────────────
+        all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
+        research_items = fetch_research_items(db, run_id, enabled_markets, investment_focus)
+
+        # ── 1b. Build Knowledge Graph from those articles ─────────────────────
+        try:
+            from knowledge_graph import upsert_asset_nodes, ingest_retrieval_to_graph
+            upsert_asset_nodes(db, all_tickers)
+            _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
+                 f"Extracting graph facts from {len(research_items)} research items…")
+            edges_added = ingest_retrieval_to_graph(db, research_items, run_id)
+            _log(db, run_id, "KG_INGEST", "DONE",
+                 f"Knowledge graph updated — {edges_added} new edges (semantic dedup applied)")
+        except Exception as kg_err:
+            import traceback as _tb
+            _log(db, run_id, "KG_INGEST", "ERROR",
+                 f"KG ingest failed: {str(kg_err)[:300]} | {_tb.format_exc()[-300:]}")
+
+        # ── 1c. Build shared context using fresh graph ────────────────────────
         shared_context, research_log, _ = build_shared_retrieval_context(
-            db, run_id, enabled_markets, investment_focus=investment_focus)
+            db, run_id, enabled_markets, investment_focus=investment_focus,
+            research_items=research_items)
 
         # ── 2. 4-Agent Debate Panel ───────────────────────────────────────────
         _log(db, run_id, "DEBATE_PANEL", "IN_PROGRESS",
@@ -1052,7 +1113,8 @@ def run_debate(focus_tickers: list[str] | None = None):
             f"If budget is low, prefer closing an underperforming position over opening a new one."
         )
         best_ticker, best_action, judge_reasoning = run_judge(
-            db, run_id, proposals_log, shared_context, budget_context
+            db, run_id, proposals_log, shared_context, budget_context,
+            market_constraint=market_constraint
         )
 
         # ── 4. Deploy ─────────────────────────────────────────────────────────

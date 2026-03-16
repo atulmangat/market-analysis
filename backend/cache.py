@@ -1,25 +1,31 @@
 """
 Two-level cache:
   L1 — in-process dict (zero latency, lost on process restart / cold start)
-  L2 — DB-backed CacheEntry table (shared across all workers, survives restarts)
+  L2 — per-key files in /tmp (one file per cache key, no DB round-trip)
 
-Reads: L1 hit → return immediately. L1 miss → L2 lookup → populate L1 → return.
-Writes: write L2 first, then populate L1.
-Invalidation: delete from L2 (L1 entries will expire naturally or be skipped on next L2 miss).
+Reads:  L1 hit → return immediately.
+        L1 miss → read single file from /tmp → populate L1 → return.
+Writes: write file to /tmp, populate L1.
+Invalidation: delete file, evict L1 entry.
 
-TTL constants are defined in api.py and passed to cache_set().
+File format: first line = ISO expiry timestamp (or "0" = no expiry), rest = JSON payload.
 """
 
 import json
+import os
 import time
 import threading
 from datetime import datetime, timedelta
 from typing import Any
 
-# ── L1: in-process ────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────────
+_CACHE_DIR = os.getenv("CACHE_DIR", "/tmp/mkt_cache")
+os.makedirs(_CACHE_DIR, exist_ok=True)
+
+# ── L1: in-process dict ────────────────────────────────────────────────────────
 _l1: dict[str, tuple[Any, float]] = {}   # key → (value, l1_expires_monotonic)
 _l1_lock = threading.Lock()
-_L1_TTL = 30  # seconds — L1 is a short-lived hot layer; L2 is authoritative
+_L1_TTL = 60  # seconds — warm layer; L2 file is authoritative
 
 
 def _l1_get(key: str) -> Any | None:
@@ -51,96 +57,86 @@ def _l1_delete_prefix(prefix: str) -> None:
             del _l1[k]
 
 
-# ── L2: DB ────────────────────────────────────────────────────────────────────
+# ── L2: per-key files in /tmp ──────────────────────────────────────────────────
 
-def _db_get(key: str) -> Any | None:
-    """Read from DB cache, returns None on miss or expiry."""
+def _key_to_path(key: str) -> str:
+    """Map a cache key to a safe filename."""
+    safe = key.replace("/", "__").replace(":", "_").replace(" ", "_")
+    return os.path.join(_CACHE_DIR, f"{safe}.cache")
+
+
+def _file_get(key: str) -> Any | None:
+    path = _key_to_path(key)
     try:
-        from database import SessionLocal
-        import models
-        db = SessionLocal()
-        try:
-            row = db.query(models.CacheEntry).filter(models.CacheEntry.key == key).first()
-            if row is None:
+        with open(path, "r") as f:
+            expiry_line = f.readline().strip()
+            payload = f.read()
+        # Check expiry
+        if expiry_line != "0":
+            expires_at = datetime.fromisoformat(expiry_line)
+            if datetime.utcnow() > expires_at:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
                 return None
-            if row.expires_at and datetime.utcnow() > row.expires_at:
-                db.delete(row)
-                db.commit()
-                return None
-            return json.loads(row.value_json)
-        finally:
-            db.close()
+        return json.loads(payload)
+    except FileNotFoundError:
+        return None
     except Exception as e:
-        print(f"[cache] DB get error for '{key}': {e}")
+        print(f"[cache] file get error for '{key}': {e}")
         return None
 
 
-def _db_set(key: str, value: Any, ttl: int) -> None:
-    """Upsert into DB cache with TTL."""
+def _file_set(key: str, value: Any, ttl: int) -> None:
+    path = _key_to_path(key)
     try:
-        from database import SessionLocal
-        import models
-        db = SessionLocal()
-        try:
-            expires_at = (datetime.utcnow() + timedelta(seconds=ttl)) if ttl else None
-            row = db.query(models.CacheEntry).filter(models.CacheEntry.key == key).first()
-            value_json = json.dumps(value)
-            if row:
-                row.value_json = value_json
-                row.expires_at = expires_at
-                row.updated_at = datetime.utcnow()
-            else:
-                db.add(models.CacheEntry(
-                    key=key,
-                    value_json=value_json,
-                    expires_at=expires_at,
-                ))
-            db.commit()
-        finally:
-            db.close()
+        expiry_line = (
+            (datetime.utcnow() + timedelta(seconds=ttl)).isoformat()
+            if ttl else "0"
+        )
+        payload = json.dumps(value)
+        # Write atomically via a temp file
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w") as f:
+            f.write(expiry_line + "\n")
+            f.write(payload)
+        os.replace(tmp_path, path)
     except Exception as e:
-        print(f"[cache] DB set error for '{key}': {e}")
+        print(f"[cache] file set error for '{key}': {e}")
 
 
-def _db_delete(key: str) -> None:
+def _file_delete(key: str) -> None:
     try:
-        from database import SessionLocal
-        import models
-        db = SessionLocal()
-        try:
-            db.query(models.CacheEntry).filter(models.CacheEntry.key == key).delete()
-            db.commit()
-        finally:
-            db.close()
+        os.remove(_key_to_path(key))
+    except FileNotFoundError:
+        pass
     except Exception as e:
-        print(f"[cache] DB delete error for '{key}': {e}")
+        print(f"[cache] file delete error for '{key}': {e}")
 
 
-def _db_delete_prefix(prefix: str) -> None:
+def _file_delete_prefix(prefix: str) -> None:
+    safe_prefix = prefix.replace("/", "__").replace(":", "_").replace(" ", "_")
     try:
-        from database import SessionLocal
-        import models
-        db = SessionLocal()
-        try:
-            db.query(models.CacheEntry).filter(
-                models.CacheEntry.key.like(f"{prefix}%")
-            ).delete(synchronize_session=False)
-            db.commit()
-        finally:
-            db.close()
+        for fname in os.listdir(_CACHE_DIR):
+            if fname.startswith(safe_prefix) and fname.endswith(".cache"):
+                try:
+                    os.remove(os.path.join(_CACHE_DIR, fname))
+                except OSError:
+                    pass
     except Exception as e:
-        print(f"[cache] DB delete_prefix error for '{prefix}': {e}")
+        print(f"[cache] file delete_prefix error for '{prefix}': {e}")
 
 
-# ── Public API ─────────────────────────────────────────────────────────────────
+# ── Public API ──────────────────────────────────────────────────────────────────
 
 def cache_get(key: str) -> Any | None:
-    # L1 fast path
+    # L1 fast path — zero I/O
     val = _l1_get(key)
     if val is not None:
         return val
-    # L2 DB
-    val = _db_get(key)
+    # L2 file — single file read, no DB
+    val = _file_get(key)
     if val is not None:
         _l1_set(key, val)
     return val
@@ -148,32 +144,30 @@ def cache_get(key: str) -> Any | None:
 
 def cache_set(key: str, value: Any, ttl: int) -> None:
     """Store value. ttl in seconds; 0 = no expiry."""
-    _db_set(key, value, ttl)
+    _file_set(key, value, ttl)
     _l1_set(key, value)
 
 
 def cache_invalidate(key: str) -> None:
-    _db_delete(key)
+    _file_delete(key)
     _l1_delete(key)
 
 
 def cache_invalidate_prefix(prefix: str) -> None:
-    _db_delete_prefix(prefix)
+    _file_delete_prefix(prefix)
     _l1_delete_prefix(prefix)
 
 
 def cache_clear_all() -> None:
     try:
-        from database import SessionLocal
-        import models
-        db = SessionLocal()
-        try:
-            db.query(models.CacheEntry).delete()
-            db.commit()
-        finally:
-            db.close()
+        for fname in os.listdir(_CACHE_DIR):
+            if fname.endswith(".cache"):
+                try:
+                    os.remove(os.path.join(_CACHE_DIR, fname))
+                except OSError:
+                    pass
     except Exception as e:
-        print(f"[cache] DB clear error: {e}")
+        print(f"[cache] clear_all error: {e}")
     with _l1_lock:
         _l1.clear()
 
@@ -184,23 +178,28 @@ def cache_stats() -> dict:
         l1_total = len(_l1)
         l1_live = sum(1 for _, (_, exp) in _l1.items() if now_mono <= exp)
         l1_keys = list(_l1.keys())
+
+    l2_total = l2_expired = 0
+    l2_keys = []
+    now_utc = datetime.utcnow()
     try:
-        from database import SessionLocal
-        import models
-        db = SessionLocal()
-        try:
-            now_utc = datetime.utcnow()
-            l2_total = db.query(models.CacheEntry).count()
-            l2_expired = db.query(models.CacheEntry).filter(
-                models.CacheEntry.expires_at.isnot(None),
-                models.CacheEntry.expires_at < now_utc,
-            ).count()
-            l2_keys = [r.key for r in db.query(models.CacheEntry.key).all()]
-        finally:
-            db.close()
-    except Exception:
-        l2_total = l2_expired = -1
-        l2_keys = []
+        for fname in os.listdir(_CACHE_DIR):
+            if not fname.endswith(".cache"):
+                continue
+            path = os.path.join(_CACHE_DIR, fname)
+            l2_total += 1
+            try:
+                with open(path, "r") as f:
+                    expiry_line = f.readline().strip()
+                if expiry_line != "0":
+                    if datetime.fromisoformat(expiry_line) < now_utc:
+                        l2_expired += 1
+            except Exception:
+                pass
+            l2_keys.append(fname[:-6])  # strip .cache
+    except Exception as e:
+        print(f"[cache] stats error: {e}")
+
     return {
         "l1": {"total": l1_total, "live": l1_live, "keys": l1_keys},
         "l2": {"total": l2_total, "expired": l2_expired, "keys": l2_keys},

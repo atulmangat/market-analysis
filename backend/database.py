@@ -37,10 +37,23 @@ def run_migrations(engine):
     """Run idempotent schema migrations not handled by create_all."""
     from sqlalchemy import text
     is_pg = not str(engine.url).startswith("sqlite")
-    if_not_exists = "IF NOT EXISTS " if is_pg else ""
+    ine = "IF NOT EXISTS " if is_pg else ""
     migrations = [
-        f"ALTER TABLE deployed_strategies ADD COLUMN {if_not_exists}debate_round_id INTEGER",
-        f"ALTER TABLE debate_rounds ADD COLUMN {if_not_exists}report_json TEXT",
+        # deployed_strategies — added over time
+        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}debate_round_id INTEGER",
+        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}position_size FLOAT",
+        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}exit_price FLOAT",
+        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}realized_pnl FLOAT",
+        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}close_reason VARCHAR",
+        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}closed_at DATETIME",
+        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}notes TEXT",
+        # debate_rounds
+        f"ALTER TABLE debate_rounds ADD COLUMN {ine}report_json TEXT",
+        f"ALTER TABLE debate_rounds ADD COLUMN {ine}research_context TEXT",
+        f"ALTER TABLE debate_rounds ADD COLUMN {ine}judge_reasoning TEXT",
+        # pipeline_runs
+        f"ALTER TABLE pipeline_runs ADD COLUMN {ine}investment_focus VARCHAR",
+        f"ALTER TABLE pipeline_runs ADD COLUMN {ine}focus_tickers TEXT",
     ]
     with engine.connect() as conn:
         for sql in migrations:

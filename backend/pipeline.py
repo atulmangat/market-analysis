@@ -19,6 +19,7 @@ from orchestrator import (
     _log,
     get_enabled_markets,
     build_market_constraint,
+    fetch_research_items,
     build_shared_retrieval_context,
     run_debate_panel,
     run_judge,
@@ -85,23 +86,40 @@ def pipeline_research(run_id: str):
         db.commit()
 
         investment_focus = run.investment_focus or ""
-        shared_context, research_log, research_items = build_shared_retrieval_context(
+        all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
+
+        # ── Step 1: Fetch raw research articles ───────────────────────────────
+        research_items = fetch_research_items(
             db, run_id, enabled_markets, investment_focus=investment_focus
         )
 
-        # ── Knowledge Graph: upsert asset nodes + ingest compressed facts ─────
-        all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
+        # ── Step 2: Build Knowledge Graph from those articles ─────────────────
+        # Hard timeout: KG ingest involves multiple LLM calls; cap at 45s so it
+        # never stalls the pipeline on Vercel's serverless timeout boundary.
         try:
             import traceback as _tb
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
             upsert_asset_nodes(db, all_tickers)
             _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
                  f"Extracting graph facts from {len(research_items)} research items…")
-            edges_added = ingest_retrieval_to_graph(db, research_items, run_id)
-            _log(db, run_id, "KG_INGEST", "DONE",
-                 f"Knowledge graph updated — {edges_added} new edges (semantic dedup applied)")
+            with ThreadPoolExecutor(max_workers=1) as _kg_pool:
+                _kg_future = _kg_pool.submit(ingest_retrieval_to_graph, db, research_items, run_id)
+                try:
+                    edges_added = _kg_future.result(timeout=45)
+                    _log(db, run_id, "KG_INGEST", "DONE",
+                         f"Knowledge graph updated — {edges_added} new edges (semantic dedup applied)")
+                except _FutureTimeout:
+                    _log(db, run_id, "KG_INGEST", "WARN",
+                         "KG ingest timed out after 45s — pipeline continuing without full graph update")
         except Exception as kg_err:
             _log(db, run_id, "KG_INGEST", "ERROR",
                  f"KG ingest failed: {str(kg_err)[:300]} | {_tb.format_exc()[-300:]}")
+
+        # ── Step 3: Build shared context (now uses fresh graph data) ──────────
+        shared_context, research_log, _ = build_shared_retrieval_context(
+            db, run_id, enabled_markets, investment_focus=investment_focus,
+            research_items=research_items,
+        )
 
         # Save context to DB for the next lambda to pick up
         run.shared_context = json.dumps({
@@ -199,8 +217,9 @@ def pipeline_consensus(run_id: str):
             f"Only recommend a new trade if sufficient capital is available."
         )
 
+        market_constraint = build_market_constraint(json.loads(run.enabled_markets_json))
         best_ticker, best_action, judge_reasoning = run_judge(
-            db, run_id, proposals_log, shared_context, budget_context
+            db, run_id, proposals_log, shared_context, budget_context, market_constraint
         )
 
         # Persist verdict back into proposals_json field as an extra key

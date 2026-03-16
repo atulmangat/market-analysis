@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -177,7 +178,7 @@ def _deduplicate_edges(db: Session, new_edges: list[dict],
     """
     For each new edge, check if a semantically similar edge already exists.
     Similar = cosine(embedding) > 0.88 AND same (source, target) pair.
-    When similar: LLM decides MERGE or KEEP_BOTH.
+    When similar: LLM decides MERGE or KEEP_BOTH — all merge calls run in parallel.
     Returns filtered list of new_edges that should be inserted.
     """
     if not new_edges or not existing_edges:
@@ -224,20 +225,21 @@ def _deduplicate_edges(db: Session, new_edges: list[dict],
     ex_embs  = {id(candidate_ex_edges[i]): embeddings[len(new_texts) + i]
                 for i in range(len(ex_texts))}
 
-    # Decide which new edges to suppress
-    suppress: set[int] = set()
+    # Identify high-similarity pairs that need LLM merge decision
+    merge_candidates: list[tuple[int, models.KGEdge, float]] = []
     for i, ex in candidate_pairs:
-        if i in suppress:
-            continue
         emb_new = new_embs.get(i)
         emb_ex  = ex_embs.get(id(ex))
         if emb_new is None or emb_ex is None:
             continue
         sim = _cosine_sim(emb_new, emb_ex)
-        if sim < 0.88:
-            continue
+        if sim >= 0.88:
+            merge_candidates.append((i, ex, sim))
 
-        # High similarity — ask LLM whether to merge
+    suppress: set[int] = set()
+
+    def _try_merge(i: int, ex: models.KGEdge, sim: float) -> tuple[int, float | None]:
+        """Returns (new_edge_idx, merged_confidence) or (new_edge_idx, None) for keep_both."""
         ne = new_edges[i]
         try:
             merge_input = (
@@ -248,16 +250,33 @@ def _deduplicate_edges(db: Session, new_edges: list[dict],
                 f"Similarity score: {sim:.3f}"
             )
             raw = query_agent(KG_MERGE_SYSTEM_PROMPT, merge_input)
-            # Parse first JSON object in response
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if match:
                 decision = json.loads(match.group())
                 if decision.get("action") == "merge":
-                    # Update existing edge in place
-                    ex.confidence = float(decision.get("confidence", max(ex.confidence, ne["confidence"])))
-                    suppress.add(i)
+                    merged_conf = float(decision.get("confidence",
+                                                     max(ex.confidence, ne["confidence"])))
+                    return i, merged_conf
         except Exception:
-            pass  # On parse failure: keep both (safe default)
+            pass
+        return i, None
+
+    # Run all merge LLM calls in parallel
+    if merge_candidates:
+        with ThreadPoolExecutor(max_workers=min(len(merge_candidates), 6)) as pool:
+            futures = {pool.submit(_try_merge, i, ex, sim): (i, ex)
+                       for i, ex, sim in merge_candidates}
+            for future in as_completed(futures):
+                new_idx, ex_edge = futures[future]
+                if new_idx in suppress:
+                    continue
+                try:
+                    idx, merged_conf = future.result()
+                    if merged_conf is not None:
+                        ex_edge.confidence = merged_conf
+                        suppress.add(idx)
+                except Exception:
+                    pass
 
     db.commit()
     return [ne for j, ne in enumerate(new_edges) if j not in suppress]
@@ -307,9 +326,10 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
     }
 
     total_edges_added = 0
-    batches = [items[i:i + 20] for i in range(0, len(items), 20)]
+    batches = [items[i:i + 20] for i in range(0, len(items), 20)][:3]  # cap at 3 batches
 
-    for batch in batches[:3]:  # cap at 3 LLM calls
+    def _extract_batch(batch: list[dict]) -> list[dict]:
+        """Call LLM to extract KG facts from one batch. Returns raw edge dicts (no DB writes)."""
         prompt_body = "\n\n".join(
             f"[{i + 1}] TITLE: {r['title']}\n"
             f"      SNIPPET: {r.get('snippet', '')[:200]}\n"
@@ -317,154 +337,157 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
             f"      PUBLISHED: {r.get('published', 'N/A')}"
             for i, r in enumerate(batch)
         )
-
         try:
             raw = query_agent(KG_EXTRACT_SYSTEM_PROMPT, prompt_body)
         except Exception as e:
             print(f"[KG] LLM extraction failed: {e}")
-            continue
+            return []
 
-        batch_new_edges: list[dict] = []
-
+        extracted: list[dict] = []  # list of {nodes_to_upsert, edges}
         for line in raw.strip().splitlines():
             line = line.strip()
             if not line or not line.startswith("{"):
                 continue
             try:
                 fact = json.loads(line)
-                event_id    = fact.get("event_id", "")
-                event_label = fact.get("event_label", "")
+                event_id      = fact.get("event_id", "")
+                event_label   = fact.get("event_label", "")
                 event_summary = fact.get("event_summary", "")
-                direction   = fact.get("direction", "neutral")
-                magnitude   = fact.get("magnitude", "medium")
-                expires_days = int(fact.get("expires_days", 7))
-                affected    = fact.get("affected_assets", [])
-                entities    = fact.get("related_entities", [])
-                relations   = fact.get("relations", [])
+                direction     = fact.get("direction", "neutral")
+                magnitude     = fact.get("magnitude", "medium")
+                expires_days  = int(fact.get("expires_days", 7))
+                affected      = fact.get("affected_assets", [])
+                entities      = fact.get("related_entities", [])
+                relations     = fact.get("relations", [])
 
                 if not event_id or not event_label:
                     continue
 
-                # Normalise event node id
-                event_node_id = f"event:{event_id[:60]}"
-                expires_at = now + timedelta(days=expires_days)
-
-                # Upsert EVENT node with rich metadata
-                event_meta = {
-                    "summary":   event_summary[:500],
+                extracted.append({
+                    "event_id": event_id,
+                    "event_label": event_label,
+                    "event_summary": event_summary,
                     "direction": direction,
                     "magnitude": magnitude,
                     "expires_days": expires_days,
-                    "run_id":    run_id,
-                    "extracted_at": now.isoformat(),
-                }
-                _upsert_node(db, event_node_id, "EVENT", event_label[:80],
-                             metadata=event_meta)
-                nodes_by_id[event_node_id] = {"label": event_label, "type": "EVENT"}
-
-                # Upsert affected asset nodes (ensure they exist)
-                for asset_ref in affected:
-                    if asset_ref.startswith("asset:"):
-                        a_node_id = asset_ref
-                        a_sym = asset_ref.replace("asset:", "")
-                    else:
-                        a_node_id = f"asset:{asset_ref}"
-                        a_sym = asset_ref
-                    a_label = TICKER_LABELS.get(a_sym, a_sym)
-                    _upsert_node(db, a_node_id, "ASSET", a_label, symbol=a_sym)
-                    nodes_by_id[a_node_id] = {"label": a_label, "type": "ASSET"}
-
-                    # Auto-link event → asset
-                    direction_rel = "affects"
-                    batch_new_edges.append({
-                        "source": event_node_id,
-                        "target": a_node_id,
-                        "relation": direction_rel,
-                        "confidence": 0.75,
-                        "expires_at": expires_at,
-                    })
-
-                # Upsert related entity nodes
-                for ent_ref in entities:
-                    if ent_ref.startswith("entity:") or ent_ref.startswith("indicator:"):
-                        ent_node_id = ent_ref
-                        ent_label = ent_ref.split(":", 1)[1].replace("-", " ").replace("_", " ")
-                        ent_type = "ENTITY" if ent_ref.startswith("entity:") else "INDICATOR"
-                    else:
-                        ent_node_id = f"entity:{ent_ref}"
-                        ent_label = ent_ref
-                        ent_type = "ENTITY"
-                    _upsert_node(db, ent_node_id, ent_type, ent_label)
-                    nodes_by_id[ent_node_id] = {"label": ent_label, "type": ent_type}
-
-                    # Link entity → event
-                    batch_new_edges.append({
-                        "source": ent_node_id,
-                        "target": event_node_id,
-                        "relation": "caused_by",
-                        "confidence": 0.65,
-                        "expires_at": expires_at,
-                    })
-
-                # Explicit typed relations from LLM
-                for rel in relations:
-                    src_id  = rel.get("source", "")
-                    tgt_id  = rel.get("target", "")
-                    rtype   = rel.get("relation", "related_to")
-                    conf    = float(rel.get("confidence", 0.5))
-                    if not src_id or not tgt_id or conf < 0.4:
-                        continue
-                    if rtype not in ("affects", "correlated_with", "caused_by",
-                                     "related_to", "sector_peer"):
-                        continue
-
-                    # Ensure nodes exist
-                    for nid in [src_id, tgt_id]:
-                        if nid not in nodes_by_id:
-                            ntype = ("ASSET" if nid.startswith("asset:") else
-                                     "INDICATOR" if nid.startswith("indicator:") else
-                                     "EVENT" if nid.startswith("event:") else "ENTITY")
-                            nlabel = nid.split(":", 1)[1].replace("-", " ") if ":" in nid else nid
-                            nsym = nid.replace("asset:", "") if nid.startswith("asset:") else None
-                            _upsert_node(db, nid, ntype, nlabel, symbol=nsym)
-                            nodes_by_id[nid] = {"label": nlabel, "type": ntype}
-
-                    batch_new_edges.append({
-                        "source":     src_id,
-                        "target":     tgt_id,
-                        "relation":   rtype,
-                        "confidence": conf,
-                        "expires_at": expires_at,
-                    })
-
+                    "affected_assets": affected,
+                    "related_entities": entities,
+                    "relations": relations,
+                })
             except Exception:
                 continue
+        return extracted
 
-        # Semantic dedup against existing edges
-        filtered_edges = _deduplicate_edges(db, batch_new_edges, existing_edges, nodes_by_id)
+    # ── Run all batch extractions in parallel ──────────────────────────────────
+    all_facts: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+        futures = {pool.submit(_extract_batch, batch): batch for batch in batches}
+        for future in as_completed(futures):
+            try:
+                all_facts.extend(future.result())
+            except Exception as e:
+                print(f"[KG] Batch future error: {e}")
 
-        # Insert net-new edges
-        for ne in filtered_edges:
-            db.add(models.KGEdge(
-                source_node_id=ne["source"],
-                target_node_id=ne["target"],
-                relation=ne["relation"],
-                confidence=ne["confidence"],
-                source_run_id=run_id,
-                expires_at=ne.get("expires_at"),
-            ))
-            total_edges_added += 1
+    # ── Write all extracted facts to DB (single-threaded — SQLAlchemy session not thread-safe) ──
+    all_new_edges: list[dict] = []
 
-        db.commit()
+    for fact in all_facts:
+        event_id      = fact["event_id"]
+        event_label   = fact["event_label"]
+        event_summary = fact["event_summary"]
+        direction     = fact["direction"]
+        magnitude     = fact["magnitude"]
+        expires_days  = fact["expires_days"]
+        affected      = fact["affected_assets"]
+        entities      = fact["related_entities"]
+        relations     = fact["relations"]
 
-        # Extend existing_edges for subsequent batch dedup
-        existing_edges = (
-            db.query(models.KGEdge)
-            .order_by(models.KGEdge.created_at.desc())
-            .limit(500)
-            .all()
-        )
+        event_node_id = f"event:{event_id[:60]}"
+        expires_at = now + timedelta(days=expires_days)
 
+        event_meta = {
+            "summary":      event_summary[:500],
+            "direction":    direction,
+            "magnitude":    magnitude,
+            "expires_days": expires_days,
+            "run_id":       run_id,
+            "extracted_at": now.isoformat(),
+        }
+        _upsert_node(db, event_node_id, "EVENT", event_label[:80], metadata=event_meta)
+        nodes_by_id[event_node_id] = {"label": event_label, "type": "EVENT"}
+
+        for asset_ref in affected:
+            if asset_ref.startswith("asset:"):
+                a_node_id = asset_ref
+                a_sym = asset_ref.replace("asset:", "")
+            else:
+                a_node_id = f"asset:{asset_ref}"
+                a_sym = asset_ref
+            a_label = TICKER_LABELS.get(a_sym, a_sym)
+            _upsert_node(db, a_node_id, "ASSET", a_label, symbol=a_sym)
+            nodes_by_id[a_node_id] = {"label": a_label, "type": "ASSET"}
+            all_new_edges.append({
+                "source": event_node_id, "target": a_node_id,
+                "relation": "affects", "confidence": 0.75, "expires_at": expires_at,
+            })
+
+        for ent_ref in entities:
+            if ent_ref.startswith("entity:") or ent_ref.startswith("indicator:"):
+                ent_node_id = ent_ref
+                ent_label = ent_ref.split(":", 1)[1].replace("-", " ").replace("_", " ")
+                ent_type = "ENTITY" if ent_ref.startswith("entity:") else "INDICATOR"
+            else:
+                ent_node_id = f"entity:{ent_ref}"
+                ent_label = ent_ref
+                ent_type = "ENTITY"
+            _upsert_node(db, ent_node_id, ent_type, ent_label)
+            nodes_by_id[ent_node_id] = {"label": ent_label, "type": ent_type}
+            all_new_edges.append({
+                "source": ent_node_id, "target": event_node_id,
+                "relation": "caused_by", "confidence": 0.65, "expires_at": expires_at,
+            })
+
+        for rel in relations:
+            src_id = rel.get("source", "")
+            tgt_id = rel.get("target", "")
+            rtype  = rel.get("relation", "related_to")
+            conf   = float(rel.get("confidence", 0.5))
+            if not src_id or not tgt_id or conf < 0.4:
+                continue
+            if rtype not in ("affects", "correlated_with", "caused_by",
+                             "related_to", "sector_peer"):
+                continue
+            for nid in [src_id, tgt_id]:
+                if nid not in nodes_by_id:
+                    ntype = ("ASSET" if nid.startswith("asset:") else
+                             "INDICATOR" if nid.startswith("indicator:") else
+                             "EVENT" if nid.startswith("event:") else "ENTITY")
+                    nlabel = nid.split(":", 1)[1].replace("-", " ") if ":" in nid else nid
+                    nsym = nid.replace("asset:", "") if nid.startswith("asset:") else None
+                    _upsert_node(db, nid, ntype, nlabel, symbol=nsym)
+                    nodes_by_id[nid] = {"label": nlabel, "type": ntype}
+            all_new_edges.append({
+                "source": src_id, "target": tgt_id,
+                "relation": rtype, "confidence": conf, "expires_at": expires_at,
+            })
+
+    db.commit()
+
+    # ── Semantic dedup + insert (parallel merge LLM calls inside) ─────────────
+    filtered_edges = _deduplicate_edges(db, all_new_edges, existing_edges, nodes_by_id)
+
+    for ne in filtered_edges:
+        db.add(models.KGEdge(
+            source_node_id=ne["source"],
+            target_node_id=ne["target"],
+            relation=ne["relation"],
+            confidence=ne["confidence"],
+            source_run_id=run_id,
+            expires_at=ne.get("expires_at"),
+        ))
+        total_edges_added += 1
+
+    db.commit()
     return total_edges_added
 
 

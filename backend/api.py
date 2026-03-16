@@ -418,9 +418,11 @@ def get_pipeline_events(db: Session = Depends(get_db)):
 def get_pipeline_runs(db: Session = Depends(get_db)):
     """Returns a summary list of all past pipeline runs, newest first."""
     cached = cache_get("pipeline_runs")
-    if cached:  # skip empty-list cache entries
+    if cached:
         return cached
-    from sqlalchemy import func
+    from sqlalchemy import func, or_, case
+
+    # ── 1 query: run summaries (started, ended, event count) ─────────────────
     rows = (
         db.query(
             models.PipelineEvent.run_id,
@@ -433,65 +435,74 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
         .limit(50)
         .all()
     )
+    if not rows:
+        return []
 
-    run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-    current_run_id = run_id_conf.value if run_id_conf else None
+    run_ids = [r.run_id for r in rows]
 
+    # ── 1 query: which runs have any ERROR event ──────────────────────────────
+    error_run_ids = {
+        r[0] for r in db.query(models.PipelineEvent.run_id)
+        .filter(models.PipelineEvent.run_id.in_(run_ids),
+                models.PipelineEvent.status == "ERROR")
+        .distinct().all()
+    }
+
+    # ── 1 query: DEPLOY DONE events for all runs ──────────────────────────────
+    deploy_events = db.query(models.PipelineEvent).filter(
+        models.PipelineEvent.run_id.in_(run_ids),
+        models.PipelineEvent.step == "DEPLOY",
+        models.PipelineEvent.status == "DONE",
+    ).all()
+    deploy_by_run = {e.run_id: e for e in deploy_events}
+
+    # ── 1 query: current run id + is_running ─────────────────────────────────
+    configs = db.query(models.AppConfig).filter(
+        models.AppConfig.key.in_(["current_run_id", "debate_running"])
+    ).all()
+    cfg = {c.key: c.value for c in configs}
+    current_run_id = cfg.get("current_run_id")
+    is_running = cfg.get("debate_running") == "1"
+
+    # ── 1 query: all strategies that fall within any run's time window ────────
+    min_start = min(r.started_at for r in rows)
+    max_end   = max(r.ended_at   for r in rows)
+    strategies_in_window = (
+        db.query(models.DeployedStrategy)
+        .filter(
+            models.DeployedStrategy.timestamp >= min_start,
+            models.DeployedStrategy.timestamp <= max_end,
+        )
+        .order_by(models.DeployedStrategy.timestamp.desc())
+        .all()
+    )
+
+    # ── 1 query: debate rounds for those strategies ───────────────────────────
+    dr_ids = [s.debate_round_id for s in strategies_in_window if s.debate_round_id]
+    debate_rounds = {}
+    if dr_ids:
+        for dr in db.query(models.DebateRound).filter(models.DebateRound.id.in_(dr_ids)).all():
+            debate_rounds[dr.id] = dr
+
+    # ── Assemble in Python ────────────────────────────────────────────────────
     result = []
     for row in rows:
-        # Determine status from last event in the run
-        last_event = (
-            db.query(models.PipelineEvent)
-            .filter(models.PipelineEvent.run_id == row.run_id)
-            .order_by(models.PipelineEvent.created_at.desc())
-            .first()
-        )
-        has_error = db.query(models.PipelineEvent).filter(
-            models.PipelineEvent.run_id == row.run_id,
-            models.PipelineEvent.status == "ERROR",
-        ).count() > 0
-
-        if row.run_id == current_run_id:
+        if row.run_id == current_run_id and is_running:
             status = "running"
-        elif has_error:
-            status = "error"
-        else:
+        elif row.run_id in deploy_by_run:
+            # Only truly "done" if DEPLOY step completed successfully
             status = "done"
+        else:
+            # Stopped mid-way — whether it has an ERROR event or just never finished
+            status = "error"
 
-        # Extract deployed ticker from DEPLOY event if present
-        deploy_event = (
-            db.query(models.PipelineEvent)
-            .filter(
-                models.PipelineEvent.run_id == row.run_id,
-                models.PipelineEvent.step == "DEPLOY",
-                models.PipelineEvent.status == "DONE",
-            )
-            .first()
+        # Find strategy created within this run's time window
+        strategy = next(
+            (s for s in strategies_in_window
+             if row.started_at <= s.timestamp <= row.ended_at),
+            None
         )
-        # Find the DebateRound and linked strategy for this run via PipelineRun
-        pipeline_run = db.query(models.PipelineRun).filter(
-            models.PipelineRun.run_id == row.run_id
-        ).first()
-
-        debate_round = None
-        strategy_id = None
-        if pipeline_run:
-            # Find strategy linked to a debate round created near this run's time
-            strategy = (
-                db.query(models.DeployedStrategy)
-                .filter(
-                    models.DeployedStrategy.timestamp >= row.started_at,
-                    models.DeployedStrategy.timestamp <= row.ended_at,
-                )
-                .order_by(models.DeployedStrategy.timestamp.desc())
-                .first()
-            )
-            if strategy:
-                strategy_id = strategy.id
-                if strategy.debate_round_id:
-                    debate_round = db.query(models.DebateRound).filter(
-                        models.DebateRound.id == strategy.debate_round_id
-                    ).first()
+        debate_round = debate_rounds.get(strategy.debate_round_id) if strategy and strategy.debate_round_id else None
 
         output = None
         if debate_round:
@@ -505,22 +516,23 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
                 "votes":           debate_round.consensus_votes,
                 "judge_reasoning": (debate_round.judge_reasoning or "")[:300],
                 "proposals":       proposals,
-                "strategy_id":     strategy_id,
+                "strategy_id":     strategy.id if strategy else None,
                 "debate_id":       debate_round.id,
             }
 
+        deploy_ev = deploy_by_run.get(row.run_id)
         result.append({
             "run_id":        row.run_id,
             "started_at":    row.started_at.isoformat(),
             "ended_at":      row.ended_at.isoformat(),
             "event_count":   row.event_count,
             "status":        status,
-            "deploy_detail": deploy_event.detail if deploy_event else None,
+            "deploy_detail": deploy_ev.detail if deploy_ev else None,
             "output":        output,
         })
-    # Only cache if no run is currently active and we have results (don't cache empty lists)
-    is_running_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if result and not (is_running_conf and is_running_conf.value == "1"):
+
+    # Cache unless actively running
+    if result and not is_running:
         cache_set("pipeline_runs", result, _TTL_RUNS_LIST)
     return result
 
