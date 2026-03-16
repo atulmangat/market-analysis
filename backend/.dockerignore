@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+.env.*
+market_analysis.db
+*.db
+.vercel/
+api/

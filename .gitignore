@@ -3,6 +3,7 @@ backend/__pycache__/
 backend/*.pyc
 backend/venv/
 backend/.env
+backend/.env.*
 backend/market_analysis.db
 
 # Node

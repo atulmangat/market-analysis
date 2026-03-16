@@ -1,0 +1,55 @@
+services:
+  # ── PostgreSQL (local DB — avoids hitting prod Neon) ───────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: market_analysis
+      POSTGRES_USER: market
+      POSTGRES_PASSWORD: market
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U market -d market_analysis"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── FastAPI backend ────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env             # copy .env.example → .env and fill in OPENROUTER_API_KEY
+    environment:
+      DATABASE_URL: postgresql://market:market@db:5432/market_analysis
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Hot-reload: mount source so uvicorn --reload picks up changes
+      - ./backend:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ── React frontend (nginx, built with local backend URL) ──────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # nginx proxies /api/* → backend:8000, so the browser uses relative URL
+        VITE_API_URL: /api
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  pg_data:
