@@ -241,8 +241,16 @@ function AppInner() {
     setSelectedRunLoading(true);
     try {
       const res = await apiFetch(`/pipeline/runs/${runId}`);
-      if (res.ok) { const d = await res.json(); setSelectedRunEvents(d.events ?? []); }
-    } catch { /* ignore */ } finally {
+      if (res.ok) {
+        const d = await res.json();
+        setSelectedRunEvents(d.events ?? []);
+      } else {
+        // Keep empty array — PipelinePage will show "No events recorded"
+        setSelectedRunEvents([]);
+      }
+    } catch {
+      setSelectedRunEvents([]);
+    } finally {
       setSelectedRunLoading(false);
     }
   };
@@ -415,15 +423,20 @@ function AppInner() {
       setSelectedRunId(null);
       setSelectedRunEvents([]);
     } else if (wasRunning && !isNowRunning && pipelineRunId) {
+      const finishedRunId = pipelineRunId;
       setPipelineEvents([]);
-      setSelectedRunId(pipelineRunId);
+      setSelectedRunId(finishedRunId);
       setSelectedRunEvents([]);
       setSelectedRunLoading(true);
-      apiFetch(`/pipeline/runs/${pipelineRunId}`)
-        .then(r => r.ok ? r.json() : null)
-        .then(d => { if (d) setSelectedRunEvents(d.events ?? []); })
-        .catch(() => {})
-        .finally(() => setSelectedRunLoading(false));
+      // Refresh both the runs list and the events in parallel so the sidebar
+      // and output card populate immediately without waiting for the next poll.
+      Promise.all([
+        apiFetch('/pipeline/runs').then(r => r.ok ? r.json() : null),
+        apiFetch(`/pipeline/runs/${finishedRunId}`).then(r => r.ok ? r.json() : null),
+      ]).then(([runs, eventsData]) => {
+        if (runs) setPipelineRuns(runs);
+        if (eventsData) setSelectedRunEvents(eventsData.events ?? []);
+      }).catch(() => {}).finally(() => setSelectedRunLoading(false));
     }
     prevIsTriggering.current = isNowRunning;
     prevPipelineRunId.current = pipelineRunId;
@@ -676,7 +689,7 @@ function AppInner() {
                   onClick={() => setPendingDropdownOpen(o => !o)}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 text-amber-700 dark:text-amber-300 rounded-lg text-xs font-medium animate-pulse hover:bg-amber-200 dark:hover:bg-amber-900 transition-colors"
                 >
-                  <span>⚠</span> {pendingStrategies.length} pending {pendingStrategies.length === 1 ? 'strategy' : 'strategies'}
+                  <span>⚠</span> {pendingStrategies.length} pending {pendingStrategies.length === 1 ? 'trade' : 'trades'}
                 </button>
                 {pendingDropdownOpen && (
                   <div className="absolute right-0 top-full mt-2 z-50 w-80 bg-surface border border-borderMid rounded-xl shadow-2xl overflow-hidden">

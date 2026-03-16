@@ -1,16 +1,13 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "main.py", "use": "@vercel/python", "config": { "maxDuration": 800 } }
-  ],
   "functions": {
-    "main.py": {
-      "maxDuration": 800,
+    "api/index.py": {
+      "maxDuration": 300,
       "memory": 1024
     }
   },
-  "routes": [
-    { "src": "/(.*)", "dest": "main.py" }
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/api/index.py" }
   ],
   "crons": [
     { "path": "/api/cron/debate", "schedule": "0 */4 * * *" },

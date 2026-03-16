@@ -1158,6 +1158,8 @@ def stop_pipeline(db: Session = Depends(get_db)):
     if conf:
         conf.value = "0"
         db.commit()
+    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_events")
     return {"status": "stopped"}
 
 def _get_schedule_interval(db: Session) -> int:

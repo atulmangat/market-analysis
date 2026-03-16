@@ -50,8 +50,8 @@ export function DashboardPage({
 }: DashboardPageProps) {
 
   const stats: { key: 'active' | 'pending' | 'debates' | 'memories'; label: string; value: number; color: string; hint: string }[] = [
-    { key: 'active',   label: 'Active Strategies', value: activeStrategies.length,  color: 'text-up',         hint: 'View all active strategies' },
-    { key: 'pending',  label: 'Pending Approval',  value: pendingStrategies.length, color: 'text-amber-400',  hint: 'Review & approve pending strategies' },
+    { key: 'active',   label: 'Active Trades',     value: activeStrategies.length,  color: 'text-up',         hint: 'View all active trades' },
+    { key: 'pending',  label: 'Pending Approval',  value: pendingStrategies.length, color: 'text-amber-400',  hint: 'Review & approve pending trades' },
     { key: 'debates',  label: 'Debate Rounds',     value: debates.length,           color: 'text-brand-400',  hint: 'Browse debate history' },
     { key: 'memories', label: 'Agent Memories',    value: memories.length,          color: 'text-purple-400', hint: 'Inspect agent memory notes' },
   ];
@@ -95,7 +95,7 @@ export function DashboardPage({
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         {/* Strategies — market → ticker hierarchy */}
         <div className="xl:col-span-2 space-y-4">
-          <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Deployed Strategies</h2>
+          <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Active Trades</h2>
           {!strategiesLoaded && (
             <Card className="p-6 space-y-3">
               {[1,2,3].map(i => (
@@ -111,7 +111,7 @@ export function DashboardPage({
           )}
           {strategiesLoaded && strategies.length === 0 && (
             <Card className="p-10 text-center text-textMuted text-sm">
-              No strategies yet — awaiting the next debate cycle.
+              No trades yet — awaiting the next debate cycle.
             </Card>
           )}
           {strategies.length > 0 && (
@@ -157,13 +157,18 @@ export function DashboardPage({
                           </div>
                           <div>
                             <p className="text-sm font-semibold text-textMain">{ticker}</p>
-                            <p className="text-[11px] text-textMuted">{tickerStrats.length} strateg{tickerStrats.length !== 1 ? 'ies' : 'y'}</p>
+                            <p className="text-[11px] text-textMuted">{tickerStrats.length} trade{tickerStrats.length !== 1 ? 's' : ''}</p>
                           </div>
                         </div>
                         <div className="flex items-center gap-3">
                           {hasPending && (
                             <span className="text-[10px] text-amber-700 dark:text-amber-300 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 px-2 py-0.5 rounded-full animate-pulse">
                               Pending
+                            </span>
+                          )}
+                          {latestStrat.status === 'ACTIVE' && (
+                            <span className={`text-xs font-mono font-semibold tabular-nums ${(latestStrat.current_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                              {(latestStrat.current_return ?? 0) >= 0 ? '+' : ''}{(latestStrat.current_return ?? 0).toFixed(2)}%
                             </span>
                           )}
                           <Badge type={latestStrat.strategy_type} />

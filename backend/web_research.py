@@ -251,23 +251,18 @@ def fetch_web_research(
             ]
 
     print("[WebResearch] Fetching fresh research from curated sources...")
-    all_results = []
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
-    # ── 1. Curated RSS by enabled markets ─────────────────────────────────
     if enabled_tickers:
         active_markets = list(enabled_tickers.keys())
     else:
         active_markets = ["US"]
 
-    seen_rss = set()
-    for market in active_markets:
-        feeds = MARKET_RSS_MAP.get(market, RSS_GLOBAL)
-        for feed_url, label in feeds:
-            if feed_url not in seen_rss:
-                seen_rss.add(feed_url)
-                all_results.extend(_fetch_rss(feed_url, label, max_items=4))
+    ticker_pool = []
+    if enabled_tickers:
+        for market_tickers in enabled_tickers.values():
+            ticker_pool.extend(market_tickers)
 
-    # ── 2. Google News for targeted macro topics ───────────────────────────
     macro_queries = ["Federal Reserve interest rates", "global economy outlook"]
     if "Crypto" in active_markets:
         macro_queries.append("Bitcoin Ethereum price")
@@ -276,18 +271,42 @@ def fetch_web_research(
     if "MCX" in active_markets:
         macro_queries.append("gold oil prices today")
 
-    for q in macro_queries[:4]:
-        all_results.extend(_fetch_google_news(q, max_items=2))
+    # Build all fetch tasks upfront
+    fetch_tasks = []
 
-    # ── 3. Stocktwits social / X sentiment ────────────────────────────────
-    ticker_pool = []
-    if enabled_tickers:
-        for market_tickers in enabled_tickers.values():
-            ticker_pool.extend(market_tickers)
+    # RSS feeds (deduplicated)
+    seen_rss: set[str] = set()
+    for market in active_markets:
+        feeds = MARKET_RSS_MAP.get(market, RSS_GLOBAL)
+        for feed_url, label in feeds:
+            if feed_url not in seen_rss:
+                seen_rss.add(feed_url)
+                fetch_tasks.append(("rss", feed_url, label))
+
+    # Google News macro queries
+    for q in macro_queries[:4]:
+        fetch_tasks.append(("gnews", q, None))
+
+    # Run all HTTP fetches in parallel
+    all_results = []
+    def _run_task(task):
+        kind, arg, label = task
+        if kind == "rss":
+            return _fetch_rss(arg, label, max_items=4)
+        else:
+            return _fetch_google_news(arg, max_items=2)
+
+    with ThreadPoolExecutor(max_workers=min(len(fetch_tasks), 12)) as pool:
+        futures = [pool.submit(_run_task, t) for t in fetch_tasks]
+        for f in _as_completed(futures):
+            try:
+                all_results.extend(f.result())
+            except Exception:
+                pass
+
+    # Stocktwits and YFinance (batch calls, already fast)
     if ticker_pool:
         all_results.extend(_fetch_stocktwits(ticker_pool, max_items=2))
-
-    # ── 4. Yahoo Finance ticker news ──────────────────────────────────────
     yf_tickers = ticker_pool if ticker_pool else ["SPY", "BTC-USD", "GC=F"]
     all_results.extend(_fetch_yfinance_news(yf_tickers, max_items=3))
 

@@ -19,7 +19,7 @@ export function StatDrawer({
   const [expandedDebateId, setExpandedDebateId] = useState<number | null>(null);
 
   const titles: Record<string, string> = {
-    active:   'Active Strategies',
+    active:   'Active Trades',
     pending:  'Pending Approval',
     debates:  'Debate Rounds',
     memories: 'Agent Memory Notes',
@@ -31,7 +31,7 @@ export function StatDrawer({
     if (focus === 'active' || focus === 'pending') {
       const list = focus === 'active' ? activeStrategies : pendingStrategies;
       if (list.length === 0)
-        return <p className="text-sm text-textMuted px-5 py-10 text-center">No {focus === 'pending' ? 'pending' : 'active'} strategies.</p>;
+        return <p className="text-sm text-textMuted px-5 py-10 text-center">No {focus === 'pending' ? 'pending' : 'active'} trades.</p>;
       return (
         <div className="divide-y divide-borderLight">
           {list.map(strat => (

@@ -685,7 +685,7 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
     db = SessionLocal()
     try:
         _log(db, run_id, "AGENT_QUERY", "IN_PROGRESS",
-             f"Querying {agent_name}…", agent_name=agent_name)
+             f"Pass 1: scanning KG + portfolio context for search queries…", agent_name=agent_name)
 
         memories = get_agent_memory(db, agent_name, limit=10)
         memory_context = format_memory_for_context(memories)
@@ -714,18 +714,20 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
 
         # Parse search queries
         search_results_block = ""
-        if "NO_SEARCH_NEEDED" not in search_response.upper():
-            queries = []
+        queries = []
+        if search_response and "NO_SEARCH_NEEDED" not in search_response.upper():
             for line in search_response.strip().splitlines():
                 m = re.search(r"SEARCH_QUERY_\d+:\s*(.+)", line, re.IGNORECASE)
                 if m:
                     queries.append(m.group(1).strip())
             if queries:
                 _log(db, run_id, "AGENT_QUERY", "IN_PROGRESS",
-                     f"{agent_name} searching: {'; '.join(queries[:2])}", agent_name=agent_name)
+                     f"Searching: {'; '.join(queries[:3])}", agent_name=agent_name)
                 search_results_block = _agent_web_search(agent_name, run_id, queries)
 
         # ── Pass 2: Full analysis with search results ────────────────────────
+        _log(db, run_id, "AGENT_QUERY", "IN_PROGRESS",
+             f"Pass 2: forming proposal with {len(queries)} search result{'s' if len(queries) != 1 else ''}…", agent_name=agent_name)
         pass2_context = (
             f"{focus_block}"
             f"{portfolio_context}\n\n"
@@ -736,6 +738,8 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
             f"---\n{memory_context}\n---\n{performance_context}\n"
         )
         response = query_agent(system_prompt, pass2_context)
+        if not response:
+            raise Exception("LLM returned no response after all retries")
         ticker, action = extract_proposal(response)
 
         pred = models.AgentPrediction(
@@ -749,8 +753,13 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
         db.commit()
 
         print(f"{agent_name} proposes: {action} {ticker}")
+        # Extract a brief reasoning snippet for the pipeline viewer
+        reasoning_snippet = ""
+        lines = [l.strip() for l in response.splitlines() if l.strip() and not l.strip().startswith("TICKER") and not l.strip().startswith("ACTION")]
+        if lines:
+            reasoning_snippet = " ".join(lines[:3])[:200]
         _log(db, run_id, "AGENT_QUERY", "DONE",
-             f"Proposed {action} {ticker}", agent_name=agent_name)
+             f"Proposed {action} {ticker} — {reasoning_snippet}", agent_name=agent_name)
 
         return {
             "agent_name": agent_name,
@@ -906,8 +915,9 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
     Returns (winner_ticker, winner_action, judge_reasoning).
     Falls back to plurality vote if the judge LLM fails.
     """
+    proposals_summary = " | ".join(f"{p['agent_name'].split()[0]}: {p['action']} {p['ticker']}" for p in proposals_log)
     _log(db, run_id, "JUDGE", "IN_PROGRESS",
-         f"Judge evaluating {len(proposals_log)} proposals…")
+         f"Evaluating {len(proposals_log)} proposals → {proposals_summary}")
 
     # Build the judge's input — pass full reasoning (no truncation)
     proposals_text = "\n\n".join(
@@ -935,6 +945,8 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
     )
 
     response = query_agent(JUDGE_SYSTEM_PROMPT, judge_input)
+    if not response:
+        response = ""  # fall through to plurality vote fallback
 
     # Parse judge output
     ticker_match  = re.search(r"WINNER_TICKER:\s*([A-Za-z0-9.\-=]+)", response, re.IGNORECASE)

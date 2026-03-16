@@ -100,17 +100,27 @@ def pipeline_research(run_id: str):
             import traceback as _tb
             from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
             upsert_asset_nodes(db, all_tickers)
+            n_batches = max(1, (len(research_items) + 19) // 20)
             _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
-                 f"Extracting graph facts from {len(research_items)} research items…")
+                 f"Processing {len(research_items)} articles in {min(n_batches, 3)} LLM batch{'es' if min(n_batches, 3) > 1 else ''} → extracting events, catalysts & relationships…")
             with ThreadPoolExecutor(max_workers=1) as _kg_pool:
                 _kg_future = _kg_pool.submit(ingest_retrieval_to_graph, db, research_items, run_id)
                 try:
-                    edges_added = _kg_future.result(timeout=45)
+                    edges_added = _kg_future.result(timeout=220)
+                    # Query relation type breakdown for the log
+                    try:
+                        from sqlalchemy import func as _func
+                        rel_counts = db.query(models.KGEdge.relation, _func.count(models.KGEdge.id))\
+                            .filter(models.KGEdge.source_run_id == run_id)\
+                            .group_by(models.KGEdge.relation).all()
+                        rel_summary = ", ".join(f"{r}×{c}" for r, c in sorted(rel_counts, key=lambda x: -x[1])[:5]) if rel_counts else "none"
+                    except Exception:
+                        rel_summary = f"{edges_added} edges"
                     _log(db, run_id, "KG_INGEST", "DONE",
-                         f"Knowledge graph updated — {edges_added} new edges (semantic dedup applied)")
+                         f"{edges_added} new edges added after semantic dedup — relation types: {rel_summary}")
                 except _FutureTimeout:
                     _log(db, run_id, "KG_INGEST", "WARN",
-                         "KG ingest timed out after 45s — pipeline continuing without full graph update")
+                         "KG ingest timed out after 220s — pipeline continuing without full graph update")
         except Exception as kg_err:
             _log(db, run_id, "KG_INGEST", "ERROR",
                  f"KG ingest failed: {str(kg_err)[:300]} | {_tb.format_exc()[-300:]}")
@@ -379,6 +389,10 @@ def pipeline_deploy(run_id: str):
         _set_step(db, run, "done")
         _log(db, run_id, "MEMORY_WRITE", "DONE", "Pipeline complete")
 
+        # Invalidate runs list cache so frontend sees new run immediately
+        from cache import cache_invalidate
+        cache_invalidate("pipeline_runs")
+
         # Release concurrency lock
         lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
         if lock:
@@ -390,6 +404,8 @@ def pipeline_deploy(run_id: str):
         run = _get_run(db, run_id)
         if run:
             _set_step(db, run, "error")
+        from cache import cache_invalidate
+        cache_invalidate("pipeline_runs")
         lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
         if lock:
             lock.value = "0"

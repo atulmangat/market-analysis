@@ -125,9 +125,11 @@ export function PipelinePage({
       );
     }
     if (events.length === 0) {
-      return <p className="px-5 py-8 text-sm text-textMuted text-center">Loading…</p>;
+      return <p className="px-5 py-8 text-sm text-textMuted text-center">No events recorded for this run.</p>;
     }
     const hasError = events.some(e => e.status === 'ERROR');
+    const isFullyComplete = events.some(e => e.step === 'MEMORY_WRITE' && e.status === 'DONE');
+    const wasStopped = !hasError && !isFullyComplete;
     const errorEvent = events.find(e => e.status === 'ERROR');
     const lastEvent = events[events.length - 1];
     const dur = Math.round((new Date(lastEvent.created_at).getTime() - new Date(events[0].created_at).getTime()) / 1000);
@@ -238,9 +240,9 @@ export function PipelinePage({
           </div>
         </div>
         {!isActive || !live ? (
-          <div className={`border-t border-borderLight ${hasError ? 'bg-down/5' : 'bg-up/5'}`}>
+          <div className={`border-t border-borderLight ${hasError || wasStopped ? 'bg-down/5' : 'bg-up/5'}`}>
             {/* Skipped steps */}
-            {hasError && (() => {
+            {(hasError || wasStopped) && (() => {
               const ranSteps = new Set(events.map(e => e.step));
               const skipped = PIPELINE_STEPS.filter(s => !ranSteps.has(s.step) && s.step !== 'START');
               if (!skipped.length) return null;
@@ -258,8 +260,8 @@ export function PipelinePage({
             })()}
             <div className="px-5 py-3 flex items-center justify-between">
               <div className="flex items-center gap-2">
-                <span className={`text-xs font-semibold ${hasError ? 'text-down' : 'text-up'}`}>
-                  {hasError ? '✕ Failed' : '✓ Completed'}
+                <span className={`text-xs font-semibold ${hasError ? 'text-down' : wasStopped ? 'text-yellow-400' : 'text-up'}`}>
+                  {hasError ? '✕ Failed' : wasStopped ? '⏹ Stopped' : '✓ Completed'}
                 </span>
                 {hasError && errorEvent && (
                   <span className="text-[10px] text-textDim">
@@ -323,7 +325,9 @@ export function PipelinePage({
         <div className="px-4 py-2.5 flex items-center gap-3 flex-wrap">
           {/* Market sector pills */}
           <div className="flex items-center gap-1.5 flex-wrap flex-1 min-w-0">
-            {Object.entries(MARKET_SECTORS).map(([market, sectors]) =>
+            {Object.entries(MARKET_SECTORS)
+              .filter(([market]) => enabledMarketNames.length === 0 || enabledMarketNames.includes(market))
+              .map(([market, sectors]) =>
               sectors.map(sector => {
                 const isActiveFilter = focusSectorFilter?.market === market && focusSectorFilter?.sector === sector;
                 return (
@@ -433,8 +437,8 @@ export function PipelinePage({
                   className={`w-full text-left px-4 py-3 border-b border-borderLight transition-colors ${isSelected ? 'bg-surface border-l-2 border-l-brand-500' : 'hover:bg-surface3'}`}
                 >
                   <div className="flex items-center gap-2 mb-0.5">
-                    <span className={`text-xs shrink-0 ${run.status === 'error' ? 'text-down' : 'text-up'}`}>
-                      {run.status === 'error' ? '✕' : '✓'}
+                    <span className={`text-xs shrink-0 ${run.status === 'error' ? 'text-down' : out ? 'text-up' : 'text-yellow-500'}`}>
+                      {run.status === 'error' ? '✕' : out ? '✓' : '⏹'}
                     </span>
                     {out ? (
                       <>
@@ -443,8 +447,8 @@ export function PipelinePage({
                         <span className="text-[9px] text-textDim shrink-0">{out.votes}</span>
                       </>
                     ) : (
-                      <span className={`text-xs font-mono truncate ${run.status === 'error' ? 'text-down' : 'text-textMuted'}`}>
-                        {run.status === 'error' ? 'Failed' : `${run.run_id.substring(0, 8)}…`}
+                      <span className={`text-xs font-mono truncate ${run.status === 'error' ? 'text-down' : 'text-yellow-500'}`}>
+                        {run.status === 'error' ? 'Failed' : 'Stopped'}
                       </span>
                     )}
                   </div>

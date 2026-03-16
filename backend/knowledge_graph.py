@@ -123,10 +123,15 @@ def _embed_texts(texts: list[str]) -> list[list[float]] | None:
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
-    na  = math.sqrt(sum(x * x for x in a)) or 1.0
-    nb  = math.sqrt(sum(x * x for x in b)) or 1.0
-    return dot / (na * nb)
+    try:
+        import numpy as np
+        av, bv = np.array(a), np.array(b)
+        return float(np.dot(av, bv) / (np.linalg.norm(av) * np.linalg.norm(bv) + 1e-9))
+    except ImportError:
+        dot = sum(x * y for x, y in zip(a, b))
+        na  = math.sqrt(sum(x * x for x in a)) or 1.0
+        nb  = math.sqrt(sum(x * x for x in b)) or 1.0
+        return dot / (na * nb)
 
 
 def _edge_description(source_id: str, relation: str, target_id: str,
@@ -144,7 +149,6 @@ def _upsert_node(db: Session, node_id: str, node_type: str, label: str,
     if existing:
         existing.last_seen_at = datetime.utcnow()
         if metadata:
-            # Merge metadata: update existing fields
             try:
                 old_meta = json.loads(existing.metadata_json or "{}")
                 old_meta.update(metadata)
@@ -152,13 +156,18 @@ def _upsert_node(db: Session, node_id: str, node_type: str, label: str,
             except Exception:
                 pass
     else:
-        db.add(models.KGNode(
+        node = models.KGNode(
             node_id=node_id,
             node_type=node_type,
             label=label,
             symbol=symbol,
             metadata_json=json.dumps(metadata or {}),
-        ))
+        )
+        db.add(node)
+        try:
+            db.flush()  # catch UNIQUE violations before batch commit
+        except Exception:
+            db.rollback()  # node already exists — safe to ignore
 
 
 def upsert_asset_nodes(db: Session, tickers: list[str]) -> None:
@@ -233,7 +242,7 @@ def _deduplicate_edges(db: Session, new_edges: list[dict],
         if emb_new is None or emb_ex is None:
             continue
         sim = _cosine_sim(emb_new, emb_ex)
-        if sim >= 0.88:
+        if sim >= 0.90:
             merge_candidates.append((i, ex, sim))
 
     suppress: set[int] = set()
@@ -263,7 +272,7 @@ def _deduplicate_edges(db: Session, new_edges: list[dict],
 
     # Run all merge LLM calls in parallel
     if merge_candidates:
-        with ThreadPoolExecutor(max_workers=min(len(merge_candidates), 6)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(merge_candidates), 12)) as pool:
             futures = {pool.submit(_try_merge, i, ex, sim): (i, ex)
                        for i, ex, sim in merge_candidates}
             for future in as_completed(futures):
@@ -307,11 +316,11 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
     if not items:
         return 0
 
-    # Load existing edges once for dedup (recent runs only, cap at 500)
+    # Load existing edges once for dedup (recent runs only, cap at 300)
     existing_edges = (
         db.query(models.KGEdge)
         .order_by(models.KGEdge.created_at.desc())
-        .limit(500)
+        .limit(300)
         .all()
     )
     # Build nodes lookup for description generation
@@ -326,7 +335,7 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
     }
 
     total_edges_added = 0
-    batches = [items[i:i + 20] for i in range(0, len(items), 20)][:3]  # cap at 3 batches
+    batches = [items[i:i + 30] for i in range(0, len(items), 30)][:3]  # 30 articles/batch, cap at 3
 
     def _extract_batch(batch: list[dict]) -> list[dict]:
         """Call LLM to extract KG facts from one batch. Returns raw edge dicts (no DB writes)."""
@@ -341,6 +350,9 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
             raw = query_agent(KG_EXTRACT_SYSTEM_PROMPT, prompt_body)
         except Exception as e:
             print(f"[KG] LLM extraction failed: {e}")
+            return []
+
+        if not raw:
             return []
 
         extracted: list[dict] = []  # list of {nodes_to_upsert, edges}
