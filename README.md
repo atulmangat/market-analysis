@@ -2,7 +2,7 @@
 
 # ◈ Market Analysis
 
-**A multi-agent AI trading system where four specialized LLM agents debate every trade, vote on LONG/SHORT strategies, and evolve over time through Darwinian selection.**
+**A multi-agent AI system that runs a structured pipeline — fetching live market data, building a knowledge graph, querying four specialised LLM agents, and deploying LONG/SHORT strategies via an independent judge.**
 
 [![Live Demo](https://img.shields.io/badge/Live%20Demo-market--analysis.space-6366f1?style=for-the-badge&logo=vercel)](https://market-analysis.space)
 [![Python](https://img.shields.io/badge/Python-3.11-3776ab?style=for-the-badge&logo=python)](https://python.org)
@@ -16,11 +16,11 @@
 
 ## What is this?
 
-Four AI agents — a **Value Investor**, **Technical Analyst**, **Macro Economist**, and **Sentiment Analyst** — each independently research the markets, form a thesis, and debate their recommended trade. A judge synthesises the debate and deploys a consensus LONG/SHORT strategy.
+Each pipeline run fetches live news and market data, extracts structured events into a knowledge graph, then queries four specialised LLM agents in parallel — a **Value Investor**, **Technical Analyst**, **Macro Economist**, and **Sentiment Analyst**. Each agent independently analyses the shared research context plus their own persistent memory and proposes a ticker + LONG/SHORT action. An independent **judge LLM** reviews all four proposals alongside portfolio budget context and selects the best trade to deploy.
 
-Every agent carries **persistent memory** across rounds. Agents that perform well gain conviction. Agents that underperform have their prompts automatically rewritten by an LLM reflection loop — survival of the fittest.
+Deployed strategies are tracked against live prices. A validator loop closes positions at −10% stop-loss or +15% take-profit. Agents that consistently underperform have their system prompts automatically evolved via an LLM reflection loop — agents on a losing streak receive aggressive rewrites, while high-fitness agents can donate their strategy patterns to struggling peers via crossover.
 
-> *This is not financial advice. It's an experiment in multi-agent reasoning.*
+> *This is not financial advice.*
 
 ---
 
@@ -28,56 +28,78 @@ Every agent carries **persistent memory** across rounds. Agents that perform wel
 
 | | |
 |---|---|
-| 🤖 **Multi-Agent Debate** | Value Investor, Technical Analyst, Macro Economist, Sentiment Analyst argue every trade |
-| 🧠 **Persistent Memory** | Each agent remembers past wins/losses and updates its reasoning accordingly |
-| 🧬 **Darwinian Evolution** | Underperforming agent prompts are auto-rewritten via LLM reflection |
-| 📊 **Strategy Reports** | Each trade comes with a full report: price chart, fundamentals, agent debate breakdown |
-| 📰 **Live Research** | Real-time news from curated RSS feeds + Stocktwits social sentiment |
-| 📈 **Live P&L Tracking** | Active positions tracked against real market prices with auto stop-loss/take-profit |
-| 🌍 **4 Markets** | US Equities, India NSE, Crypto, MCX Futures |
-| ⚡ **Live Pipeline** | Watch the debate happen in real-time, step by step |
-| 🔁 **Auto Schedule** | Runs on configurable interval (default: every 60 minutes) |
-| ✋ **Manual Approval** | Optional manual review before strategies go live |
+| 🤖 **4 Specialised Agents** | Value Investor, Technical Analyst, Macro Economist, Sentiment Analyst — each with structured reasoning frameworks |
+| 🧠 **Persistent Agent Memory** | Each agent accumulates up to 200 notes (INSIGHT, OBSERVATION, LESSON) across runs |
+| 🧬 **Prompt Evolution** | Fitness scored on win rate + avg return; underperforming agents are mutated or receive crossover from elite agents |
+| 🕸️ **Knowledge Graph** | LLM extracts EVENT nodes and relationships from news articles; agents query a 2-hop subgraph as context |
+| 📊 **Strategy Reports** | Each deployed trade generates a price chart + fundamentals report cached at pipeline time |
+| 📰 **Live Research** | Real-time news via Google News RSS + Yahoo Finance; cached 30 min to avoid redundant fetches |
+| 📈 **Live P&L Tracking** | Active positions tracked against real market prices with auto stop-loss / take-profit |
+| 🌍 **4 Markets** | US Equities, India NSE, Crypto, MCX Futures — per-market enable/disable from settings |
+| ⚡ **Live Pipeline View** | Watch every step in real-time with per-step status, agent pills, and event logs |
+| 🔁 **Auto + Manual Modes** | Strategies deploy immediately (auto) or queue for manual approval |
+| ↻ **Pipeline Resume** | Failed or stopped runs can be resumed from their last checkpoint |
 
 ---
 
-## Architecture
+## How it works
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                     Pipeline Run                        │
-│                                                         │
-│  Web Research ──► Agent Context                         │
-│     RSS feeds      Current date + news age labels       │
-│     Stocktwits     Per-ticker fundamentals              │
-│     yfinance       Agent memory (last 50 notes)         │
-│                           │                             │
-│                    ┌──────▼──────┐                      │
-│              ┌─────┤   4 Agents  ├─────┐                │
-│              │     └─────────────┘     │                │
-│        Value Investor           Technical Analyst       │
-│        Macro Economist          Sentiment Analyst       │
-│              │                         │                │
-│              └──────────┬──────────────┘                │
-│                         │                               │
-│                   ┌─────▼──────┐                        │
-│                   │   Judge    │  Majority vote          │
-│                   └─────┬──────┘  + reasoning           │
-│                         │                               │
-│                ┌────────▼────────┐                      │
-│                │ Deploy Strategy │  LONG / SHORT         │
-│                └────────┬────────┘  1 active per ticker │
-│                         │                               │
-│              ┌──────────▼──────────┐                    │
-│              │  Generate Report    │  Chart + Fundamentals│
-│              │  Write Agent Memory │  LESSON / INSIGHT   │
-│              └─────────────────────┘                    │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        Pipeline Run                          │
+│                                                              │
+│  1. WEB_RESEARCH                                             │
+│     Google News RSS + Yahoo Finance for all enabled tickers  │
+│     Cached 30 min. Falls back to DB cache if fetch fails.    │
+│                                                              │
+│  2. KG_INGEST                                                │
+│     LLM extracts EVENT nodes + typed edges from articles     │
+│     Upserted into KGNode / KGEdge with semantic dedup        │
+│     150s hard timeout — pipeline continues if it times out   │
+│                                                              │
+│  3. AGENT_QUERY  (4 agents in parallel)                      │
+│     Each agent receives:                                     │
+│       - Shared research context + KG 2-hop subgraph          │
+│       - Their own memory notes (tiered by recency)           │
+│       - Portfolio budget + open positions                     │
+│       - Market constraint (enabled tickers only)             │
+│     Each outputs: TICKER:SYMBOL, ACTION:LONG|SHORT           │
+│                                                              │
+│  4. JUDGE                                                    │
+│     Independent LLM reviews all 4 proposals                  │
+│     Selects best trade(s) with position sizing               │
+│     Enforces 1 active strategy per ticker                    │
+│                                                              │
+│  5. DEPLOY                                                   │
+│     Saves DeployedStrategy with entry price                  │
+│     Writes INSIGHT / OBSERVATION memory per agent            │
+│     Generates price chart + fundamentals report              │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
 
-Later: Validator scores each strategy against live prices,
-       closes at -10% stop-loss / +15% take-profit,
-       and auto-rewrites underperforming agent prompts.
+Background: Validator scores strategies vs live prices
+  → closes at −10% stop-loss / +15% take-profit
+  → writes LESSON / STRATEGY_RESULT memory
+  → fitness score = (win_rate × 60) + (avg_return × 40)
+  → agents below fitness 55/100 trigger prompt mutation
+  → agents on 3+ loss streak trigger aggressive rewrite
+  → elite agents (fitness > 70) donate strategy patterns via crossover
 ```
+
+---
+
+## The Agents
+
+Each agent has a structured 5-step reasoning framework baked into its system prompt:
+
+| Agent | Focus | Framework |
+|---|---|---|
+| **Value Investor** | Fundamental mispricing vs intrinsic value | Date-filter news → screen P/E vs sector median → identify catalyst → review memory → state exact mispricing |
+| **Technical Analyst** | Price structure and momentum | Check news staleness → analyse 5-day price sequence for breakout/breakdown/compression → confirm with volume → size the setup |
+| **Macro Economist** | Regime identification and macro flows | Identify current macro regime → map rate/FX/commodity drivers → check geopolitical risk → pick the asset most exposed to the regime shift |
+| **Sentiment Analyst** | Crowd psychology and positioning | Score news sentiment → detect retail vs smart money divergence → check for peak fear/greed → fade the crowd or follow the smart money |
+
+Agent prompts are versioned. Each evolution is archived with its fitness score so you can see how prompts improved over time.
 
 ---
 
@@ -85,11 +107,12 @@ Later: Validator scores each strategy against live prices,
 
 | Layer | Tech |
 |---|---|
-| **Backend** | Python · FastAPI · SQLAlchemy · PostgreSQL (Neon) |
-| **LLMs** | OpenRouter (any model, primary + fallback) |
-| **Market Data** | yfinance · Google News RSS · Stocktwits |
-| **Frontend** | React · TypeScript · Vite · Tailwind CSS |
-| **Deploy** | Vercel (frontend + backend serverless) |
+| **Backend** | Python 3.11 · FastAPI · SQLAlchemy · PostgreSQL (Neon) |
+| **LLMs** | OpenRouter — any model, configurable primary + fallback |
+| **Market Data** | yfinance (prices) · Google News RSS · Yahoo Finance RSS |
+| **Optional enrichment** | FRED (macro data) · Finnhub · Alpha Vantage (fundamentals) |
+| **Frontend** | React 18 · TypeScript · Vite · Tailwind CSS |
+| **Deploy** | Vercel serverless (frontend + backend) |
 
 ---
 
@@ -129,6 +152,11 @@ FALLBACK_LLM_MODEL=minimax/minimax-m2.5:nitro
 
 # Optional: PostgreSQL (defaults to local SQLite)
 DATABASE_URL=postgresql://user:pass@host/db
+
+# Optional enrichment (all degrade gracefully if missing)
+FRED_API_KEY=your_key
+FINNHUB_API_KEY=your_key
+ALPHA_VANTAGE_API_KEY=your_key
 ```
 
 ```bash
@@ -179,21 +207,6 @@ npx vercel --prod --yes
 
 ---
 
-## The Agents
-
-Each agent has a distinct investment philosophy with a structured 5-step reasoning framework:
-
-| Agent | Philosophy | Edge |
-|---|---|---|
-| **Value Investor** | Fundamental mispricing vs intrinsic value | Finds assets trading far from fair value with a clear catalyst |
-| **Technical Analyst** | Price structure & momentum | Identifies breakouts, breakdowns, compression setups |
-| **Macro Economist** | Regime identification | Maps macro drivers (rates, geopolitics, flows) to assets |
-| **Sentiment Analyst** | Crowd psychology | Fades peak greed, buys peak fear, spots retail/smart money divergence |
-
-Agents **evolve**: after enough losing trades, the validator triggers an LLM reflection that rewrites the agent's system prompt — preserving what worked, fixing what didn't.
-
----
-
 ## Project Structure
 
 ```
@@ -202,22 +215,22 @@ market-analysis/
 │   ├── main.py                   # FastAPI app + APScheduler cron setup
 │   ├── api/routes.py             # All REST endpoints under /api
 │   ├── pipeline/
-│   │   ├── runner.py             # Full pipeline run (research → KG → debate → deploy)
-│   │   ├── orchestrator.py       # Agent prompts, debate logic, judge
-│   │   └── validator.py          # P&L scoring + agent prompt evolution
+│   │   ├── runner.py             # Full pipeline run (research → KG → agents → judge → deploy)
+│   │   ├── orchestrator.py       # Agent prompts, debate logic, judge, market config
+│   │   └── validator.py          # P&L scoring, fitness computation, prompt evolution
 │   ├── agents/
-│   │   ├── llm.py                # OpenRouter wrapper (primary + fallback model)
-│   │   └── memory.py             # Per-agent persistent notes (max 50)
+│   │   ├── llm.py                # OpenRouter wrapper (primary + fallback model retry)
+│   │   └── memory.py             # Per-agent persistent notes (max 200, tiered retrieval)
 │   ├── graph/knowledge.py        # KG ingest + 2-hop BFS retrieval
 │   ├── data/
 │   │   ├── research.py           # Google News RSS + Yahoo Finance fetcher
-│   │   ├── market.py             # Live price via yfinance
-│   │   ├── fundamentals.py       # Fundamentals enrichment (Alpha Vantage / Finnhub)
-│   │   └── macro.py              # Macro data (FRED)
+│   │   ├── market.py             # Live price + news via yfinance
+│   │   ├── fundamentals.py       # Alpha Vantage / Finnhub enrichment
+│   │   └── macro.py              # FRED macro data
 │   └── core/
 │       ├── models.py             # SQLAlchemy models
 │       ├── database.py           # Neon PostgreSQL session factory
-│       ├── cache.py              # Two-level DB-backed cache
+│       ├── cache.py              # DB-backed cache with per-key TTL
 │       └── auth.py               # JWT auth
 ├── frontend/
 │   └── src/
@@ -227,19 +240,6 @@ market-analysis/
 │       └── templates/            # Stock/Crypto/Commodity report panels
 └── CLAUDE.md                     # AI coding instructions
 ```
-
----
-
-## Key Data Flows
-
-**Pipeline cycle:**
-`run_full_pipeline()` → fetch news/RSS (cached 30 min) → KG ingest (LLM extracts EVENT nodes + edges, 150s timeout) → 4 agents query OpenRouter in parallel with research + KG subgraph + memory → judge picks best trade → deploy `DeployedStrategy` → write `AgentMemory`
-
-**Evaluation cycle:**
-`evaluate_predictions()` → fetch live prices → update `current_return` → write STRATEGY_RESULT/LESSON memory → close at −10% stop-loss / +15% take-profit → auto-improve low-scoring agent prompts via LLM reflection
-
-**Report:**
-Pre-generated at pipeline time (chart + fundamentals cached on `DebateRound.report_json`) → served instantly from cache, no blocking yfinance calls on request
 
 ---
 
