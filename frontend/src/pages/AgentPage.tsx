@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import type { AgentMemory, AgentPrompt, AgentFitness } from '../types';
+import type { AgentMemory, AgentPrompt, AgentFitness, AgentEvolution } from '../types';
 import { NOTE_COLORS } from '../constants';
 import { Card } from '../components/Card';
 import { Toggle } from '../components/Toggle';
@@ -44,11 +44,15 @@ export function AgentPage({
   const [leaderboardExpanded, setLeaderboardExpanded] = useState(true);
   const [disabledAgents, setDisabledAgents] = useState<string[]>([]);
   const [aiEditAgent, setAiEditAgent] = useState<AgentPrompt | null>(null);
+  const [evolutionHistory, setEvolutionHistory] = useState<Record<string, AgentEvolution[]>>({});
+  const [expandedEvolution, setExpandedEvolution] = useState<string[]>([]);
 
   const toggleExpandedAgent = (agentName: string) => {
-    setExpandedAgents(prev => 
+    const willExpand = !expandedAgents.includes(agentName);
+    setExpandedAgents(prev =>
       prev.includes(agentName) ? prev.filter(name => name !== agentName) : [...prev, agentName]
     );
+    if (willExpand) loadEvolutionHistory(agentName);
   };
 
   // Merge agents from predefined metadata, active prompts, and memories
@@ -60,6 +64,17 @@ export function AgentPage({
 
   const coreAgents = allAgentNames.filter(n => (AGENT_META[n]?.type ?? 'core') === 'core');
   const specialistAgents = allAgentNames.filter(n => AGENT_META[n]?.type === 'specialist');
+
+  const loadEvolutionHistory = async (agentName: string) => {
+    if (evolutionHistory[agentName]) return; // already loaded
+    try {
+      const res = await apiFetch(`/agents/evolution/${encodeURIComponent(agentName)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setEvolutionHistory(prev => ({ ...prev, [agentName]: data }));
+      }
+    } catch { /* network */ }
+  };
 
   const renderAgentCard = (agentName: string) => {
     const meta = AGENT_META[agentName];
@@ -194,6 +209,69 @@ export function AgentPage({
               </div>
             )}
 
+            {/* Evolution History */}
+            {(() => {
+              const evo = evolutionHistory[agentName];
+              if (!evo) return null;
+              if (evo.length === 0) return (
+                <div className="border-t border-borderLight px-4 py-3">
+                  <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-1">Evolution History</p>
+                  <p className="text-[11px] text-textDim italic">No evolution history yet — this agent hasn't been evolved.</p>
+                </div>
+              );
+              const showEvo = expandedEvolution.includes(agentName);
+              return (
+                <div className="border-t border-borderLight">
+                  <button
+                    className="w-full px-4 py-3 flex items-center justify-between hover:bg-surface2/50 transition-colors"
+                    onClick={e => { e.stopPropagation(); setExpandedEvolution(prev => prev.includes(agentName) ? prev.filter(n => n !== agentName) : [...prev, agentName]); }}
+                  >
+                    <div className="flex items-center gap-2">
+                      <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider">Evolution History</p>
+                      <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-400">{evo.length} versions</span>
+                    </div>
+                    <span className={`text-textDim text-xs transition-transform ${showEvo ? 'rotate-180' : ''}`}>▾</span>
+                  </button>
+                  {showEvo && (
+                    <div className="px-4 pb-3 space-y-3 max-h-80 overflow-y-auto" onClick={e => e.stopPropagation()}>
+                      {evo.map(h => (
+                        <div key={h.id} className="bg-surface2 rounded-lg border border-borderLight overflow-hidden">
+                          <div className="px-3 py-2 bg-surface3 border-b border-borderLight flex items-center justify-between flex-wrap gap-2">
+                            <div className="flex items-center gap-2">
+                              <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-400">gen {h.generation}</span>
+                              {h.evolution_reason && (
+                                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${
+                                  h.evolution_reason.includes('AGGRESSIVE') ? 'bg-down-bg border-down/30 text-down-text' :
+                                  h.evolution_reason.includes('CROSSOVER') ? 'bg-brand-900/40 border-brand-700/40 text-brand-400' :
+                                  'bg-amber-900/40 border-amber-700/40 text-amber-400'
+                                }`}>{h.evolution_reason}</span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-3 text-[9px] text-textDim">
+                              {h.fitness_score !== null && (
+                                <span className={h.fitness_score >= 55 ? 'text-up' : 'text-down'}>
+                                  fitness {h.fitness_score?.toFixed(1)}
+                                </span>
+                              )}
+                              {h.win_rate !== null && (
+                                <span>{Math.round((h.win_rate ?? 0) * 100)}% WR / {h.total_scored} scored</span>
+                              )}
+                              {h.replaced_at && (
+                                <span className="font-mono">{new Date(h.replaced_at).toLocaleDateString()}</span>
+                              )}
+                            </div>
+                          </div>
+                          <pre className="text-[9px] text-textDim leading-relaxed whitespace-pre-wrap font-sans px-3 py-2 line-clamp-3 overflow-hidden">
+                            {h.system_prompt.slice(0, 400)}{h.system_prompt.length > 400 ? '…' : ''}
+                          </pre>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
             {/* System Prompt */}
             <div className="border-t border-borderLight px-4 py-3">
               <div className="flex items-center justify-between mb-2">
@@ -312,9 +390,14 @@ export function AgentPage({
                             {af.agent_name.split(' ').map(w => w[0]).join('')}
                           </div>
                           <div className="flex-1 min-w-0">
-                            <div className="flex items-center justify-between">
-                              <span className="truncate text-[11px] font-semibold text-textMain">{af.agent_name}</span>
-                              <div className="text-right">
+                            <div className="flex items-center justify-between gap-2">
+                              <div className="flex items-center gap-2 flex-wrap min-w-0">
+                                <span className="truncate text-[11px] font-semibold text-textMain">{af.agent_name}</span>
+                                {af.generation > 1 && (
+                                  <span className="text-[8px] font-bold px-1 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-400 shrink-0">gen {af.generation}</span>
+                                )}
+                              </div>
+                              <div className="text-right shrink-0">
                                 {hasData ? (
                                   <span className={`text-[11px] font-medium tabular-nums ${fitness! >= 65 ? 'text-up' : fitness! >= 45 ? 'text-amber-400' : 'text-down'}`}>
                                     {fitness!.toFixed(1)} <span className="text-[9px] text-textDim font-normal">/100</span>
@@ -335,6 +418,45 @@ export function AgentPage({
                                 )}
                               </div>
                             </div>
+                            {/* Stats row */}
+                            {hasData && (
+                              <div className="flex items-center gap-3 mt-1.5 flex-wrap">
+                                <span className="text-[9px] text-textDim">
+                                  W/L <span className="text-textMuted font-mono">
+                                    {Math.round((af.win_rate ?? 0) * af.total_scored)}/{af.total_scored - Math.round((af.win_rate ?? 0) * af.total_scored)}
+                                  </span>
+                                </span>
+                                {af.avg_return !== null && (
+                                  <span className={`text-[9px] font-mono ${(af.avg_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                                    avg {(af.avg_return ?? 0) >= 0 ? '+' : ''}{af.avg_return?.toFixed(1)}
+                                  </span>
+                                )}
+                                {af.streak !== undefined && af.streak !== 0 && (
+                                  <span className={`text-[9px] font-mono font-bold ${af.streak > 0 ? 'text-up' : 'text-down'}`}>
+                                    {af.streak > 0 ? `+${af.streak}🔥` : `${af.streak}❄`} streak
+                                  </span>
+                                )}
+                                {af.last_evolution && (
+                                  <span className="text-[9px] text-purple-400 bg-purple-900/20 border border-purple-700/30 px-1 py-0.5 rounded" title={af.last_evolution.replaced_at ?? ''}>
+                                    {af.last_evolution.reason?.replace('AGGRESSIVE_', '') ?? 'evolved'}
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                            {/* Recent predictions */}
+                            {af.recent_predictions && af.recent_predictions.length > 0 && (
+                              <div className="flex flex-wrap gap-1 mt-1.5">
+                                {af.recent_predictions.slice(0, 5).map((p, pi) => (
+                                  <span key={pi} className={`text-[8px] font-mono px-1 py-0.5 rounded border ${
+                                    p.actual_outcome === 'PROFIT' ? 'text-up bg-up/10 border-up/20' :
+                                    p.actual_outcome === 'LOSS'   ? 'text-down bg-down/10 border-down/20' :
+                                                                     'text-textDim bg-surface3 border-borderLight'
+                                  }`} title={p.prediction}>
+                                    {p.symbol} {p.actual_outcome === 'PROFIT' ? '↑' : p.actual_outcome === 'LOSS' ? '↓' : '?'}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
                           </div>
                         </div>
                       </div>

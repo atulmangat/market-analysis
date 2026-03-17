@@ -54,6 +54,9 @@ def run_migrations(engine):
         # pipeline_runs
         f"ALTER TABLE pipeline_runs ADD COLUMN {ine}investment_focus VARCHAR",
         f"ALTER TABLE pipeline_runs ADD COLUMN {ine}focus_tickers TEXT",
+        f"ALTER TABLE pipeline_runs ADD COLUMN {ine}run_type VARCHAR DEFAULT 'debate'",
+        # pipeline_events
+        f"ALTER TABLE pipeline_events ADD COLUMN {ine}run_type VARCHAR DEFAULT 'debate'",
         # agent_memory — tiered memory system
         f"ALTER TABLE agent_memory ADD COLUMN {ine}importance_score FLOAT DEFAULT 0.5",
         f"ALTER TABLE agent_memory ADD COLUMN {ine}ticker_refs VARCHAR",

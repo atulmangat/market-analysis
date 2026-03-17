@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
-from core.database import get_db
+from core.database import get_db, SessionLocal
 from pydantic import BaseModel
 from typing import List
 from datetime import datetime
@@ -21,6 +21,12 @@ _TTL_FITNESS     = 600     # 10 min — agent fitness scores
 _TTL_EVOLUTION   = 3600    # 1 hr   — prompt evolution history
 _TTL_MARKET_EVT  = 1800    # 30 min — earnings/news calendar
 _TTL_MEMORY      = 300     # 5 min  — agent memories written after each run
+
+
+def _is_pipeline_running(db) -> bool:
+    """Return True if a pipeline run is currently active. Used to skip caches during live runs."""
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+    return conf is not None and conf.value == "1"
 
 
 # Public router — no auth required
@@ -358,9 +364,10 @@ def get_strategy_report(strategy_id: int, db: Session = Depends(get_db)):
 
 @protected.get("/debates")
 def get_debates(db: Session = Depends(get_db)):
-    cached = cache_get("debates")
-    if cached is not None:
-        return cached
+    if not _is_pipeline_running(db):
+        cached = cache_get("debates")
+        if cached is not None:
+            return cached
     debates = db.query(models.DebateRound).order_by(models.DebateRound.timestamp.desc()).limit(20).all()
     result = [
         {
@@ -476,14 +483,16 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
         .distinct().all()
     }
 
-    # ── 1 query: DEPLOY DONE and MEMORY_WRITE DONE events for all runs ─────────
+    # ── 1 query: terminal events for all runs ────────────────────────────────────
+    # DEPLOY DONE = debate run complete; MEMORY_WRITE DONE = either run type complete;
+    # START DONE = eval run complete (eval emits START DONE at the very end)
     terminal_events = db.query(models.PipelineEvent).filter(
         models.PipelineEvent.run_id.in_(run_ids),
-        models.PipelineEvent.step.in_(["DEPLOY", "MEMORY_WRITE"]),
+        models.PipelineEvent.step.in_(["DEPLOY", "MEMORY_WRITE", "START"]),
         models.PipelineEvent.status == "DONE",
     ).all()
     deploy_by_run = {e.run_id: e for e in terminal_events if e.step == "DEPLOY"}
-    complete_by_run = {e.run_id for e in terminal_events if e.step == "MEMORY_WRITE"}
+    complete_by_run = {e.run_id for e in terminal_events if e.step in ("MEMORY_WRITE", "START")}
 
     # ── 1 query: current run id + is_running ─────────────────────────────────
     configs = db.query(models.AppConfig).filter(
@@ -522,11 +531,17 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
             debate_rounds[dr.id] = dr
 
     # ── Assemble in Python ────────────────────────────────────────────────────
-    _INTERMEDIATE_STEPS = {"pending", "research", "agents", "consensus", "deploy"}
+    _INTERMEDIATE_STEPS = {
+        "pending", "research", "agents", "consensus", "deploy",
+        # eval intermediate steps
+        "running", "score_strategies", "close_positions", "darwin_selection", "memory_write",
+    }
 
     result = []
     for row in rows:
         step = run_steps.get(row.run_id)
+        pr_row = pipeline_run_rows.get(row.run_id)
+        is_eval = pr_row and getattr(pr_row, "run_type", "debate") == "eval"
         is_current_run = row.run_id == current_run_id
         # MEMORY_WRITE DONE is the most authoritative "complete" signal.
         # Even if there are intermediate ERROR events (e.g. KG_INGEST failed but
@@ -617,8 +632,10 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
             }
 
         deploy_ev = deploy_by_run.get(row.run_id)
+        run_type = pipeline_run_rows.get(row.run_id)
         result.append({
             "run_id":        row.run_id,
+            "run_type":      (run_type.run_type if run_type and hasattr(run_type, "run_type") else "debate") or "debate",
             "started_at":    row.started_at.isoformat(),
             "ended_at":      row.ended_at.isoformat(),
             "event_count":   row.event_count,
@@ -891,12 +908,14 @@ def get_market_events(db: Session = Depends(get_db)):
 @protected.get("/agents/fitness")
 def get_agent_fitness(db: Session = Depends(get_db)):
     """Returns current fitness scores for all agents based on recent predictions."""
-    cached = cache_get("agents_fitness")
-    if cached is not None:
-        return cached
+    if not _is_pipeline_running(db):
+        cached = cache_get("agents_fitness")
+        if cached is not None:
+            return cached
     from sqlalchemy import func
     from pipeline.validator import _compute_fitness
 
+    from pipeline.validator import _compute_fitness, _compute_streak
     agents = db.query(models.AgentPrompt).all()
     result = []
     for a in agents:
@@ -904,14 +923,46 @@ def get_agent_fitness(db: Session = Depends(get_db)):
         gen = db.query(models.AgentPromptHistory).filter(
             models.AgentPromptHistory.agent_name == a.agent_name
         ).count() + 1
+        streak = _compute_streak(db, a.agent_name)
+        # Last evolution
+        last_evo = (
+            db.query(models.AgentPromptHistory)
+            .filter(models.AgentPromptHistory.agent_name == a.agent_name)
+            .order_by(models.AgentPromptHistory.generation.desc())
+            .first()
+        )
+        # Recent predictions (last 5)
+        recent_preds = (
+            db.query(models.AgentPrediction)
+            .filter(models.AgentPrediction.agent_name == a.agent_name)
+            .order_by(models.AgentPrediction.timestamp.desc())
+            .limit(5)
+            .all()
+        )
         result.append({
-            "agent_name":   a.agent_name,
-            "generation":   gen,
+            "agent_name":    a.agent_name,
+            "generation":    gen,
             "fitness_score": fitness["fitness_score"],
             "win_rate":      fitness["win_rate"],
             "avg_return":    fitness["avg_return"],
             "total_scored":  fitness["total_scored"],
+            "streak":        streak,
             "updated_at":    a.updated_at.isoformat() if a.updated_at else None,
+            "last_evolution": {
+                "reason":   last_evo.evolution_reason,
+                "replaced_at": last_evo.replaced_at.isoformat() if last_evo and last_evo.replaced_at else None,
+                "fitness_score": last_evo.fitness_score,
+            } if last_evo else None,
+            "recent_predictions": [
+                {
+                    "symbol":   p.symbol,
+                    "prediction": p.prediction,
+                    "score":    p.score,
+                    "actual_outcome": p.actual_outcome,
+                    "timestamp": p.timestamp.isoformat() if p.timestamp else None,
+                }
+                for p in recent_preds
+            ],
         })
     cache_set("agents_fitness", result, _TTL_FITNESS)
     return result
@@ -1103,9 +1154,10 @@ def update_agent_prompt(agent_name: str, body: dict, db: Session = Depends(get_d
 @protected.get("/memory")
 def get_all_memory(db: Session = Depends(get_db)):
     """Get recent memory notes for all agents."""
-    cached = cache_get("memory_all")
-    if cached is not None:
-        return cached
+    if not _is_pipeline_running(db):
+        cached = cache_get("memory_all")
+        if cached is not None:
+            return cached
     memories = (
         db.query(models.AgentMemory)
         .order_by(models.AgentMemory.created_at.desc())
@@ -1184,9 +1236,10 @@ def search_tickers(q: str = ""):
 @protected.get("/research")
 def get_research(db: Session = Depends(get_db)):
     """Get the latest cached web research results."""
-    cached = cache_get("research")
-    if cached is not None:
-        return cached
+    if not _is_pipeline_running(db):
+        cached = cache_get("research")
+        if cached is not None:
+            return cached
     research = (
         db.query(models.WebResearch)
         .order_by(models.WebResearch.fetched_at.desc())
@@ -1380,6 +1433,50 @@ def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depend
 
     msg = f"Focused pipeline run on: {', '.join(focus)}" if focus else "Full pipeline started."
     return {"status": "success", "message": msg, "run_id": run_id}
+
+@protected.post("/eval/trigger")
+def trigger_eval(db: Session = Depends(get_db)):
+    """Manually trigger an evaluation pipeline run (score strategies, evolve agents)."""
+    is_running = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+    if is_running and is_running.value == "1":
+        return {"status": "error", "message": "A pipeline is already running. Please wait."}
+
+    # Acquire concurrency lock
+    lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+    if not lock:
+        db.add(models.AppConfig(key="debate_running", value="1"))
+    else:
+        lock.value = "1"
+    db.commit()
+
+    # Run eval in a background thread
+    from pipeline.validator import evaluate_predictions
+
+    def _run_eval_and_release():
+        try:
+            evaluate_predictions()
+        finally:
+            _db = SessionLocal()
+            try:
+                conf = _db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+                if conf:
+                    conf.value = "0"
+                _db.commit()
+            except Exception:
+                pass
+            finally:
+                _db.close()
+            cache_invalidate("pipeline_runs")
+            cache_invalidate("agents_fitness")
+            cache_invalidate("memory_all")
+            cache_invalidate_prefix("agent_evolution:")
+
+    t = threading.Thread(target=_run_eval_and_release, daemon=True)
+    t.start()
+
+    cache_invalidate("pipeline_runs")
+    return {"status": "success", "message": "Evaluation pipeline started."}
+
 
 @protected.get("/system/status")
 def get_system_status(db: Session = Depends(get_db)):
@@ -1691,9 +1788,10 @@ def get_portfolio_pnl(db: Session = Depends(get_db)):
 @protected.get("/knowledge-graph")
 def get_knowledge_graph(db: Session = Depends(get_db)):
     """Return all nodes and deduplicated edges (capped at 500 nodes)."""
-    cached = cache_get("kg_full")
-    if cached is not None:
-        return cached
+    if not _is_pipeline_running(db):
+        cached = cache_get("kg_full")
+        if cached is not None:
+            return cached
     from graph.knowledge import get_full_graph
     result = get_full_graph(db, limit_nodes=500)
     cache_set("kg_full", result, _TTL_GRAPH)
@@ -1705,9 +1803,10 @@ def get_ticker_kg(symbol: str, hops: int = 2, db: Session = Depends(get_db)):
     """Return the 1–3 hop subgraph centered on a ticker."""
     hops = max(1, min(hops, 3))
     cache_key = f"kg_ticker:{symbol.upper()}:{hops}"
-    cached = cache_get(cache_key)
-    if cached is not None:
-        return cached
+    if not _is_pipeline_running(db):
+        cached = cache_get(cache_key)
+        if cached is not None:
+            return cached
     from graph.knowledge import get_ticker_subgraph
     result = get_ticker_subgraph(db, symbol.upper(), hops=hops)
     cache_set(cache_key, result, _TTL_GRAPH)

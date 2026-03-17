@@ -36,6 +36,7 @@ interface PipelinePagesProps {
   saveInvestmentFocus: (text: string) => void;
   handleManualTrigger: (tickers?: string[]) => void;
   handleStopPipeline: () => void;
+  handleEvalTrigger: () => void;
   loadRunEvents: (runId: string) => void;
   openReport: (id: number) => void;
 }
@@ -43,6 +44,22 @@ interface PipelinePagesProps {
 const ORDERED_STEPS = [
   'START', 'WEB_RESEARCH', 'KG_INGEST', 'DEBATE_PANEL', 'AGENT_QUERY', 'JUDGE', 'DEPLOY', 'MEMORY_WRITE',
 ];
+
+// Evaluation pipeline steps
+const EVAL_ORDERED_STEPS = [
+  'START', 'PRICE_FETCH', 'SCORE_STRATEGIES', 'CLOSE_POSITIONS', 'AGENT_ANALYSIS', 'DARWIN_SELECTION', 'MEMORY_WRITE',
+];
+
+const EVAL_STEP_LABELS: Record<string, string> = {
+  START:             'Initialising',
+  PRICE_FETCH:       'Fetching Live Prices',
+  SCORE_STRATEGIES:  'Scoring Strategies',
+  CLOSE_POSITIONS:   'Closing Positions',
+  AGENT_ANALYSIS:    'Post-Mortem Analysis',
+  DARWIN_SELECTION:  'Evolving Agents',
+  MEMORY_WRITE:      'Writing Lessons',
+};
+
 
 const STEP_LABELS: Record<string, string> = {
   START:        'Initialising',
@@ -113,7 +130,15 @@ function getCompletedSteps(events: PipelineEvent[]): Set<string> {
 }
 
 function isRunComplete(events: PipelineEvent[]): boolean {
-  return events.some(e => e.step === 'MEMORY_WRITE' && e.status === 'DONE');
+  return events.some(e => e.step === 'MEMORY_WRITE' && e.status === 'DONE') ||
+    events.some(e => e.step === 'START' && e.status === 'DONE');
+}
+
+function isEvalRun(events: PipelineEvent[]): boolean {
+  return events.some(e =>
+    e.step === 'PRICE_FETCH' || e.step === 'SCORE_STRATEGIES' ||
+    e.step === 'CLOSE_POSITIONS' || e.step === 'DARWIN_SELECTION' || e.step === 'AGENT_ANALYSIS'
+  );
 }
 
 function hasError(events: PipelineEvent[]): boolean {
@@ -136,7 +161,7 @@ export function PipelinePage({
   setResearchStepOpen, setSelectedRunId, setSelectedRunEvents,
   setInvestmentFocus, setFocusTickers, setFocusSearch, setFocusSearchOpen,
   setFocusSectorFilter, setTickerSearchResults, setTickerSearchLoading,
-  saveInvestmentFocus, handleManualTrigger, handleStopPipeline, loadRunEvents, openReport,
+  saveInvestmentFocus, handleManualTrigger, handleStopPipeline, handleEvalTrigger, loadRunEvents, openReport,
 }: PipelinePagesProps) {
   const isActive = isTriggering;
   const focusSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -290,6 +315,302 @@ export function PipelinePage({
             </div>
           </div>
         )}
+      </div>
+    );
+  };
+
+  // ── Eval Active View ──────────────────────────────────────────────────────
+  const renderEvalActiveView = (events: PipelineEvent[]) => {
+    const currentStep = events.slice().reverse().find(e => e.status === 'IN_PROGRESS')?.step ?? null;
+    const doneSteps = new Set(events.filter(e => e.status === 'DONE').map(e => e.step));
+    const stepIndex = currentStep ? EVAL_ORDERED_STEPS.indexOf(currentStep) : -1;
+    const progressPct = stepIndex >= 0 ? Math.round(((stepIndex + 0.5) / EVAL_ORDERED_STEPS.length) * 100) : 0;
+
+    const latestDetail = (step: string) => {
+      return [...events].reverse().find(e => e.step === step && e.detail)?.detail ?? '';
+    };
+
+    const agentsDone = events
+      .filter(e => e.step === 'AGENT_ANALYSIS' && e.status === 'DONE' && e.agent_name)
+      .map(e => e.agent_name!)
+      .filter((v, i, a) => a.indexOf(v) === i);
+    const agentsActive = events
+      .filter(e => e.step === 'AGENT_ANALYSIS' && e.status === 'IN_PROGRESS' && e.agent_name)
+      .map(e => e.agent_name!);
+
+    return (
+      <div className="flex-1 flex flex-col overflow-y-auto">
+        <div className="px-5 py-4 border-b border-borderLight bg-surface2/40">
+          <div className="flex items-center justify-between mb-2">
+            <div className="flex items-center gap-2">
+              <span className="h-1.5 w-1.5 rounded-full bg-purple-400 animate-ping shrink-0" />
+              <span className="text-xs font-semibold text-purple-400">
+                {currentStep ? (EVAL_STEP_LABELS[currentStep] ?? currentStep) : 'Starting…'}
+              </span>
+              <span className="text-[9px] text-textDim bg-purple-900/30 border border-purple-700/30 px-1.5 py-0.5 rounded uppercase tracking-wider">Eval</span>
+            </div>
+            <span className="text-[10px] text-textDim font-mono">{progressPct}%</span>
+          </div>
+          <div className="h-0.5 bg-surface3 rounded-full overflow-hidden">
+            <div className="h-full rounded-full bg-purple-400 transition-all duration-700" style={{ width: `${progressPct}%` }} />
+          </div>
+        </div>
+
+        <div className="flex-1 px-5 py-3 space-y-0.5">
+          {EVAL_ORDERED_STEPS.map(s => {
+            const isDone = doneSteps.has(s);
+            const isCurrent = s === currentStep;
+            const detail = (isDone || isCurrent) ? latestDetail(s) : '';
+
+            return (
+              <div key={s} className={`flex items-start gap-3 py-2 rounded-lg px-2 transition-colors ${
+                isCurrent ? 'bg-surface2' : isDone ? 'bg-up/[0.06]' : ''
+              }`}>
+                <div className={`mt-0.5 h-5 w-5 rounded-full shrink-0 flex items-center justify-center text-[10px] border ${
+                  isCurrent ? `border-purple-500 bg-purple-500/10 animate-pulse` :
+                  isDone    ? 'border-up bg-up/20' :
+                              'border-borderLight bg-surface3 opacity-30'
+                }`}>
+                  {isDone ? <span className="text-up text-[9px] font-bold">✓</span>
+                    : <span className={isCurrent ? 'text-purple-400' : 'text-textDim'}>
+                        {s === 'PRICE_FETCH' ? '₿' : s === 'SCORE_STRATEGIES' ? '⚖' : s === 'CLOSE_POSITIONS' ? '✕' :
+                         s === 'AGENT_ANALYSIS' ? '🔬' : s === 'DARWIN_SELECTION' ? '🧬' : '·'}
+                      </span>
+                  }
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className={`text-[11px] font-semibold ${isCurrent ? 'text-purple-400' : isDone ? 'text-up' : 'text-textDim opacity-40'}`}>
+                      {EVAL_STEP_LABELS[s] ?? s}
+                    </span>
+                    {isCurrent && <span className="text-[9px] text-purple-400 animate-pulse">running</span>}
+                    {isDone && <span className="text-[9px] text-up/60 font-medium">done</span>}
+                  </div>
+                  {detail && (
+                    <p className="text-[10px] text-textDim mt-0.5 leading-relaxed" title={detail}>
+                      {detail.length > 100 ? detail.slice(0, 100) + '…' : detail}
+                    </p>
+                  )}
+                  {s === 'AGENT_ANALYSIS' && (agentsActive.length > 0 || agentsDone.length > 0) && (
+                    <div className="mt-1 flex flex-wrap gap-1">
+                      {[...agentsDone, ...agentsActive].filter((v, i, a) => a.indexOf(v) === i).map(agent => {
+                        const done = agentsDone.includes(agent);
+                        return (
+                          <span key={agent} className={`text-[9px] px-1.5 py-0.5 rounded-full border font-medium ${
+                            done ? 'text-up bg-up/10 border-up/30' : 'text-purple-300 bg-purple-500/10 border-purple-500/30 animate-pulse'
+                          }`}>
+                            {done ? '✓ ' : '🔬 '}{agent}
+                          </span>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  // ── Eval Completed View ───────────────────────────────────────────────────
+  const renderEvalCompletedView = (events: PipelineEvent[], run?: PipelineRun) => {
+    const complete = run?.status === 'done' || isRunComplete(events);
+    const errored = !complete && (run?.status === 'error' || hasError(events));
+    const dur = getRunDuration(events);
+
+    // Extract key data from events
+    const priceFetchEvent = events.find(e => e.step === 'PRICE_FETCH' && e.status === 'DONE');
+    const scoringEvent = events.find(e => e.step === 'SCORE_STRATEGIES' && e.status === 'DONE');
+    const closingEvent = events.find(e => e.step === 'CLOSE_POSITIONS' && e.status === 'DONE');
+    const darwinEvent = events.find(e => e.step === 'DARWIN_SELECTION' && e.status === 'DONE');
+    const memoryEvent = events.find(e => e.step === 'MEMORY_WRITE' && e.status === 'DONE');
+
+    // Agent analysis events
+    const analysisEvents = events.filter(e => e.step === 'AGENT_ANALYSIS' && e.status === 'DONE');
+    // Darwin in-progress events (per-agent evolution)
+    const darwinAgentEvents = events.filter(e => e.step === 'DARWIN_SELECTION' && e.status === 'IN_PROGRESS' && e.agent_name);
+
+    return (
+      <div className="flex-1 flex flex-col overflow-y-auto">
+        {/* Outcome banner */}
+        <div className={`px-6 py-5 border-b border-borderLight ${errored ? 'bg-down-bg/40' : 'bg-purple-500/5'}`}>
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className={`h-10 w-10 rounded-full flex items-center justify-center text-lg ${errored ? 'bg-down-bg text-down-text' : 'bg-purple-500/15 text-purple-400'}`}>
+                {errored ? '✕' : '🧬'}
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <p className={`text-sm font-semibold ${errored ? 'text-down-text' : 'text-purple-400'}`}>
+                    {errored ? 'Evaluation Failed' : 'Evaluation Complete'}
+                  </p>
+                  <span className="text-[9px] text-purple-400 bg-purple-900/30 border border-purple-700/30 px-1.5 py-0.5 rounded uppercase tracking-wider">Eval</span>
+                </div>
+                <p className="text-[11px] text-textDim mt-0.5">
+                  {events.length} events{dur != null ? ` · ${dur}s` : ''}
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setStepsExpanded(v => !v)}
+              className="flex items-center gap-1.5 text-[11px] text-textDim hover:text-textMuted border border-borderLight bg-surface2 hover:bg-surface3 px-3 py-1.5 rounded-lg transition-colors"
+            >
+              <span className="font-mono">{stepsExpanded ? '▲' : '▼'}</span>
+              <span>{stepsExpanded ? 'Hide' : 'View'} Steps</span>
+            </button>
+          </div>
+
+          {/* Step chips */}
+          {!stepsExpanded && (
+            <div className="mt-4 flex flex-wrap gap-1.5">
+              {EVAL_ORDERED_STEPS.map(s => {
+                const ran = events.some(e => e.step === s);
+                const failed = events.some(e => e.step === s && e.status === 'ERROR');
+                if (!ran) return (
+                  <span key={s} className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border border-borderLight text-textDim opacity-35">
+                    {EVAL_STEP_LABELS[s]}
+                  </span>
+                );
+                return (
+                  <span key={s} className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ${
+                    failed ? 'border-down/40 text-down-text bg-down-bg' : 'border-purple-500/40 text-purple-400 bg-purple-500/10'
+                  }`}>
+                    {EVAL_STEP_LABELS[s]}{failed ? ' ✕' : ' ✓'}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Expanded step log */}
+        {stepsExpanded && (
+          <div className="border-b border-borderLight bg-surface2/30">
+            <div className="divide-y divide-borderLight">
+              {events.map(ev => {
+                const timeStr = new Date(ev.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+                const label = EVAL_STEP_LABELS[ev.step] ?? ev.step;
+                return (
+                  <div key={ev.id} className="px-5 py-3 flex items-start gap-4">
+                    <div className={`mt-0.5 shrink-0 h-6 w-6 rounded-full flex items-center justify-center text-[10px] border ${
+                      ev.status === 'ERROR' ? 'bg-down-bg border-down/50 text-down-text' :
+                      ev.status === 'DONE'  ? 'bg-up/15 border-up/50 text-up' :
+                                              'bg-purple-500/10 border-purple-500/30 text-purple-400'
+                    }`}>
+                      {ev.status === 'DONE' ? '✓' : ev.status === 'ERROR' ? '✕' : '↻'}
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between gap-2 mb-0.5">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="text-[11px] font-medium text-textMain">{label}</span>
+                          {ev.agent_name && (
+                            <span className="text-[9px] px-1.5 py-0.5 rounded-full font-medium text-purple-300 bg-purple-900/40 border border-purple-700/40">{ev.agent_name}</span>
+                          )}
+                        </div>
+                        <span className="text-[10px] text-textDim font-mono shrink-0">{timeStr}</span>
+                      </div>
+                      {ev.detail && <p className="text-[11px] text-textDim leading-relaxed">{ev.detail}</p>}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Summary cards */}
+        <div className="px-5 py-4 space-y-4">
+          {/* Price & Score summary */}
+          {(priceFetchEvent || scoringEvent) && (
+            <div className="rounded-xl border border-borderLight bg-surface2 overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-borderLight bg-surface3">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-textDim">Position Scoring</span>
+              </div>
+              <div className="px-4 py-3 space-y-1">
+                {priceFetchEvent?.detail && <p className="text-[11px] text-textMuted">{priceFetchEvent.detail}</p>}
+                {scoringEvent?.detail && (
+                  <div className="mt-1">
+                    {scoringEvent.detail.split('\n').map((line, i) => (
+                      <p key={i} className="text-[11px] text-textDim font-mono leading-relaxed">{line}</p>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Closed positions */}
+          {closingEvent && (
+            <div className="rounded-xl border border-borderLight bg-surface2 overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-borderLight bg-surface3">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-textDim">Positions Closed</span>
+              </div>
+              <div className="px-4 py-3">
+                <p className="text-[11px] text-textMuted">{closingEvent.detail}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Agent post-mortems */}
+          {analysisEvents.length > 0 && (
+            <div className="rounded-xl border border-borderLight bg-surface2 overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-borderLight bg-surface3 flex items-center gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-textDim">Post-Mortem Analysis</span>
+                <span className="text-[10px] text-textDim bg-surface2 border border-borderLight px-1.5 py-0.5 rounded">{analysisEvents.length}</span>
+              </div>
+              <div className="divide-y divide-borderLight">
+                {analysisEvents.map(ev => (
+                  <div key={ev.id} className="px-4 py-3">
+                    <div className="flex items-center gap-2 mb-1">
+                      {ev.agent_name && (
+                        <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-300">{ev.agent_name}</span>
+                      )}
+                    </div>
+                    {ev.detail && <p className="text-[11px] text-textMuted leading-relaxed">{ev.detail}</p>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Darwin evolution */}
+          {(darwinEvent || darwinAgentEvents.length > 0) && (
+            <div className="rounded-xl border border-borderLight bg-surface2 overflow-hidden">
+              <div className="px-4 py-2.5 border-b border-borderLight bg-surface3 flex items-center gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-widest text-textDim">Agent Evolution</span>
+              </div>
+              <div className="divide-y divide-borderLight">
+                {darwinAgentEvents.filter(e => e.detail && (e.detail.includes('evolved') || e.detail.includes('MUTATION') || e.detail.includes('CROSSOVER'))).map(ev => (
+                  <div key={ev.id} className="px-4 py-3 flex items-start gap-3">
+                    <span className="text-sm shrink-0">🧬</span>
+                    <div>
+                      {ev.agent_name && <span className="text-[10px] font-semibold text-textMain">{ev.agent_name}</span>}
+                      {ev.detail && <p className="text-[11px] text-textMuted mt-0.5 leading-relaxed">{ev.detail}</p>}
+                    </div>
+                  </div>
+                ))}
+                {darwinEvent && (
+                  <div className="px-4 py-3">
+                    <p className="text-[11px] text-textMuted">{darwinEvent.detail}</p>
+                  </div>
+                )}
+                {darwinAgentEvents.filter(e => e.detail && (e.detail.includes('evolved') || e.detail.includes('MUTATION') || e.detail.includes('CROSSOVER'))).length === 0 && !darwinEvent && (
+                  <div className="px-4 py-3">
+                    <p className="text-[11px] text-textDim italic">No agents evolved this run.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {memoryEvent && (
+            <div className="rounded-xl border border-borderLight bg-surface2 px-4 py-3">
+              <p className="text-[11px] text-textMuted">{memoryEvent.detail}</p>
+            </div>
+          )}
+        </div>
       </div>
     );
   };
@@ -653,11 +974,16 @@ export function PipelinePage({
       // Past run
       const run = pipelineRuns.find(r => r.run_id === selectedRunId);
       if (panelEvents.length === 0) return <p className="flex-1 flex items-center justify-center text-sm text-textMuted">No events recorded for this run.</p>;
+      const isEval = run?.run_type === 'eval' || isEvalRun(panelEvents);
+      if (isEval) return renderEvalCompletedView(panelEvents, run);
       return renderCompletedView(panelEvents, run);
     }
 
     // Live view
-    if (isActive && !isRunComplete(panelEvents)) return renderActiveView(panelEvents);
+    if (isActive && !isRunComplete(panelEvents)) {
+      if (isEvalRun(panelEvents)) return renderEvalActiveView(panelEvents);
+      return renderActiveView(panelEvents);
+    }
     // Not active and no run selected → show idle blueprint
     return renderIdleView();
   };
@@ -689,12 +1015,21 @@ export function PipelinePage({
               ■ Stop
             </button>
           ) : (
-            <button
-              onClick={() => handleManualTrigger(focusTickers.length > 0 ? focusTickers : undefined)}
-              className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-brand-600 border-brand-500 text-white hover:bg-brand-500 transition-colors"
-            >
-              ▶ {focusTickers.length > 0 ? `Run ${focusTickers.length} ticker${focusTickers.length !== 1 ? 's' : ''}` : 'Run Pipeline'}
-            </button>
+            <>
+              <button
+                onClick={handleEvalTrigger}
+                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-purple-700/50 bg-purple-900/20 text-purple-400 hover:bg-purple-800/30 transition-colors"
+                title="Score active strategies, run post-mortem analysis, and evolve underperforming agents"
+              >
+                🧬 Evaluate
+              </button>
+              <button
+                onClick={() => handleManualTrigger(focusTickers.length > 0 ? focusTickers : undefined)}
+                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-brand-600 border-brand-500 text-white hover:bg-brand-500 transition-colors"
+              >
+                ▶ {focusTickers.length > 0 ? `Run ${focusTickers.length} ticker${focusTickers.length !== 1 ? 's' : ''}` : 'Run Pipeline'}
+              </button>
+            </>
           )}
         </div>
 
@@ -813,21 +1148,25 @@ export function PipelinePage({
                     const isSelected = selectedRunId === run.run_id;
                     const dur = Math.round((new Date(run.ended_at).getTime() - new Date(run.started_at).getTime()) / 1000);
                     const params = run.run_params;
+                    const isEval = run.run_type === 'eval';
                     return (
                       <button key={run.run_id}
                         onClick={() => { loadRunEvents(run.run_id); setStepsExpanded(false); }}
-                        className={`w-full text-left px-4 py-3 border-b border-borderLight transition-colors ${isSelected ? 'bg-surface border-l-2 border-l-brand-500' : 'hover:bg-surface3'}`}
+                        className={`w-full text-left px-4 py-3 border-b border-borderLight transition-colors ${isSelected ? `bg-surface border-l-2 ${isEval ? 'border-l-purple-500' : 'border-l-brand-500'}` : 'hover:bg-surface3'}`}
                       >
                         <div className="flex items-center gap-2 mb-0.5">
                           <span className={`text-xs shrink-0 ${run.status === 'done' ? 'text-up' : run.status === 'error' ? 'text-down' : 'text-yellow-500'}`}>
                             {run.status === 'done' ? '✓' : run.status === 'error' ? '✕' : '⏹'}
                           </span>
                           <span className="text-[11px] font-mono text-textMuted truncate">{run.run_id.substring(0, 8)}</span>
+                          {isEval && (
+                            <span className="text-[8px] font-bold px-1 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-400 uppercase tracking-wider shrink-0">eval</span>
+                          )}
                         </div>
                         <p className="text-[10px] text-textDim pl-4">
                           {new Date(run.started_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · {dur}s
                         </p>
-                        {params && (params.focus || (params.tickers && params.tickers.length > 0)) && (
+                        {!isEval && params && (params.focus || (params.tickers && params.tickers.length > 0)) && (
                           <div className="pl-4 mt-0.5 flex flex-wrap gap-1">
                             {params.focus && (
                               <span className="text-[9px] text-brand-400 bg-brand-900/30 px-1 py-0.5 rounded truncate max-w-[110px]">{params.focus}</span>

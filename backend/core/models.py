@@ -135,6 +135,7 @@ class PipelineRun(Base):
 
     id            = Column(Integer, primary_key=True, index=True)
     run_id        = Column(String, unique=True, index=True)
+    run_type      = Column(String, default="debate")   # "debate" | "eval"
     step          = Column(String, default="pending")  # pending | research | agents | consensus | deploy | done | error
     shared_context = Column(Text, nullable=True)       # cached research context JSON
     proposals_json = Column(Text, nullable=True)       # agent proposals JSON
@@ -151,6 +152,7 @@ class PipelineEvent(Base):
 
     id         = Column(Integer, primary_key=True, index=True)
     run_id     = Column(String, index=True)       # UUID, one per run_debate() call
+    run_type   = Column(String, default="debate") # "debate" | "eval"
     step       = Column(String)                   # START | WEB_RESEARCH | AGENT_QUERY | VOTE | DEPLOY | MEMORY_WRITE | ERROR
     agent_name = Column(String, nullable=True)    # set for AGENT_QUERY steps
     status     = Column(String)                   # IN_PROGRESS | DONE | ERROR

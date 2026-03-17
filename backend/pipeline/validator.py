@@ -3,6 +3,7 @@ from sqlalchemy import func
 from core.database import SessionLocal
 import core.models as models
 import re
+import uuid
 from datetime import datetime
 from agents.llm import query_agent
 from data.market import fetch_market_data
@@ -18,6 +19,26 @@ STREAK_AGGRESSIVE_MUTATE  = 3     # consecutive losses before aggressive (full-p
 
 # ── Structured prompt section delimiters ─────────────────────────────────────
 _SECTION_MARKER = "=== {} ==="
+
+
+def _log(db: Session, run_id: str, step: str, status: str, detail: str = None, agent_name: str = None):
+    """Write a PipelineEvent for the eval pipeline and immediately commit."""
+    ev = models.PipelineEvent(
+        run_id=run_id,
+        run_type="eval",
+        step=step,
+        agent_name=agent_name,
+        status=status,
+        detail=detail,
+    )
+    db.add(ev)
+    db.commit()
+
+
+def _update_run(db: Session, run: models.PipelineRun, step: str):
+    run.step = step
+    run.updated_at = datetime.utcnow()
+    db.commit()
 
 
 def _extract_section(prompt: str, section: str) -> str:
@@ -148,12 +169,127 @@ def _archive_prompt(db: Session, agent_name: str, reason: str, fitness: dict):
     return generation
 
 
-def _mutate_prompt(db: Session, agent_name: str, fitness: dict, streak: int = 0) -> str:
+def _build_exhaustive_analysis_prompt(
+    agent_name: str,
+    prediction: models.AgentPrediction,
+    strategy: models.DeployedStrategy,
+    pct_return: float,
+    outcome: str,
+) -> str:
     """
-    MUTATION: ask LLM to improve a failing agent's prompt, giving it full context
-    about what went wrong (win rate, avg return, recent predictions).
-    If streak <= -STREAK_AGGRESSIVE_MUTATE, performs aggressive mutation that also
-    rewrites the CONSTITUTION section (not just EVOLVED_GUIDELINES).
+    Build a rich prompt for exhaustive post-mortem analysis of a closed position.
+    """
+    direction = "LONG" if strategy.strategy_type == "LONG" else "SHORT"
+    was_right = (
+        (direction == "LONG" and pct_return >= 0) or
+        (direction == "SHORT" and pct_return >= 0)
+    )
+
+    original_reasoning = prediction.reasoning or "(no reasoning recorded)"
+
+    return f"""You are conducting an exhaustive post-mortem analysis of a market prediction made by the {agent_name} agent.
+
+=== ORIGINAL PREDICTION ===
+Agent: {agent_name}
+Symbol: {prediction.symbol}
+Call: {prediction.prediction} (deployed as {direction})
+Entry price: ${strategy.entry_price:.4f}
+Exit price: ${strategy.exit_price:.4f}
+Return: {pct_return:+.2f}%
+Outcome: {outcome}
+Prediction timestamp: {prediction.timestamp}
+
+=== ORIGINAL REASONING ===
+{original_reasoning}
+
+=== YOUR TASK ===
+Perform a thorough forensic analysis of this trade. Structure your output EXACTLY as follows:
+
+WHAT_THE_AGENT_SAW:
+<2-4 sentences summarising what data/signals the agent used to justify this call>
+
+WHAT_WENT_WRONG:
+<If a LOSS: What specific signals were wrong or misread? What did the agent over-weight or under-weight? What did it miss entirely?>
+<If a WIN: What signals were correct? Was this luck or skill?>
+
+ROOT_CAUSE:
+<1-2 sentences identifying the single most important mistake (if loss) or edge (if win)>
+
+IMPROVEMENT_RULES:
+<3-5 concrete, actionable rules this agent should follow in the future to avoid repeating this mistake or to replicate this success. Be SPECIFIC to {agent_name}'s methodology. Start each rule with a verb (e.g. "Always check...", "Never go LONG when...", "Weight macro context more heavily when...")>
+
+UPDATED_GUIDELINES_DELTA:
+<Write 2-3 bullet points that should be added or changed in this agent's evolved guidelines section — focus on what was learned from this specific trade>
+
+Keep each section concise but specific. Do NOT be generic. Ground every statement in the actual prediction data above.
+"""
+
+
+def _exhaustive_agent_analysis(
+    db: Session,
+    run_id: str,
+    agent_name: str,
+    prediction: models.AgentPrediction,
+    strategy: models.DeployedStrategy,
+    pct_return: float,
+    outcome: str,
+) -> dict:
+    """
+    Run exhaustive LLM post-mortem on a closed position.
+    Returns parsed sections as a dict.
+    """
+    prompt = _build_exhaustive_analysis_prompt(agent_name, prediction, strategy, pct_return, outcome)
+    _log(db, run_id, "AGENT_ANALYSIS", "IN_PROGRESS",
+         f"Analysing {agent_name}'s {prediction.prediction} call on {prediction.symbol}",
+         agent_name=agent_name)
+
+    response = query_agent(
+        "You are an expert trading post-mortem analyst. Be precise, specific, and brutally honest.",
+        prompt,
+    )
+    if not response:
+        _log(db, run_id, "AGENT_ANALYSIS", "ERROR",
+             f"LLM failed for {agent_name}/{prediction.symbol}", agent_name=agent_name)
+        return {}
+
+    # Parse sections
+    sections = {}
+    section_keys = ["WHAT_THE_AGENT_SAW", "WHAT_WENT_WRONG", "ROOT_CAUSE", "IMPROVEMENT_RULES", "UPDATED_GUIDELINES_DELTA"]
+    for i, key in enumerate(section_keys):
+        pattern = rf"{key}:\s*(.+?)(?={'|'.join(section_keys[i+1:]) or '$'})"
+        m = re.search(rf"{key}:\s*(.+?)(?={'|'.join(section_keys[i+1:]) if i+1 < len(section_keys) else ''}$)", response, re.DOTALL | re.IGNORECASE)
+        if m:
+            sections[key] = m.group(1).strip()
+        else:
+            # Fallback: grab everything after the key
+            start = response.find(key + ":")
+            if start != -1:
+                start += len(key) + 1
+                # Find the next section heading
+                next_pos = len(response)
+                for next_key in section_keys[i+1:]:
+                    pos = response.find(next_key + ":", start)
+                    if pos != -1 and pos < next_pos:
+                        next_pos = pos
+                sections[key] = response[start:next_pos].strip()
+
+    _log(db, run_id, "AGENT_ANALYSIS", "DONE",
+         f"{agent_name} → {outcome} ({pct_return:+.2f}%) | {sections.get('ROOT_CAUSE', '')[:120]}",
+         agent_name=agent_name)
+    return sections
+
+
+def _mutate_prompt_exhaustive(
+    db: Session,
+    run_id: str,
+    agent_name: str,
+    fitness: dict,
+    streak: int,
+    analysis_summaries: list[dict],
+) -> str | None:
+    """
+    MUTATION with exhaustive post-mortem context.
+    analysis_summaries: list of {symbol, outcome, root_cause, improvement_rules, guidelines_delta}
     """
     current = db.query(models.AgentPrompt).filter(
         models.AgentPrompt.agent_name == agent_name
@@ -177,35 +313,45 @@ def _mutate_prompt(db: Session, agent_name: str, fitness: dict, streak: int = 0)
     )
 
     is_aggressive = streak <= -STREAK_AGGRESSIVE_MUTATE
-    streak_note = f"\n⚠️  STREAK ALERT: This agent is on a {abs(streak)}-loss streak. AGGRESSIVE MODE: be radical in your changes." if is_aggressive else ""
+    current_guidelines = _extract_section(current.system_prompt, "EVOLVED_GUIDELINES")
+    current_bias = _extract_section(current.system_prompt, "STRATEGY_BIAS") or "(none set yet)"
+
+    # Format post-mortem summaries
+    postmortem_text = ""
+    for s in analysis_summaries[:5]:  # cap at 5 to avoid token overflow
+        postmortem_text += f"\n--- Trade: {s.get('symbol','?')} ({s.get('outcome','?')}) ---\n"
+        if s.get("root_cause"):
+            postmortem_text += f"Root cause: {s['root_cause']}\n"
+        if s.get("improvement_rules"):
+            postmortem_text += f"Improvement rules:\n{s['improvement_rules']}\n"
+        if s.get("guidelines_delta"):
+            postmortem_text += f"Suggested guidelines update:\n{s['guidelines_delta']}\n"
 
     if is_aggressive:
-        # Aggressive: mutate EVOLVED_GUIDELINES AND add a STRATEGY_BIAS section
-        current_guidelines = _extract_section(current.system_prompt, "EVOLVED_GUIDELINES")
-        current_bias = _extract_section(current.system_prompt, "STRATEGY_BIAS") or ""
-        evolution_context = f"""
-You are an AI agent optimizer performing AGGRESSIVE Darwinian selection on a chronically underperforming market prediction agent.
+        evolution_context = f"""You are an AI agent optimizer performing AGGRESSIVE Darwinian selection on a chronically underperforming market prediction agent.
 
 AGENT: {agent_name}
 CURRENT FITNESS: {fitness['fitness_score']:.1f}/100 (CRITICAL — well below threshold)
 WIN RATE: {fitness['win_rate']*100:.1f}% over last {fitness['total_scored']} predictions
 LOSS STREAK: {abs(streak)} consecutive losses
-AVG RETURN SCORE: {fitness['avg_return']:+.2f} (centred at 0, positive = beating market)
+AVG RETURN SCORE: {fitness['avg_return']:+.2f}
 
 RECENT PREDICTION RECORD:
 {pred_summary}
 
+EXHAUSTIVE POST-MORTEM ANALYSIS OF CLOSED POSITIONS:
+{postmortem_text or "(no positions closed this eval run)"}
+
 CURRENT EVOLVED GUIDELINES:
-{current_guidelines}
+{current_guidelines or "(none)"}
 
 CURRENT STRATEGY BIAS:
-{current_bias or '(none set yet)'}
-{streak_note}
+{current_bias}
 
-This agent is on a LOSING STREAK and needs radical surgery. Rewrite BOTH sections:
+This agent is on a LOSING STREAK and needs radical surgery. Using the post-mortem analysis above as your primary evidence, rewrite BOTH sections:
 
-1. EVOLVED_GUIDELINES — completely overhaul the analysis rules; reverse any biases that have been causing losses; add clear stop rules for the specific patterns that keep failing
-2. STRATEGY_BIAS — write 3-5 concrete directional rules for THIS agent's specific failure mode (e.g. "Do NOT go LONG on high-P/E tech unless earnings beat by >10%", "Always check BTC dominance before altcoin longs")
+1. EVOLVED_GUIDELINES — completely overhaul the analysis rules; reverse any biases that have been causing losses; incorporate the improvement rules from the post-mortem analyses
+2. STRATEGY_BIAS — write 3-5 concrete directional rules that directly address the failure patterns identified in the post-mortems
 
 OUTPUT FORMAT (output BOTH sections, clearly labelled):
 EVOLVED_GUIDELINES:
@@ -224,7 +370,6 @@ Do NOT include section markers (===). Do NOT include the full prompt. Just the t
             return None
         response = response.strip()
 
-        # Parse out the two sections
         guidelines_m = re.search(r"EVOLVED_GUIDELINES:\s*(.+?)(?=STRATEGY_BIAS:|$)", response, re.DOTALL | re.IGNORECASE)
         bias_m = re.search(r"STRATEGY_BIAS:\s*(.+?)$", response, re.DOTALL | re.IGNORECASE)
 
@@ -235,30 +380,28 @@ Do NOT include section markers (===). Do NOT include the full prompt. Just the t
             new_prompt = _replace_section(new_prompt, "STRATEGY_BIAS", bias_m.group(1).strip())
         return new_prompt
     else:
-        # Standard mutation: only EVOLVED_GUIDELINES
-        current_guidelines = _extract_section(current.system_prompt, "EVOLVED_GUIDELINES")
-        if not current_guidelines:
-            current_guidelines = "(No evolved guidelines section found — treat entire prompt as guidelines)"
-
-        evolution_context = f"""
-You are an AI agent optimizer performing Darwinian selection on a market prediction agent.
+        evolution_context = f"""You are an AI agent optimizer performing Darwinian selection on a market prediction agent.
 
 AGENT: {agent_name}
 CURRENT FITNESS: {fitness['fitness_score']:.1f}/100
 WIN RATE: {fitness['win_rate']*100:.1f}% over last {fitness['total_scored']} predictions
-AVG RETURN SCORE: {fitness['avg_return']:+.2f} (centred at 0, positive = beating market)
+AVG RETURN SCORE: {fitness['avg_return']:+.2f}
 
 RECENT PREDICTION RECORD:
 {pred_summary}
 
-CURRENT EVOLVED GUIDELINES (this is the ONLY section you are allowed to change):
-{current_guidelines}
+EXHAUSTIVE POST-MORTEM ANALYSIS OF CLOSED POSITIONS:
+{postmortem_text or "(no positions closed this eval run)"}
 
-This agent is UNDERPERFORMING. Analyse its recent failures and rewrite ONLY the evolved guidelines section to:
-1. Fix the specific weaknesses shown in its prediction record
-2. Add market biases, risk preferences, or sector tilts that address failure patterns
-3. Make it more disciplined about when to go LONG vs SHORT
-4. Keep guidelines actionable and concise (5-10 bullet points max)
+CURRENT EVOLVED GUIDELINES (this is the ONLY section you are allowed to change):
+{current_guidelines or "(No evolved guidelines section found — treat entire prompt as guidelines)"}
+
+This agent is UNDERPERFORMING. Using the post-mortem analysis as your primary evidence, rewrite ONLY the evolved guidelines section to:
+1. Fix the specific weaknesses identified in the post-mortems
+2. Incorporate the improvement rules discovered from closed positions
+3. Add market biases, risk preferences, or sector tilts that address failure patterns
+4. Make it more disciplined about when to go LONG vs SHORT
+5. Keep guidelines actionable and concise (5-10 bullet points max)
 
 IMPORTANT: Output ONLY the evolved guidelines text. Do NOT include section markers, commentary, or the full prompt.
 Do NOT change the agent's identity, analysis framework, or output format.
@@ -353,18 +496,23 @@ def _save_rank(db: Session, agent_name: str, rank: int):
         db.add(models.AppConfig(key=key, value=str(rank)))
 
 
-def _run_darwin_selection(db: Session):
+def _run_darwin_selection(
+    db: Session,
+    run_id: str,
+    agent_analysis_map: dict,  # {agent_name: [analysis_dict, ...]}
+):
     """
-    Darwinian selection loop:
+    Darwinian selection loop with exhaustive post-mortem context:
     1. Compute fitness + streaks for all agents
     2. Rank them; write competitive rank-change memory notes
-    3. Mutate bottom performers (aggressive if on losing streak); crossover with elite
+    3. Mutate bottom performers using post-mortem insights; crossover with elite
     4. Archive old prompts, write new ones, log to memory
     """
-    print("[Darwin] Running selection pressure evaluation...")
+    _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS", "Running selection pressure evaluation")
 
     agent_prompts = db.query(models.AgentPrompt).all()
     if not agent_prompts:
+        _log(db, run_id, "DARWIN_SELECTION", "DONE", "No agent prompts found — skipped")
         return
 
     fitness_map = {}
@@ -373,10 +521,12 @@ def _run_darwin_selection(db: Session):
         f = _compute_fitness(db, ap.agent_name)
         fitness_map[ap.agent_name] = f
         streak_map[ap.agent_name] = _compute_streak(db, ap.agent_name)
-        score_str = f"{f['fitness_score']:.1f}" if f['fitness_score'] is not None else "N/A"
-        streak = streak_map[ap.agent_name]
-        streak_str = f"+{streak}" if streak > 0 else str(streak)
-        print(f"[Darwin] {ap.agent_name}: fitness={score_str}, scored={f['total_scored']}, streak={streak_str}")
+
+    fitness_summary = " | ".join(
+        f"{n}: {f['fitness_score']:.1f}" if f['fitness_score'] is not None else f"{n}: N/A"
+        for n, f in fitness_map.items()
+    )
+    _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS", f"Fitness: {fitness_summary}")
 
     # Need minimum predictions before making evolution decisions
     eligible = {
@@ -385,7 +535,8 @@ def _run_darwin_selection(db: Session):
     }
 
     if not eligible:
-        print(f"[Darwin] Not enough scored predictions yet (need {MIN_SCORED_FOR_DARWIN} per agent). Skipping.")
+        _log(db, run_id, "DARWIN_SELECTION", "DONE",
+             f"Not enough scored predictions yet (need {MIN_SCORED_FOR_DARWIN} per agent). Skipping evolution.")
         return
 
     # Sort by fitness — best first (rank 1 = best)
@@ -394,7 +545,6 @@ def _run_darwin_selection(db: Session):
     best_name  = ranked[0][0]
     best_score = ranked[0][1]["fitness_score"]
     total = len(ranked)
-    print(f"[Darwin] Elite agent: {best_name} (fitness={best_score:.1f})")
 
     # ── Write competitive rank-change memory notes ─────────────────────────
     for pos, (agent_name, fitness) in enumerate(ranked):
@@ -405,7 +555,6 @@ def _run_darwin_selection(db: Session):
         if prev_rank is not None and prev_rank != current_rank:
             score = fitness["fitness_score"]
             if current_rank < prev_rank:
-                # Climbed the leaderboard
                 write_agent_memory(
                     db, agent_name, "INSIGHT",
                     f"[Leaderboard] You climbed from rank {prev_rank} → #{current_rank}/{total} "
@@ -414,7 +563,6 @@ def _run_darwin_selection(db: Session):
                     importance_score=0.9,
                 )
             else:
-                # Dropped
                 write_agent_memory(
                     db, agent_name, "LESSON",
                     f"[Leaderboard] You dropped from rank {prev_rank} → #{current_rank}/{total} "
@@ -422,7 +570,6 @@ def _run_darwin_selection(db: Session):
                     importance_score=0.9,
                 )
         elif prev_rank is None and current_rank == 1:
-            # First appearance at top
             write_agent_memory(
                 db, agent_name, "INSIGHT",
                 f"[Leaderboard] You are the #1 ranked agent (fitness {fitness['fitness_score']:.1f}/100). "
@@ -431,12 +578,14 @@ def _run_darwin_selection(db: Session):
             )
         db.commit()
 
+    evolved_agents = []
     for agent_name, fitness in ranked:
         score = fitness["fitness_score"]
         streak = streak_map.get(agent_name, 0)
 
         if score >= FITNESS_THRESHOLD and streak > -STREAK_AGGRESSIVE_MUTATE:
-            print(f"[Darwin] {agent_name} fitness {score:.1f} is acceptable. No change.")
+            _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS",
+                 f"{agent_name}: fitness {score:.1f} acceptable — no evolution needed", agent_name=agent_name)
             continue
 
         # Decide: crossover if elite is available and strong, otherwise mutate
@@ -446,21 +595,29 @@ def _run_darwin_selection(db: Session):
         if not current_prompt:
             continue
 
+        agent_postmortems = agent_analysis_map.get(agent_name, [])
+
         if best_name != agent_name and best_score >= CROSSOVER_THRESHOLD and streak > -STREAK_AGGRESSIVE_MUTATE:
-            print(f"[Darwin] {agent_name} fitness={score:.1f} → CROSSOVER with {best_name}")
             reason = "CROSSOVER"
+            _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS",
+                 f"{agent_name}: fitness={score:.1f} → CROSSOVER with {best_name}", agent_name=agent_name)
             new_prompt = _crossover_prompt(db, agent_name, best_name, fitness)
         elif streak <= -STREAK_AGGRESSIVE_MUTATE:
-            print(f"[Darwin] {agent_name} streak={streak} → AGGRESSIVE MUTATION")
             reason = f"AGGRESSIVE_MUTATION (streak {streak})"
-            new_prompt = _mutate_prompt(db, agent_name, fitness, streak=streak)
+            _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS",
+                 f"{agent_name}: streak={streak} → AGGRESSIVE MUTATION with {len(agent_postmortems)} post-mortems",
+                 agent_name=agent_name)
+            new_prompt = _mutate_prompt_exhaustive(db, run_id, agent_name, fitness, streak, agent_postmortems)
         else:
-            print(f"[Darwin] {agent_name} fitness={score:.1f} → MUTATION")
             reason = "MUTATION"
-            new_prompt = _mutate_prompt(db, agent_name, fitness, streak=streak)
+            _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS",
+                 f"{agent_name}: fitness={score:.1f} → MUTATION with {len(agent_postmortems)} post-mortems",
+                 agent_name=agent_name)
+            new_prompt = _mutate_prompt_exhaustive(db, run_id, agent_name, fitness, streak, agent_postmortems)
 
         if not new_prompt or "Agent error" in new_prompt:
-            print(f"[Darwin] LLM failed to produce a new prompt for {agent_name}. Skipping.")
+            _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS",
+                 f"{agent_name}: LLM failed to produce new prompt — skipped", agent_name=agent_name)
             continue
 
         # Archive old prompt
@@ -480,75 +637,213 @@ def _run_darwin_selection(db: Session):
             f"to improve performance. Adapt your strategy accordingly."
         )
         db.commit()
-        print(f"[Darwin] {agent_name} evolved via {reason} → generation {generation}")
 
-    print("[Darwin] Selection complete.")
+        evolved_agents.append({"agent": agent_name, "reason": reason, "generation": generation, "fitness": score})
+        _log(db, run_id, "DARWIN_SELECTION", "IN_PROGRESS",
+             f"{agent_name} evolved → generation {generation} via {reason}", agent_name=agent_name)
+
+    summary = f"Evolution complete. Evolved {len(evolved_agents)} agent(s): {', '.join(a['agent'] for a in evolved_agents) or 'none'}"
+    _log(db, run_id, "DARWIN_SELECTION", "DONE", summary)
+    return evolved_agents
 
 
 # ── Public entry point ───────────────────────────────────────────────────────
 
 def evaluate_predictions():
     """
-    1. Score active deployed strategies against live prices.
-    2. Close strategies at stop-loss / take-profit.
-    3. Run Darwinian selection on underperforming agents.
+    Exhaustive evaluation pipeline:
+    1. Create a PipelineRun of type "eval"
+    2. PRICE_FETCH — score active deployed strategies against live prices
+    3. SCORE_STRATEGIES — update prediction scores
+    4. CLOSE_POSITIONS — close at stop-loss / take-profit with exhaustive post-mortem analysis
+    5. DARWIN_SELECTION — evolve underperforming agents using post-mortem insights
+    6. MEMORY_WRITE — write final lessons and prune old memory
     """
     db = SessionLocal()
-    print("--- Running Evaluation Loop ---")
+    run_id = str(uuid.uuid4())
 
-    # ── Score active strategies ──────────────────────────────────────────────
-    active_strategies = db.query(models.DeployedStrategy).filter(
-        models.DeployedStrategy.status == "ACTIVE"
-    ).all()
+    # ── Create eval pipeline run ──────────────────────────────────────────────
+    run = models.PipelineRun(
+        run_id=run_id,
+        run_type="eval",
+        step="pending",
+    )
+    db.add(run)
+    db.commit()
 
-    for strategy in active_strategies:
-        print(f"Evaluating: {strategy.strategy_type} {strategy.symbol}")
+    _log(db, run_id, "START", "IN_PROGRESS", "Evaluation pipeline started")
+    _update_run(db, run, "running")
 
-        current_data = fetch_market_data(strategy.symbol)
-        if not current_data:
-            print(f"Could not fetch data for {strategy.symbol}")
-            continue
+    try:
+        # ── PRICE_FETCH ───────────────────────────────────────────────────────
+        _log(db, run_id, "PRICE_FETCH", "IN_PROGRESS", "Fetching live prices for active strategies")
 
-        current_price = current_data.price
-        entry_price   = strategy.entry_price
+        active_strategies = db.query(models.DeployedStrategy).filter(
+            models.DeployedStrategy.status == "ACTIVE"
+        ).all()
 
-        if strategy.strategy_type == "LONG":
-            pct_return = ((current_price - entry_price) / entry_price) * 100
+        if not active_strategies:
+            _log(db, run_id, "PRICE_FETCH", "DONE", "No active strategies to evaluate")
         else:
-            pct_return = ((entry_price - current_price) / entry_price) * 100
+            _log(db, run_id, "PRICE_FETCH", "IN_PROGRESS",
+                 f"Fetching prices for {len(active_strategies)} active position(s): "
+                 f"{', '.join(s.symbol for s in active_strategies)}")
 
-        strategy.current_return = pct_return
-        print(f"  {strategy.symbol}: entry=${entry_price:.2f} current=${current_price:.2f} return={pct_return:+.2f}%")
+        price_data = {}
+        failed_fetches = []
+        for strategy in active_strategies:
+            current_data = fetch_market_data(strategy.symbol)
+            if current_data:
+                price_data[strategy.id] = current_data.price
+            else:
+                failed_fetches.append(strategy.symbol)
 
-        _write_performance_feedback(db, strategy, current_price, pct_return)
+        if failed_fetches:
+            _log(db, run_id, "PRICE_FETCH", "IN_PROGRESS",
+                 f"Could not fetch: {', '.join(failed_fetches)}")
 
-        if pct_return <= STOP_LOSS_PCT:
+        _log(db, run_id, "PRICE_FETCH", "DONE",
+             f"Fetched {len(price_data)}/{len(active_strategies)} prices successfully")
+
+        # ── SCORE_STRATEGIES ──────────────────────────────────────────────────
+        _log(db, run_id, "SCORE_STRATEGIES", "IN_PROGRESS", "Scoring strategies against live prices")
+        _update_run(db, run, "score_strategies")
+
+        score_lines = []
+        strategies_to_close = []
+        for strategy in active_strategies:
+            current_price = price_data.get(strategy.id)
+            if not current_price:
+                continue
+
+            entry_price = strategy.entry_price
+            if strategy.strategy_type == "LONG":
+                pct_return = ((current_price - entry_price) / entry_price) * 100
+            else:
+                pct_return = ((entry_price - current_price) / entry_price) * 100
+
+            strategy.current_return = pct_return
+            score_lines.append(
+                f"{strategy.symbol} ({strategy.strategy_type}): "
+                f"entry=${entry_price:.2f} now=${current_price:.2f} return={pct_return:+.2f}%"
+            )
+
+            # Update prediction scores (mark partial performance)
+            _write_performance_feedback(db, strategy, current_price, pct_return)
+
+            if pct_return <= STOP_LOSS_PCT:
+                strategies_to_close.append((strategy, current_price, pct_return, "STOP_LOSS"))
+            elif pct_return >= TAKE_PROFIT_PCT:
+                strategies_to_close.append((strategy, current_price, pct_return, "TAKE_PROFIT"))
+
+        db.commit()
+
+        _log(db, run_id, "SCORE_STRATEGIES", "DONE",
+             "\n".join(score_lines) if score_lines else "No positions to score")
+
+        # ── CLOSE_POSITIONS + EXHAUSTIVE ANALYSIS ────────────────────────────
+        _log(db, run_id, "CLOSE_POSITIONS", "IN_PROGRESS",
+             f"{len(strategies_to_close)} position(s) hit threshold — running exhaustive post-mortem analysis")
+        _update_run(db, run, "close_positions")
+
+        # {agent_name: [analysis_dict, ...]} accumulated for Darwin selection
+        agent_analysis_map: dict[str, list] = {}
+
+        for strategy, current_price, pct_return, close_reason in strategies_to_close:
             strategy.status = "CLOSED"
             strategy.exit_price = current_price
-            strategy.close_reason = "STOP_LOSS"
+            strategy.close_reason = close_reason
             strategy.closed_at = datetime.utcnow()
             if strategy.position_size:
                 strategy.realized_pnl = round(strategy.position_size * pct_return / 100, 2)
-            _write_closure_feedback(db, strategy, pct_return, "STOP_LOSS")
-            print(f"  Stop-loss triggered at {pct_return:.2f}%. Strategy closed.")
-        elif pct_return >= TAKE_PROFIT_PCT:
-            strategy.status = "CLOSED"
-            strategy.exit_price = current_price
-            strategy.close_reason = "TAKE_PROFIT"
-            strategy.closed_at = datetime.utcnow()
-            if strategy.position_size:
-                strategy.realized_pnl = round(strategy.position_size * pct_return / 100, 2)
-            _write_closure_feedback(db, strategy, pct_return, "TAKE_PROFIT")
-            print(f"  Take-profit triggered at {pct_return:.2f}%. Strategy closed.")
+            db.commit()
 
-    db.commit()
+            outcome = "WIN" if close_reason == "TAKE_PROFIT" else "LOSS"
+            _log(db, run_id, "CLOSE_POSITIONS", "IN_PROGRESS",
+                 f"Closed {strategy.symbol} ({strategy.strategy_type}): {close_reason} at {pct_return:+.2f}%")
 
-    # ── Darwinian selection ──────────────────────────────────────────────────
-    _run_darwin_selection(db)
+            # Find all agents that predicted this symbol — run exhaustive analysis per agent
+            agent_preds = (
+                db.query(models.AgentPrediction)
+                .filter(models.AgentPrediction.symbol == strategy.symbol)
+                .order_by(models.AgentPrediction.timestamp.desc())
+                .limit(1)
+                .all()
+            )
 
-    db.commit()
-    db.close()
-    print("--- Evaluation Complete ---")
+            for pred in agent_preds:
+                analysis = _exhaustive_agent_analysis(
+                    db, run_id, pred.agent_name, pred, strategy, pct_return, outcome
+                )
+                if analysis:
+                    analysis["symbol"] = strategy.symbol
+                    analysis["outcome"] = outcome
+                    if pred.agent_name not in agent_analysis_map:
+                        agent_analysis_map[pred.agent_name] = []
+                    agent_analysis_map[pred.agent_name].append(analysis)
+
+                    # Write improvement rules as memory
+                    if analysis.get("improvement_rules"):
+                        write_agent_memory(
+                            db, pred.agent_name, "LESSON",
+                            f"[Post-mortem {strategy.symbol} {outcome}] {analysis['improvement_rules'][:400]}",
+                            importance_score=0.85,
+                            ticker_refs=strategy.symbol,
+                        )
+                    if analysis.get("what_went_wrong") or analysis.get("WHAT_WENT_WRONG"):
+                        wrong = analysis.get("WHAT_WENT_WRONG") or analysis.get("what_went_wrong", "")
+                        if wrong:
+                            write_agent_memory(
+                                db, pred.agent_name, "OBSERVATION",
+                                f"[Post-mortem {strategy.symbol}] What went {'right' if outcome=='WIN' else 'wrong'}: {wrong[:300]}",
+                                importance_score=0.75,
+                                ticker_refs=strategy.symbol,
+                            )
+                    db.commit()
+
+            # Write closure lessons via existing helper
+            _write_closure_feedback(db, strategy, pct_return, close_reason)
+
+        closed_count = len(strategies_to_close)
+        if closed_count == 0:
+            _log(db, run_id, "CLOSE_POSITIONS", "DONE", "No positions closed this run")
+        else:
+            _log(db, run_id, "CLOSE_POSITIONS", "DONE",
+                 f"Closed {closed_count} position(s). Post-mortems completed for {len(agent_analysis_map)} agent(s).")
+
+        # ── DARWIN_SELECTION ──────────────────────────────────────────────────
+        _update_run(db, run, "darwin_selection")
+        evolved = _run_darwin_selection(db, run_id, agent_analysis_map)
+
+        # ── MEMORY_WRITE ──────────────────────────────────────────────────────
+        _log(db, run_id, "MEMORY_WRITE", "IN_PROGRESS", "Writing final memories and pruning")
+        _update_run(db, run, "memory_write")
+
+        all_agents = db.query(models.AgentPrompt).all()
+        for ap in all_agents:
+            prune_old_memory(db, ap.agent_name, keep=200)
+
+        _log(db, run_id, "MEMORY_WRITE", "DONE",
+             f"Memory pruned. {len(all_agents)} agent(s) maintained at ≤200 notes.")
+
+        # ── Finish ────────────────────────────────────────────────────────────
+        evolved_summary = ""
+        if evolved:
+            evolved_summary = f" Evolved: {', '.join(a['agent'] for a in evolved)}."
+
+        _log(db, run_id, "START", "DONE",
+             f"Evaluation complete. {len(active_strategies)} positions scored, "
+             f"{closed_count} closed.{evolved_summary}")
+        _update_run(db, run, "done")
+
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()
+        _log(db, run_id, "ERROR", "ERROR", f"Evaluation pipeline failed: {e}\n{err[:500]}")
+        _update_run(db, run, "error")
+    finally:
+        db.commit()
+        db.close()
 
 
 def _write_performance_feedback(db: Session, strategy, current_price: float, pct_return: float):

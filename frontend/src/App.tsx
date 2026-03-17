@@ -434,6 +434,23 @@ function AppInner() {
       .catch(() => {});
   };
 
+  const handleEvalTrigger = () => {
+    if (isTriggering) return;
+    isTriggeringRef.current = true;
+    setIsTriggering(true);
+    setTimeout(() => { triggerPollRef.current?.(); }, 500);
+    apiFetch('/eval/trigger', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'error') { isTriggeringRef.current = false; setIsTriggering(false); toast(data.message, 'err'); }
+        else {
+          toast('Evaluation pipeline started', 'ok');
+          setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000);
+        }
+      })
+      .catch(() => { isTriggeringRef.current = false; setIsTriggering(false); });
+  };
+
   const saveAgentPrompt = (agentName: string, prompt: string) => {
     setEditingPromptAgent(null);
     apiFetch(`/agents/${encodeURIComponent(agentName)}/prompt`, {
@@ -644,6 +661,7 @@ function AppInner() {
             setTickerSearchLoading={setTickerSearchLoading}
             handleManualTrigger={handleManualTrigger}
             handleStopPipeline={handleStopPipeline}
+            handleEvalTrigger={handleEvalTrigger}
             enabledMarketNames={enabledMarketNames}
             openReport={openReport}
           />
