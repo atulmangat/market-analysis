@@ -150,12 +150,16 @@ npm run dev
 
 ## Deployment (Vercel)
 
-```bash
-# Backend
-cd backend && npx vercel --prod
+> Auto-deploy on git push is **disabled**. Always deploy manually.
 
-# Frontend
-cd frontend && npx vercel --prod
+```bash
+# Frontend → market-analysis.space (deploy from repo ROOT)
+cd market-analysis
+npx vercel --prod --yes
+
+# Backend → backend-jet-nine-93.vercel.app
+cd backend
+npx vercel --prod --yes
 ```
 
 **Backend env vars** (set in Vercel project settings):
@@ -195,32 +199,44 @@ Agents **evolve**: after enough losing trades, the validator triggers an LLM ref
 ```
 market-analysis/
 ├── backend/
-│   ├── main.py             # FastAPI app + APScheduler
-│   ├── api.py              # REST endpoints + report generation
-│   ├── orchestrator.py     # Agent prompts + debate logic
-│   ├── pipeline.py         # Full pipeline run (research → debate → deploy)
-│   ├── validator.py        # P&L scoring + agent evolution
-│   ├── memory_manager.py   # Per-agent persistent notes (max 50)
-│   ├── web_research.py     # RSS feeds + Stocktwits + yfinance
-│   ├── data_ingestion.py   # Live price fetching
-│   ├── models.py           # SQLAlchemy models
-│   ├── database.py         # DB connection + idempotent migrations
-│   └── agents.py           # OpenRouter LLM wrapper (primary + fallback)
+│   ├── main.py                   # FastAPI app + APScheduler cron setup
+│   ├── api/routes.py             # All REST endpoints under /api
+│   ├── pipeline/
+│   │   ├── runner.py             # Full pipeline run (research → KG → debate → deploy)
+│   │   ├── orchestrator.py       # Agent prompts, debate logic, judge
+│   │   └── validator.py          # P&L scoring + agent prompt evolution
+│   ├── agents/
+│   │   ├── llm.py                # OpenRouter wrapper (primary + fallback model)
+│   │   └── memory.py             # Per-agent persistent notes (max 50)
+│   ├── graph/knowledge.py        # KG ingest + 2-hop BFS retrieval
+│   ├── data/
+│   │   ├── research.py           # Google News RSS + Yahoo Finance fetcher
+│   │   ├── market.py             # Live price via yfinance
+│   │   ├── fundamentals.py       # Fundamentals enrichment (Alpha Vantage / Finnhub)
+│   │   └── macro.py              # Macro data (FRED)
+│   └── core/
+│       ├── models.py             # SQLAlchemy models
+│       ├── database.py           # Neon PostgreSQL session factory
+│       ├── cache.py              # Two-level DB-backed cache
+│       └── auth.py               # JWT auth
 ├── frontend/
 │   └── src/
-│       └── App.tsx         # React app (single file)
-└── CLAUDE.md               # AI coding instructions
+│       ├── App.tsx               # Main orchestrator — all state, effects, handlers
+│       ├── pages/                # Dashboard, Markets, Portfolio, Pipeline, KnowledgeGraph, Settings, Agents
+│       ├── components/           # Badge, StatusChip, StatPill, KnowledgeGraphViewer, …
+│       └── templates/            # Stock/Crypto/Commodity report panels
+└── CLAUDE.md                     # AI coding instructions
 ```
 
 ---
 
 ## Key Data Flows
 
-**Debate cycle:**
-`run_debate()` → fetch RSS/Stocktwits (cached 30 min) → inject per-ticker fundamentals + memory into each agent → LLM response → regex extract ticker/action → majority vote → deploy `DeployedStrategy` → generate report → write `AgentMemory`
+**Pipeline cycle:**
+`run_full_pipeline()` → fetch news/RSS (cached 30 min) → KG ingest (LLM extracts EVENT nodes + edges, 150s timeout) → 4 agents query OpenRouter in parallel with research + KG subgraph + memory → judge picks best trade → deploy `DeployedStrategy` → write `AgentMemory`
 
 **Evaluation cycle:**
-`evaluate_predictions()` → fetch live prices → update `current_return` → write STRATEGY_RESULT/LESSON memory → close at stop-loss/take-profit → auto-improve low-scoring agent prompts
+`evaluate_predictions()` → fetch live prices → update `current_return` → write STRATEGY_RESULT/LESSON memory → close at −10% stop-loss / +15% take-profit → auto-improve low-scoring agent prompts via LLM reflection
 
 **Report:**
 Pre-generated at pipeline time (chart + fundamentals cached on `DebateRound.report_json`) → served instantly from cache, no blocking yfinance calls on request
