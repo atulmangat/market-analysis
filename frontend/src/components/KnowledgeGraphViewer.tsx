@@ -4,10 +4,10 @@ import type { KGNode, KnowledgeGraph } from '../types';
 import { KG_COLORS } from '../constants';
 import { apiFetch } from '../utils';
 
-export function KnowledgeGraphViewer() {
+export function KnowledgeGraphViewer({ refreshTrigger }: { refreshTrigger?: number }) {
   const [graph, setGraph]           = useState<KnowledgeGraph | null>(null);
   const [loading, setLoading]       = useState(false);
-  const [filter, setFilter]         = useState<'ALL' | 'ASSET' | 'ENTITY' | 'EVENT' | 'INDICATOR'>('ALL');
+  const [filter, setFilter]         = useState<'ALL' | 'ASSET' | 'ENTITY' | 'EVENT' | 'INDICATOR' | 'MARKET'>('ALL');
   const [selectedNode, setSelectedNode] = useState<KGNode | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
   const [highlightIds, setHighlightIds] = useState<Set<string>>(new Set());
@@ -44,6 +44,8 @@ export function KnowledgeGraphViewer() {
   };
 
   useEffect(() => { loadGraph(); }, []);
+  // Reload whenever the pipeline KG_INGEST step completes
+  useEffect(() => { if (refreshTrigger) loadGraph(); }, [refreshTrigger]);
 
   // Zoom to fit after graph data loads
   useEffect(() => {
@@ -162,7 +164,7 @@ export function KnowledgeGraphViewer() {
         <div>
           <h2 className="text-base font-semibold text-textMain">Knowledge Graph</h2>
           <p className="text-[11px] text-textDim mt-0.5">
-            {graph ? `${graph.nodes.length} nodes · ${graph.edges.length} edges — drag to explore, scroll to zoom, click node for details` : 'Persistent market intelligence network — updated each pipeline run'}
+            {graph ? `${graph.nodes.length} nodes · ${graph.edges.length} edges — drag to explore, scroll to zoom, click node for details` : 'Persistent event & entity network — updated each pipeline run'}
           </p>
         </div>
         <button onClick={loadGraph} disabled={loading}
@@ -194,7 +196,7 @@ export function KnowledgeGraphViewer() {
 
       {/* Filter bar */}
       <div className="flex gap-2 flex-wrap">
-        {(['ALL', 'ASSET', 'ENTITY', 'EVENT', 'INDICATOR'] as const).map(t => (
+        {(['ALL', 'ASSET', 'ENTITY', 'EVENT', 'INDICATOR', 'MARKET'] as const).map(t => (
           <button key={t} onClick={() => setFilter(t)}
             className={`text-[10px] px-2.5 py-1 rounded-full border transition-colors ${
               filter === t
@@ -222,8 +224,8 @@ export function KnowledgeGraphViewer() {
         <span className="text-[10px] text-textDim ml-2 opacity-60">· node size = connection count</span>
       </div>
 
-      {/* Force Graph canvas */}
-      <div ref={containerRef} className="rounded-xl border border-borderLight overflow-hidden bg-surface2">
+      {/* Force Graph canvas + inline detail panel */}
+      <div ref={containerRef} className="rounded-xl border border-borderLight overflow-hidden bg-surface2 relative">
         {loading ? (
           <div className="flex items-center justify-center text-textDim text-sm" style={{ height: dims.h }}>Loading graph…</div>
         ) : !graph || graph.nodes.length === 0 ? (
@@ -236,7 +238,7 @@ export function KnowledgeGraphViewer() {
           <ForceGraph2D
             ref={fgRef}
             graphData={fgData}
-            width={dims.w}
+            width={selectedNode ? dims.w * 0.58 : dims.w}
             height={dims.h}
             backgroundColor="#0f172a"
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -265,92 +267,126 @@ export function KnowledgeGraphViewer() {
             d3VelocityDecay={0.3}
           />
         )}
-      </div>
 
-      {/* Selected node detail panel */}
-      {selectedNode && graph && (
-        <div className="bg-surface2 border border-borderLight rounded-xl p-4 space-y-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: KG_COLORS[selectedNode.type] }} />
-              <span className="text-sm font-semibold text-textMain">{selectedNode.label}</span>
-              <span className="text-[10px] text-textDim font-mono">{selectedNode.id}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] px-2 py-0.5 rounded font-semibold"
-                style={{ background: KG_COLORS[selectedNode.type] + '22', color: KG_COLORS[selectedNode.type] }}>
-                {selectedNode.type}
-              </span>
-              <span className="text-[10px] text-textDim">{degreeMap[selectedNode.id] ?? 0} connections</span>
-              <button onClick={() => { setSelectedNode(null); setHighlightIds(new Set()); }}
-                className="text-textDim hover:text-textMain text-sm leading-none">×</button>
+        {/* Inline detail panel — overlays on the right side of the canvas */}
+        {selectedNode && graph && (
+          <div
+            className="absolute top-0 right-0 bottom-0 bg-surface/95 border-l border-borderLight overflow-y-auto"
+            style={{ width: '42%' }}
+          >
+            <div className="p-4 space-y-3">
+              {/* Header */}
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className="w-3 h-3 rounded-full shrink-0" style={{ background: KG_COLORS[selectedNode.type] }} />
+                  <span className="text-sm font-semibold text-textMain truncate">{selectedNode.label}</span>
+                </div>
+                <button onClick={() => { setSelectedNode(null); setHighlightIds(new Set()); }}
+                  className="text-textDim hover:text-textMain text-lg leading-none shrink-0">×</button>
+              </div>
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[10px] px-2 py-0.5 rounded font-semibold"
+                  style={{ background: KG_COLORS[selectedNode.type] + '22', color: KG_COLORS[selectedNode.type] }}>
+                  {selectedNode.type}
+                </span>
+                <span className="text-[10px] text-textDim">{degreeMap[selectedNode.id] ?? 0} connections</span>
+                <span className="text-[10px] text-textDim font-mono opacity-60 truncate">{selectedNode.id}</span>
+              </div>
+
+              {/* Relationships */}
+              {(() => {
+                const nodeEdges = graph.edges.filter(
+                  e => e.source === selectedNode.id || e.target === selectedNode.id
+                );
+                if (!nodeEdges.length) return <p className="text-[11px] text-textDim">No relationships found.</p>;
+                return (
+                  <div className="space-y-1">
+                    <p className="text-[10px] text-textDim uppercase tracking-wider font-semibold">Relationships ({nodeEdges.length})</p>
+                    {nodeEdges.slice(0, 12).map((e, i) => {
+                      const isOutbound = e.source === selectedNode.id;
+                      const otherId = isOutbound ? e.target : e.source;
+                      const other = nodesById[otherId];
+                      return (
+                        <div key={i} className="flex items-center gap-2 text-[11px] text-textMuted">
+                          <span className="font-mono text-textDim w-4 text-center shrink-0">{isOutbound ? '→' : '←'}</span>
+                          <button onClick={() => other && handleNodeClick(other)}
+                            className="text-brand-400 hover:underline truncate">
+                            {other?.label ?? otherId}
+                          </button>
+                          <span className="text-textDim text-[10px] shrink-0">{relLabel(e.relation)}</span>
+                          <span className="ml-auto text-textDim text-[10px] shrink-0">{(e.confidence * 100).toFixed(0)}%</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                );
+              })()}
+
+              {/* EVENT metadata */}
+              {selectedNode.type === 'EVENT' && (() => {
+                const m = selectedNode.metadata as Record<string, unknown>;
+                const dir = String(m.direction ?? '');
+                const mag = String(m.magnitude ?? '');
+                const exp = m.expires_days ? String(m.expires_days) : '';
+                const sum = String(m.summary ?? '');
+                const catalyst = String(m.catalyst_type ?? '');
+                const region = String(m.source_region ?? '');
+                const keyNums = Array.isArray(m.key_numbers) ? m.key_numbers as string[] : [];
+                const targets = Array.isArray(m.price_targets) ? m.price_targets as string[] : [];
+                const extractedAt = m.extracted_at ? new Date(String(m.extracted_at)).toLocaleDateString() : '';
+                if (!dir && !sum) return null;
+                return (
+                  <div className="space-y-2.5 border-t border-borderLight pt-3">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      {dir && (
+                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded ${
+                          dir.includes('bullish') ? 'bg-up/10 text-up' :
+                          dir.includes('bearish') ? 'bg-down/10 text-down' :
+                          'bg-surface3 text-textDim'
+                        }`}>{dir.toUpperCase()}</span>
+                      )}
+                      {mag && <span className="text-[10px] bg-surface3 text-textDim px-2 py-0.5 rounded">{mag.toUpperCase()}</span>}
+                      {catalyst && <span className="text-[10px] bg-brand-500/10 text-brand-400 px-2 py-0.5 rounded">{catalyst}</span>}
+                      {region && <span className="text-[10px] text-textDim px-2 py-0.5 rounded border border-borderLight">{region}</span>}
+                      {exp && <span className="text-[10px] text-textDim">expires {exp}d</span>}
+                    </div>
+                    {sum && <p className="text-[11px] text-textMuted leading-relaxed">{sum}</p>}
+                    {keyNums.length > 0 && (
+                      <div className="space-y-1">
+                        <p className="text-[10px] text-textDim uppercase tracking-wider font-semibold">Key Numbers</p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {keyNums.map((n, i) => (
+                            <span key={i} className="text-[10px] font-mono bg-surface3 text-textMain px-2 py-0.5 rounded">{n}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {targets.length > 0 && (
+                      <div className="space-y-1">
+                        <p className="text-[10px] text-textDim uppercase tracking-wider font-semibold">Analyst Calls</p>
+                        <div className="space-y-0.5">
+                          {targets.map((t, i) => (
+                            <p key={i} className="text-[10px] text-textMuted font-mono">· {t}</p>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {extractedAt && <p className="text-[9px] text-textDim">extracted {extractedAt}</p>}
+                  </div>
+                );
+              })()}
+
+              {/* Subgraph drill-down for assets */}
+              {selectedNode.type === 'ASSET' && selectedNode.symbol && (
+                <button onClick={() => { loadSubgraph(selectedNode.symbol!); setSelectedNode(null); setHighlightIds(new Set()); }}
+                  className="text-[11px] text-brand-400 hover:text-brand-300 hover:underline">
+                  Focus 2-hop subgraph on {selectedNode.symbol} →
+                </button>
+              )}
             </div>
           </div>
-
-          {/* Relationships */}
-          {(() => {
-            const nodeEdges = graph.edges.filter(
-              e => e.source === selectedNode.id || e.target === selectedNode.id
-            );
-            if (!nodeEdges.length) return <p className="text-[11px] text-textDim">No relationships found.</p>;
-            return (
-              <div className="space-y-1">
-                <p className="text-[10px] text-textDim uppercase tracking-wider font-semibold">Relationships ({nodeEdges.length})</p>
-                {nodeEdges.slice(0, 12).map((e, i) => {
-                  const isOutbound = e.source === selectedNode.id;
-                  const otherId = isOutbound ? e.target : e.source;
-                  const other = nodesById[otherId];
-                  return (
-                    <div key={i} className="flex items-center gap-2 text-[11px] text-textMuted">
-                      <span className="font-mono text-textDim w-4 text-center">{isOutbound ? '→' : '←'}</span>
-                      <button onClick={() => other && handleNodeClick(other)}
-                        className="text-brand-400 hover:underline truncate max-w-[140px]">
-                        {other?.label ?? otherId}
-                      </button>
-                      <span className="text-textDim text-[10px]">{relLabel(e.relation)}</span>
-                      <span className="ml-auto text-textDim text-[10px]">{(e.confidence * 100).toFixed(0)}%</span>
-                    </div>
-                  );
-                })}
-              </div>
-            );
-          })()}
-
-          {/* EVENT metadata */}
-          {selectedNode.type === 'EVENT' && (() => {
-            const m = selectedNode.metadata as Record<string, string | number>;
-            const dir = String(m.direction ?? '');
-            const mag = String(m.magnitude ?? '');
-            const exp = m.expires_days ? String(m.expires_days) : '';
-            const sum = String(m.summary ?? '');
-            if (!dir && !sum) return null;
-            return (
-              <div className="space-y-1.5 border-t border-borderLight pt-3">
-                {dir && (
-                  <div className="flex items-center gap-2">
-                    <span className={`text-[10px] font-semibold px-2 py-0.5 rounded ${
-                      dir === 'bullish' ? 'bg-up/10 text-up' :
-                      dir === 'bearish' ? 'bg-down/10 text-down' :
-                      'bg-surface3 text-textDim'
-                    }`}>{dir.toUpperCase()}</span>
-                    {mag && <span className="text-[10px] text-textDim">{mag.toUpperCase()} IMPACT</span>}
-                    {exp && <span className="text-[10px] text-textDim ml-auto">expires {exp}d</span>}
-                  </div>
-                )}
-                {sum && <p className="text-[11px] text-textMuted leading-relaxed">{sum}</p>}
-              </div>
-            );
-          })()}
-
-          {/* Subgraph drill-down for assets */}
-          {selectedNode.type === 'ASSET' && selectedNode.symbol && (
-            <button onClick={() => { loadSubgraph(selectedNode.symbol!); setSelectedNode(null); setHighlightIds(new Set()); }}
-              className="text-[11px] text-brand-400 hover:text-brand-300 hover:underline">
-              Focus 2-hop subgraph on {selectedNode.symbol} →
-            </button>
-          )}
-        </div>
-      )}
+        )}
+      </div>
     </div>
   );
 }

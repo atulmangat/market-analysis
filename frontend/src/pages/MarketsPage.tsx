@@ -1,3 +1,4 @@
+import React, { useState } from 'react';
 import type { Strategy, LiveQuote, MarketEvent } from '../types';
 import { MARKET_ICONS, TICKER_DB, TICKER_META } from '../constants';
 import { apiFetch } from '../utils';
@@ -6,6 +7,7 @@ import { Card } from '../components/Card';
 interface MarketsPageProps {
   enabledMarketNames: string[];
   activeStrategies: Strategy[];
+  pendingStrategies: Strategy[];
   liveQuotes: LiveQuote[];
   marketEvents: MarketEvent[];
   quotesLoading: boolean;
@@ -17,6 +19,7 @@ interface MarketsPageProps {
   marketsSearchResults: { symbol: string; name: string; sector: string; exchange: string; type: string }[];
   marketsSearchLoading: boolean;
   marketsSearchTimer: [ReturnType<typeof setTimeout> | null, (v: ReturnType<typeof setTimeout> | null) => void];
+  isTriggering: boolean;
   setQuotesMarketTab: (m: string) => void;
   setQuotesStockTab: (s: string | null) => void;
   setMarketsSearchOpen: (v: boolean) => void;
@@ -26,17 +29,21 @@ interface MarketsPageProps {
   setWatchlist: (fn: (prev: string[]) => string[]) => void;
   fetchQuotes: () => void;
   openReport: (id: number) => void;
+  onTrigger: (tickers?: string[]) => void;
+  onApprove: (id: number, action: string) => void;
 }
 
 export function MarketsPage({
-  enabledMarketNames, activeStrategies, liveQuotes, marketEvents,
+  enabledMarketNames, activeStrategies, pendingStrategies, liveQuotes, marketEvents,
   quotesLoading, quotesMarketTab, quotesStockTab, watchlist,
   marketsSearchOpen, marketsSearchQuery, marketsSearchResults, marketsSearchLoading,
-  marketsSearchTimer,
+  marketsSearchTimer, isTriggering,
   setQuotesMarketTab, setQuotesStockTab, setMarketsSearchOpen,
   setMarketsSearchQuery, setMarketsSearchResults, setMarketsSearchLoading,
-  setWatchlist, fetchQuotes,
+  setWatchlist, fetchQuotes, openReport, onTrigger, onApprove,
 }: MarketsPageProps) {
+  const [selectedTickers, setSelectedTickers] = useState<Set<string>>(new Set());
+  const [selectMode, setSelectMode] = useState(false);
 
   const fmt = (n: number | null, dec = 2, prefix = '') => {
     if (n === null || n === undefined) return '—';
@@ -84,10 +91,25 @@ export function MarketsPage({
   // Non-position watchlist symbols for the current tab
   const watchlistTabSymbols = tabSymbols.filter(sym => !positionSymbols.includes(sym));
 
-  const activeStock = (quotesStockTab && tabSymbols.includes(quotesStockTab)) || (quotesStockTab && positionTabSymbols.includes(quotesStockTab))
-    ? quotesStockTab : null;
+  // Pending-only symbols (no active position) for this tab
+  const pendingOnlyTabSymbols = pendingStrategies
+    .filter(s => !activeStrategies.some(a => a.symbol === s.symbol))
+    .map(s => s.symbol)
+    .filter(sym => {
+      const meta = TICKER_META[sym];
+      if (meta) return meta.market === activeMarketTab;
+      const q = liveQuotes.find(q => q.symbol === sym);
+      return q?.market === activeMarketTab;
+    });
+
+  const activeStock = (
+    (quotesStockTab && tabSymbols.includes(quotesStockTab)) ||
+    (quotesStockTab && positionTabSymbols.includes(quotesStockTab)) ||
+    (quotesStockTab && pendingOnlyTabSymbols.includes(quotesStockTab))
+  ) ? quotesStockTab : null;
   const stockQuote = activeStock ? liveQuotes.find(q => q.symbol === activeStock) ?? null : null;
   const stockEvents = activeStock ? marketEvents.filter(e => e.symbol === activeStock) : [];
+  const stockPending = activeStock ? pendingStrategies.filter(s => s.symbol === activeStock) : [];
 
   // Debounced markets search
   const handleMarketsSearch = (q: string) => {
@@ -123,25 +145,49 @@ export function MarketsPage({
     const ticker = sym.replace(/\.(NS)$/, '').replace(/-USD$/, '').replace(/=F$/, '');
     const isUserAdded = !allDefaultSymbols.includes(sym);
     const activePos = activeStrategies.find(s => s.symbol === sym);
+    const pendingPos = pendingStrategies.find(s => s.symbol === sym);
     const posReturn = activePos?.current_return ?? null;
     const posUp = (posReturn ?? 0) >= 0;
+    const isSelected = selectedTickers.has(sym);
+
+    const handleCardClick = () => {
+      if (selectMode) {
+        setSelectedTickers(prev => {
+          const next = new Set(prev);
+          next.has(sym) ? next.delete(sym) : next.add(sym);
+          return next;
+        });
+      } else {
+        setQuotesStockTab(isActive ? null : sym);
+      }
+    };
 
     return (
-      <button key={sym} onClick={() => setQuotesStockTab(isActive ? null : sym)}
+      <button key={sym} onClick={handleCardClick}
         className={`text-left p-4 rounded-xl border transition-all relative ${
-          hasPosition
-            ? isActive
-              ? `border-l-2 ${posUp ? 'border-l-emerald-500 border-emerald-500/60 bg-emerald-900/10 ring-1 ring-emerald-500/20' : 'border-l-red-500 border-red-500/60 bg-red-900/10 ring-1 ring-red-500/20'}`
-              : `border-l-2 ${posUp ? 'border-l-emerald-500 border-borderLight bg-surface hover:bg-surface2' : 'border-l-red-500 border-borderLight bg-surface hover:bg-surface2'}`
-            : isActive
-              ? 'border-brand-500 bg-brand-900/20 ring-1 ring-brand-500/30'
-              : 'border-borderLight bg-surface hover:border-borderMid hover:bg-surface2'
+          isSelected
+            ? 'border-brand-500 bg-brand-900/20 ring-1 ring-brand-500/40'
+            : hasPosition
+              ? isActive
+                ? `border-l-2 ${posUp ? 'border-l-up border-up/60 bg-up-bg ring-1 ring-up/20' : 'border-l-down border-down/60 bg-down-bg ring-1 ring-down/20'}`
+                : `border-l-2 ${posUp ? 'border-l-up border-borderLight bg-surface hover:bg-surface2' : 'border-l-down border-borderLight bg-surface hover:bg-surface2'}`
+              : isActive
+                ? 'border-brand-500 bg-brand-900/20 ring-1 ring-brand-500/30'
+                : 'border-borderLight bg-surface hover:border-borderMid hover:bg-surface2'
         }`}>
-        {/* Remove button for user-added symbols */}
-        {isUserAdded && (
+        {/* Selection checkbox (select mode) */}
+        {selectMode && (
+          <div className={`absolute top-2 right-2 w-4 h-4 rounded border flex items-center justify-center transition-colors ${
+            isSelected ? 'bg-brand-500 border-brand-500' : 'border-borderMid bg-surface3'
+          }`}>
+            {isSelected && <span className="text-[9px] text-white font-bold">✓</span>}
+          </div>
+        )}
+        {/* Remove button for user-added symbols (non-select mode) */}
+        {isUserAdded && !selectMode && (
           <button
             onClick={e => { e.stopPropagation(); toggleWatchlist(sym); }}
-            className="absolute top-2 right-2 w-5 h-5 flex items-center justify-center text-[10px] text-textDim hover:text-red-400 hover:bg-red-900/30 rounded transition-colors"
+            className="absolute top-2 right-2 w-5 h-5 flex items-center justify-center text-[10px] text-textDim hover:text-down-text hover:bg-down-bg rounded transition-colors"
             title="Remove from watchlist">
             ×
           </button>
@@ -183,12 +229,34 @@ export function MarketsPage({
           );
         })()}
         {q?.name && <p className="text-[10px] text-textDim mt-0.5 truncate">{q.name}</p>}
-        {/* Position return badge */}
-        {activePos && posReturn !== null && (
-          <div className={`mt-2 text-[10px] font-semibold px-2 py-0.5 rounded-full w-fit ${posUp ? 'bg-emerald-900/40 text-emerald-400' : 'bg-red-900/40 text-red-400'}`}>
-            {activePos.strategy_type} {posUp ? '+' : ''}{posReturn.toFixed(2)}%
-          </div>
-        )}
+        {/* Trade status badges */}
+        <div className="mt-2 flex items-center flex-wrap gap-1.5">
+          {activePos && posReturn !== null && (
+            <>
+              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${
+                activePos.strategy_type === 'LONG'
+                  ? 'bg-up/15 text-up border-up/30'
+                  : 'bg-down/15 text-down border-down/30'
+              }`}>
+                {activePos.strategy_type === 'LONG' ? '▲' : '▼'} {activePos.strategy_type}
+              </span>
+              <span className={`text-[10px] font-semibold ${posUp ? 'text-up' : 'text-down'}`}>
+                {posUp ? '+' : ''}{posReturn.toFixed(2)}%
+              </span>
+            </>
+          )}
+          {pendingPos && !activePos && (
+            <span
+              className="group relative inline-flex items-center"
+              title="Pending suggested trade — click to review">
+              <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+              <span className="absolute left-4 top-1/2 -translate-y-1/2 hidden group-hover:flex items-center whitespace-nowrap bg-surface border border-borderMid text-[10px] text-amber-400 px-2 py-1 rounded-lg shadow-lg z-10 gap-1 pointer-events-none">
+                <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+                Pending {pendingPos.strategy_type} — click to review
+              </span>
+            </span>
+          )}
+        </div>
       </button>
     );
   };
@@ -196,10 +264,42 @@ export function MarketsPage({
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between flex-wrap gap-2">
         <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Markets</h2>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           {quotesLoading && <span className="text-[10px] text-amber-400 animate-pulse">Fetching…</span>}
+
+          {/* Select mode toggle */}
+          <button
+            onClick={() => { setSelectMode(s => !s); if (selectMode) setSelectedTickers(new Set()); }}
+            className={`text-[11px] px-3 py-1.5 rounded-lg border transition-all flex items-center gap-1.5 ${
+              selectMode
+                ? 'bg-brand-900/40 border-brand-500 text-brand-300'
+                : 'bg-surface2 border-borderLight text-textMuted hover:border-brand-500 hover:text-brand-400'
+            }`}>
+            {selectMode ? `✓ ${selectedTickers.size} selected` : '⊡ Select'}
+          </button>
+
+          {/* Run pipeline on selected */}
+          {selectMode && selectedTickers.size > 0 && (
+            <button
+              onClick={() => { onTrigger(Array.from(selectedTickers)); setSelectMode(false); setSelectedTickers(new Set()); }}
+              disabled={isTriggering}
+              className="text-[11px] px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 border border-brand-500 text-white font-semibold transition-all disabled:opacity-50 flex items-center gap-1.5">
+              {isTriggering ? '⟳ Running…' : `▶ Run on ${selectedTickers.size} ticker${selectedTickers.size > 1 ? 's' : ''}`}
+            </button>
+          )}
+
+          {/* Run full pipeline (no selection) */}
+          {!selectMode && (
+            <button
+              onClick={() => onTrigger()}
+              disabled={isTriggering}
+              className="text-[11px] px-3 py-1.5 rounded-lg bg-surface2 border border-borderLight hover:border-brand-500 text-textMuted hover:text-brand-400 transition-all disabled:opacity-40 flex items-center gap-1.5">
+              {isTriggering ? '⟳ Running…' : '▶ Run Pipeline'}
+            </button>
+          )}
+
           <button onClick={() => { setMarketsSearchOpen(true); setMarketsSearchQuery(''); setMarketsSearchResults([]); }}
             className="text-[11px] px-3 py-1.5 rounded-lg bg-surface2 border border-borderLight hover:border-brand-500 text-textMuted hover:text-brand-400 transition-all flex items-center gap-1.5">
             + Add / Remove
@@ -211,6 +311,14 @@ export function MarketsPage({
           <span className="text-[10px] text-textDim">Live · auto-refresh</span>
         </div>
       </div>
+
+      {/* Select mode hint */}
+      {selectMode && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-brand-900/20 border border-brand-700/30 text-[11px] text-brand-300">
+          <span>Click tickers to select them, then run the pipeline focused on your selection.</span>
+          <button onClick={() => { setSelectMode(false); setSelectedTickers(new Set()); }} className="ml-auto text-brand-400 hover:text-brand-300 underline">Cancel</button>
+        </div>
+      )}
 
       {/* Market filter tabs */}
       <div className="flex gap-2 flex-wrap">
@@ -228,34 +336,193 @@ export function MarketsPage({
         ))}
       </div>
 
-      {/* Active Positions section */}
-      {positionTabSymbols.length > 0 && (
-        <div>
-          <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2 flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>
-            Active Positions ({positionTabSymbols.length})
-          </p>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-            {positionTabSymbols.map(sym => renderStockCard(sym, true))}
-          </div>
-        </div>
-      )}
+      {/* Cards + inline detail */}
+      <div className="space-y-4">
+        {/* Render a section: renders cards and injects the detail panel below the row containing the active card */}
+        {[
+          { label: positionTabSymbols.length > 0 ? `Active Positions (${positionTabSymbols.length})` : null, syms: positionTabSymbols, hasPos: true },
+          { label: positionTabSymbols.length > 0 ? 'Watchlist' : null, syms: watchlistTabSymbols, hasPos: false },
+        ].map(({ label, syms, hasPos }) => {
+          if (syms.length === 0) return null;
+          const cols = 4; // fixed columns to track row breaks
+          const activeIdx = activeStock ? syms.indexOf(activeStock) : -1;
 
-      {/* Watchlist / All markets grid */}
-      {watchlistTabSymbols.length > 0 && (
-        <div>
-          {positionTabSymbols.length > 0 && (
-            <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2">Watchlist</p>
-          )}
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-            {watchlistTabSymbols.map(sym => renderStockCard(sym, false))}
-          </div>
-        </div>
-      )}
+          return (
+            <div key={label ?? 'main'}>
+              {label && (
+                <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                  {hasPos && <span className="w-1.5 h-1.5 rounded-full bg-up inline-block" />}
+                  {label}
+                </p>
+              )}
+              {/* Grid with injected detail panel */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                {syms.map((sym, idx) => {
+                  const card = renderStockCard(sym, hasPos);
+                  // After every row-end or last item, if active card is in this row inject detail
+                  const rowEnd = (idx + 1) % cols === 0 || idx === syms.length - 1;
+                  const rowStart = Math.floor(idx / cols) * cols;
+                  const rowContainsActive = activeIdx >= rowStart && activeIdx <= rowStart + cols - 1;
+                  const injectDetail = rowEnd && rowContainsActive && activeStock;
 
-      {tabSymbols.length === 0 && positionTabSymbols.length === 0 && (
-        <div className="py-10 text-center text-textDim text-sm">No symbols tracked for this market.</div>
-      )}
+                  return (
+                    <React.Fragment key={sym}>
+                      {card}
+                      {injectDetail && (() => {
+                        const stockCalEvents = stockEvents.filter(e => e.event_type !== 'News');
+                        const stockNews = stockEvents.filter(e => e.event_type === 'News');
+                        return (
+                          <div className="col-span-2 sm:col-span-3 lg:col-span-4 -mt-1">
+                            <Card className="p-0 overflow-hidden border-brand-500/40 bg-surface2/60">
+                              {/* Header */}
+                              <div className="flex items-center justify-between px-4 py-3 border-b border-borderLight bg-surface3/50">
+                                <div className="flex items-baseline gap-2 min-w-0">
+                                  <span className="text-sm font-bold font-mono text-textMain">
+                                    {activeStock.replace(/\.(NS)$/, '').replace(/-USD$/, '').replace(/=F$/, '')}
+                                  </span>
+                                  {stockQuote?.name && <span className="text-[11px] text-textMuted">{stockQuote.name}</span>}
+                                  {stockPending.length > 0 && (
+                                    <span className="flex items-center gap-1 text-[10px] text-amber-400 font-medium">
+                                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+                                      Pending trade
+                                    </span>
+                                  )}
+                                </div>
+                                <button onClick={() => setQuotesStockTab(null)} className="text-textDim hover:text-textMain text-base leading-none ml-2 px-1">×</button>
+                              </div>
+
+                              {/* Pending trade approval panel */}
+                              {stockPending.length > 0 && (
+                                <div className="border-b border-borderLight bg-amber-950/10 px-4 py-3 space-y-2.5">
+                                  <p className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider">Suggested Trade — Awaiting Approval</p>
+                                  {stockPending.map(s => (
+                                    <div key={s.id} className="space-y-2">
+                                      <div className="flex items-center justify-between flex-wrap gap-2">
+                                        <div className="flex items-center gap-2">
+                                          <span className={`text-[11px] font-bold px-2 py-0.5 rounded-md border ${
+                                            s.strategy_type === 'LONG'
+                                              ? 'bg-up/10 text-up border-up/20'
+                                              : 'bg-down/10 text-down border-down/20'
+                                          }`}>{s.strategy_type === 'LONG' ? '▲' : '▼'} {s.strategy_type}</span>
+                                          <span className="text-[11px] font-mono text-textMuted">Entry: {s.entry_price != null ? `$${s.entry_price.toFixed(4)}` : '—'}</span>
+                                        </div>
+                                        <div className="flex gap-2">
+                                          <button
+                                            onClick={() => openReport(s.id)}
+                                            className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-brand-500/10 border border-brand-500/30 text-brand-400 hover:bg-brand-500/20 transition-all flex items-center gap-1.5">
+                                            <span className="text-xs">◈</span> Full Research Report
+                                          </button>
+                                          <button
+                                            onClick={() => { onApprove(s.id, 'approve'); setQuotesStockTab(null); }}
+                                            className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-up/10 border border-up/20 text-up hover:bg-up/15 transition-colors">
+                                            ✓ Approve
+                                          </button>
+                                          <button
+                                            onClick={() => { onApprove(s.id, 'reject'); setQuotesStockTab(null); }}
+                                            className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-down/10 border border-down/20 text-down hover:bg-down/15 transition-colors">
+                                            ✕ Reject
+                                          </button>
+                                        </div>
+                                      </div>
+                                      {s.reasoning_summary && (
+                                        <p className="text-[11px] text-textMuted leading-relaxed">{s.reasoning_summary}</p>
+                                      )}
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+
+                              <div className="flex flex-wrap gap-0 divide-x divide-borderLight">
+                                {/* Price block */}
+                                <div className="px-4 py-3 min-w-[160px]">
+                                  {stockQuote ? (() => {
+                                    const up = (stockQuote.change_pct ?? 0) >= 0;
+                                    return (
+                                      <div>
+                                        <p className="text-xl font-light font-mono text-textMain leading-none mb-2">
+                                          {stockQuote.price !== null ? fmt(stockQuote.price, stockQuote.price > 100 ? 2 : 4) : '—'}
+                                        </p>
+                                        <div className="flex gap-4 flex-wrap">
+                                          <div>
+                                            <p className="text-[9px] text-textDim uppercase mb-0.5">Change</p>
+                                            <p className={`text-xs font-mono font-semibold ${up ? 'text-up' : 'text-down'}`}>
+                                              {stockQuote.change_pct != null ? `${up ? '+' : ''}${stockQuote.change_pct.toFixed(2)}%` : '—'}
+                                            </p>
+                                          </div>
+                                          <div>
+                                            <p className="text-[9px] text-textDim uppercase mb-0.5">Prev Close</p>
+                                            <p className="text-xs font-mono text-textMain">{fmt(stockQuote.prev_close, stockQuote.prev_close && stockQuote.prev_close > 100 ? 2 : 4)}</p>
+                                          </div>
+                                          <div>
+                                            <p className="text-[9px] text-textDim uppercase mb-0.5">Volume</p>
+                                            <p className="text-xs font-mono text-textMain">{fmtVol(stockQuote.volume)}</p>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    );
+                                  })() : <p className="text-xs text-textDim">No price data</p>}
+                                </div>
+
+                                {/* Events block */}
+                                {stockCalEvents.length > 0 && (
+                                  <div className="px-4 py-3 min-w-[200px]">
+                                    <p className="text-[9px] font-semibold text-textDim uppercase tracking-wider mb-2">Upcoming Events</p>
+                                    <div className="space-y-1.5">
+                                      {stockCalEvents.map((ev, i) => (
+                                        <div key={i} className="flex items-center gap-2 px-2.5 py-1.5 bg-surface2 border border-borderLight rounded-lg">
+                                          <span className={`text-[9px] font-semibold px-1.5 py-0.5 rounded shrink-0 ${
+                                            ev.event_type === 'Earnings' ? 'bg-brand-900/60 text-brand-300 border border-brand-700/30' : 'bg-teal-900/60 text-teal-300 border border-teal-700/30'
+                                          }`}>{ev.event_type}</span>
+                                          <span className="text-[11px] font-mono text-textMain">{ev.date}</span>
+                                          {ev.detail && <span className="text-[10px] text-textMuted truncate">{ev.detail}</span>}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {/* News block */}
+                                <div className="px-4 py-3 flex-1 min-w-[240px]">
+                                  <p className="text-[9px] font-semibold text-textDim uppercase tracking-wider mb-2">Latest News</p>
+                                  {stockNews.length > 0 ? (
+                                    <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                                      {stockNews.map((ev, i) => (
+                                        <div key={i} className="px-2.5 py-2 bg-surface2 border border-borderLight rounded-lg hover:border-borderMid transition-colors group">
+                                          {ev.url ? (
+                                            <a href={ev.url} target="_blank" rel="noreferrer" className="text-[11px] font-medium text-textMain group-hover:text-brand-400 transition-colors leading-snug block mb-1">
+                                              {ev.title}
+                                            </a>
+                                          ) : (
+                                            <p className="text-[11px] font-medium text-textMain leading-snug mb-1">{ev.title}</p>
+                                          )}
+                                          <div className="flex items-center gap-2">
+                                            <span className="text-[10px] text-textDim font-mono">{ev.date}</span>
+                                            {ev.detail && <span className="text-[10px] text-textDim">{ev.detail}</span>}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  ) : (
+                                    <p className="text-[11px] text-textDim">No news available.</p>
+                                  )}
+                                </div>
+                              </div>
+                            </Card>
+                          </div>
+                        );
+                      })()}
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+
+        {tabSymbols.length === 0 && positionTabSymbols.length === 0 && (
+          <div className="py-10 text-center text-textDim text-sm">No symbols tracked for this market.</div>
+        )}
+      </div>
 
       {/* Search / Add-Remove Modal */}
       {marketsSearchOpen && (
@@ -280,7 +547,7 @@ export function MarketsPage({
                   {userAddedSymbols.map(sym => (
                     <span key={sym} className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg bg-brand-900/40 border border-brand-700/40 text-brand-300">
                       {sym.replace(/\.(NS)$/, '').replace(/-USD$/, '').replace(/=F$/, '')}
-                      <button onClick={() => toggleWatchlist(sym)} className="hover:text-red-400 ml-0.5">×</button>
+                      <button onClick={() => toggleWatchlist(sym)} className="hover:text-down-text ml-0.5">×</button>
                     </span>
                   ))}
                 </div>
@@ -306,7 +573,7 @@ export function MarketsPage({
                           isDefault
                             ? 'border-borderLight text-textDim cursor-default'
                             : tracked
-                              ? 'border-red-700/50 bg-red-900/30 text-red-400 hover:bg-red-900/50'
+                              ? 'border-down/50 bg-down-bg text-down-text hover:bg-down/20'
                               : 'border-brand-700/50 bg-brand-900/30 text-brand-400 hover:bg-brand-900/50'
                         }`}>
                         {isDefault ? 'Default' : tracked ? '− Remove' : '+ Add'}
@@ -323,90 +590,6 @@ export function MarketsPage({
         </div>
       )}
 
-      {/* Expanded stock detail */}
-      {activeStock && (() => {
-        const stockCalEvents = stockEvents.filter(e => e.event_type !== 'News');
-        const stockNews = stockEvents.filter(e => e.event_type === 'News');
-        return (
-          <Card className="p-5 space-y-5">
-            {/* Header row */}
-            <div className="flex items-center justify-between">
-              <div className="flex items-baseline gap-3">
-                <h3 className="text-base font-bold font-mono text-textMain">
-                  {activeStock.replace(/\.(NS)$/, '').replace(/-USD$/, '').replace(/=F$/, '')}
-                </h3>
-                {stockQuote?.name && <span className="text-xs text-textMuted">{stockQuote.name}</span>}
-              </div>
-              <button onClick={() => setQuotesStockTab(null)} className="text-textDim hover:text-textMain text-lg leading-none">×</button>
-            </div>
-
-            {/* Price stats */}
-            {stockQuote ? (() => {
-              const up = (stockQuote.change_pct ?? 0) >= 0;
-              return (
-                <div className="flex items-end gap-6 flex-wrap">
-                  <div>
-                    <p className="text-3xl font-light font-mono text-textMain">
-                      {stockQuote.price !== null ? fmt(stockQuote.price, stockQuote.price > 100 ? 2 : 4) : '—'}
-                    </p>
-                  </div>
-                  <div className="flex gap-5 pb-1">
-                    <div><p className="text-[10px] text-textDim uppercase mb-0.5">Prev Close</p><p className="text-sm font-mono text-textMain">{fmt(stockQuote.prev_close, stockQuote.prev_close && stockQuote.prev_close > 100 ? 2 : 4)}</p></div>
-                    <div><p className="text-[10px] text-textDim uppercase mb-0.5">Volume</p><p className="text-sm font-mono text-textMain">{fmtVol(stockQuote.volume)}</p></div>
-                    <div><p className="text-[10px] text-textDim uppercase mb-0.5">Change</p><p className={`text-sm font-mono ${up ? 'text-up' : 'text-down'}`}>{stockQuote.change_pct != null ? `${up ? '+' : ''}${stockQuote.change_pct.toFixed(2)}%` : '—'}</p></div>
-                  </div>
-                </div>
-              );
-            })() : (
-              <p className="text-sm text-textDim">No price data — click Refresh.</p>
-            )}
-
-            {/* Upcoming events */}
-            {stockCalEvents.length > 0 && (
-              <div>
-                <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2">Upcoming Events</p>
-                <div className="space-y-2">
-                  {stockCalEvents.map((ev, i) => (
-                    <div key={i} className="flex items-center gap-3 px-3 py-2.5 bg-surface2 border border-borderLight rounded-lg">
-                      <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full shrink-0 ${
-                        ev.event_type === 'Earnings' ? 'bg-brand-100 dark:bg-brand-900/60 text-brand-700 dark:text-brand-300 border border-brand-300 dark:border-brand-700/30' : 'bg-teal-100 dark:bg-teal-900/60 text-teal-700 dark:text-teal-300 border border-teal-300 dark:border-teal-700/30'
-                      }`}>{ev.event_type}</span>
-                      <span className="text-xs font-mono text-textMain">{ev.date}</span>
-                      {ev.detail && <span className="text-xs text-textMuted">{ev.detail}</span>}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* News */}
-            {stockNews.length > 0 ? (
-              <div>
-                <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2">Latest News</p>
-                <div className="space-y-2">
-                  {stockNews.map((ev, i) => (
-                    <div key={i} className="px-3 py-3 bg-surface2 border border-borderLight rounded-lg hover:border-borderMid transition-colors group">
-                      {ev.url ? (
-                        <a href={ev.url} target="_blank" rel="noreferrer" className="text-sm font-medium text-textMain group-hover:text-brand-400 transition-colors leading-snug block mb-1">
-                          {ev.title}
-                        </a>
-                      ) : (
-                        <p className="text-sm font-medium text-textMain leading-snug mb-1">{ev.title}</p>
-                      )}
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] text-textDim font-mono">{ev.date}</span>
-                        {ev.detail && <><span className="text-textDim text-[10px]">·</span><span className="text-[10px] text-textDim">{ev.detail}</span></>}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <p className="text-xs text-textDim">No news available for this stock.</p>
-            )}
-          </Card>
-        );
-      })()}
     </div>
   );
 }

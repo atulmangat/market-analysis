@@ -1,0 +1,666 @@
+"""
+Persistent Knowledge Graph for the multi-agent trading system.
+
+Design principles:
+- Nodes: ASSET (tickers), ENTITY (companies/banks/govts),
+  INDICATOR (VIX/DXY/yields), EVENT (compressed market facts),
+  MARKET (regional market nodes: US, India, Crypto, MCX)
+- Edges carry typed relationships with confidence scores
+
+Ingest pipeline (per run):
+  1. News compression  — LLM condenses raw articles into dense regional summaries
+  2. Graph extraction  — LLM receives compressed news + existing graph snapshot
+                         and outputs net-new nodes/edges (no dedup step needed)
+  3. Auto-market links — assets under India/Crypto/MCX/US market nodes are
+                         automatically linked to their market node and to any
+                         events mentioning their region
+"""
+
+import json
+import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
+import core.models as models
+from agents.llm import _call_openrouter
+
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+TICKER_LABELS: dict[str, str] = {
+    "AAPL": "Apple", "MSFT": "Microsoft", "NVDA": "NVIDIA",
+    "GOOGL": "Alphabet", "AMZN": "Amazon", "TSLA": "Tesla",
+    "META": "Meta", "AMD": "AMD",
+    "RELIANCE.NS": "Reliance Industries", "TCS.NS": "TCS",
+    "INFY.NS": "Infosys", "HDFCBANK.NS": "HDFC Bank",
+    "ICICIBANK.NS": "ICICI Bank", "WIPRO.NS": "Wipro",
+    "SBIN.NS": "SBI", "TATAMOTORS.NS": "Tata Motors",
+    "BTC-USD": "Bitcoin", "ETH-USD": "Ethereum", "SOL-USD": "Solana",
+    "BNB-USD": "BNB", "XRP-USD": "XRP", "DOGE-USD": "Dogecoin", "ADA-USD": "Cardano",
+    "GC=F": "Gold Futures", "SI=F": "Silver Futures",
+    "CL=F": "Crude Oil WTI", "NG=F": "Natural Gas", "HG=F": "Copper Futures",
+}
+
+# Market → constituent tickers
+MARKET_TICKERS: dict[str, list[str]] = {
+    "US":     ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "META", "AMD"],
+    "India":  ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS",
+               "ICICIBANK.NS", "WIPRO.NS", "SBIN.NS", "TATAMOTORS.NS"],
+    "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD",
+               "XRP-USD", "DOGE-USD", "ADA-USD"],
+    "MCX":    ["GC=F", "SI=F", "CL=F", "NG=F", "HG=F"],
+}
+
+MARKET_LABELS: dict[str, str] = {
+    "US":     "US Equities",
+    "India":  "India Equities (NSE)",
+    "Crypto": "Cryptocurrency",
+    "MCX":    "Commodities (MCX/NYMEX)",
+}
+
+# Keywords that signal a news item is relevant to each market
+MARKET_KEYWORDS: dict[str, list[str]] = {
+    "India":  ["india", "nifty", "sensex", "nse", "bse", "rupee", "rbi",
+               "sebi", "mumbai", "dalal", "reliance", "tcs", "infosys",
+               "hdfc", "icici", "wipro", "sbi", "tata"],
+    "Crypto": ["bitcoin", "btc", "ethereum", "eth", "crypto", "solana",
+               "binance", "coinbase", "defi", "blockchain", "web3",
+               "altcoin", "nft", "stablecoin"],
+    "MCX":    ["gold", "silver", "crude", "oil", "natural gas", "copper",
+               "commodity", "commodities", "opec", "wti", "brent",
+               "precious metals", "mcx"],
+    "US":     ["fed", "federal reserve", "nasdaq", "s&p", "dow", "nyse",
+               "treasury", "fomc", "wall street", "sec", "earnings",
+               "gdp", "inflation", "rate hike"],
+}
+
+
+# ── KG-specific LLM call (short timeout, 2 retries) ───────────────────────────
+
+def _kg_llm(system_prompt: str, user_content: str) -> str | None:
+    """
+    LLM call tuned for KG ingest: 40s timeout per attempt, 2 retries.
+    Faster than the default agent call (120s timeout, 3 retries).
+    Returns None on total failure.
+    """
+    api_key  = os.getenv("OPENROUTER_API_KEY", "").strip()
+    model    = os.getenv("LLM_MODEL", "stepfun/step-3.5-flash:free")
+    fallback = os.getenv("FALLBACK_LLM_MODEL", "minimax/minimax-m2.5:nitro")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_content},
+    ]
+    try:
+        return _call_openrouter(model, messages, api_key, retries=2, timeout=40)
+    except Exception as e:
+        print(f"[KG] Primary model failed: {e}. Trying fallback...")
+        try:
+            return _call_openrouter(fallback, messages, api_key, retries=2, timeout=40)
+        except Exception as e2:
+            print(f"[KG] Fallback also failed: {e2}")
+            return None
+
+
+# ── LLM prompts ────────────────────────────────────────────────────────────────
+
+KG_EXTRACT_SYSTEM_PROMPT = """You are a financial knowledge graph builder.
+
+You receive a batch of news headlines and an existing graph snapshot.
+Extract net-new market facts not already in the graph.
+
+For each distinct new fact output ONE JSON object per line (no preamble):
+
+{"event_id":"<slug-YYYY-MM-DD>","event_label":"<10 words max>","event_summary":"<2-3 sentences with key numbers>","direction":"bullish|bearish|neutral","magnitude":"high|medium|low","expires_days":3,"catalyst_type":"earnings|macro|geopolitical|regulatory|technical|sentiment|sector","key_numbers":["Oil +5%","VIX 28"],"price_targets":["GS raises NVDA to $180"],"affected_assets":["NVDA","GC=F"],"affected_markets":["US","India","Crypto","MCX"],"related_entities":["entity:FederalReserve"],"source_region":"US|India|Global|Crypto|Europe|Asia","relations":[{"source":"asset:NVDA","target":"event:slug","relation":"affects","confidence":0.8,"reason":"direct earnings impact"}]}
+
+Node IDs: asset:NVDA | entity:FederalReserve | indicator:VIX | market:US | event:slug-YYYY-MM-DD
+Relations: affects | correlated_with | caused_by | related_to | sector_peer
+Rules: skip vague facts, include specific numbers, expires_days: breaking=2 earnings=7 macro=14 structural=30, max 6 events per batch."""
+
+
+# ── Node helpers ───────────────────────────────────────────────────────────────
+
+def _upsert_node(db: Session, node_id: str, node_type: str, label: str,
+                 symbol: str = None, metadata: dict = None):
+    existing = db.query(models.KGNode).filter(models.KGNode.node_id == node_id).first()
+    if existing:
+        existing.last_seen_at = datetime.utcnow()
+        if metadata:
+            try:
+                old_meta = json.loads(existing.metadata_json or "{}")
+                old_meta.update(metadata)
+                existing.metadata_json = json.dumps(old_meta)
+            except Exception:
+                pass
+    else:
+        node = models.KGNode(
+            node_id=node_id,
+            node_type=node_type,
+            label=label,
+            symbol=symbol,
+            metadata_json=json.dumps(metadata or {}),
+        )
+        db.add(node)
+        try:
+            db.flush()
+        except Exception:
+            db.rollback()
+
+
+def upsert_asset_nodes(db: Session, tickers: list[str]) -> None:
+    """Ensure all enabled tickers and market nodes exist."""
+    for ticker in tickers:
+        node_id = f"asset:{ticker}"
+        label = TICKER_LABELS.get(ticker, ticker)
+        _upsert_node(db, node_id, "ASSET", label, symbol=ticker)
+
+    # Ensure market nodes exist
+    for market, label in MARKET_LABELS.items():
+        _upsert_node(db, f"market:{market}", "MARKET", label)
+
+    db.commit()
+
+    # Link each asset to its market node (permanent structural edges, no expiry)
+    for market, tickers_in_market in MARKET_TICKERS.items():
+        market_node_id = f"market:{market}"
+        for ticker in tickers_in_market:
+            if ticker not in tickers:
+                continue  # only link enabled tickers
+            asset_node_id = f"asset:{ticker}"
+            exists = db.query(models.KGEdge).filter(
+                models.KGEdge.source_node_id == asset_node_id,
+                models.KGEdge.target_node_id == market_node_id,
+                models.KGEdge.relation == "sector_peer",
+            ).first()
+            if not exists:
+                db.add(models.KGEdge(
+                    source_node_id=asset_node_id,
+                    target_node_id=market_node_id,
+                    relation="sector_peer",
+                    confidence=1.0,
+                    source_run_id="__system__",
+                    expires_at=None,  # permanent
+                ))
+    db.commit()
+
+
+# ── Graph snapshot for LLM context ────────────────────────────────────────────
+
+def _build_graph_snapshot(db: Session, max_nodes: int = 80) -> str:
+    """
+    Serialize the current graph as a compact text snapshot for the LLM.
+    Shows recent EVENT nodes with summaries + key edges.
+    """
+    now = datetime.utcnow()
+
+    # Recent non-expired event nodes
+    event_nodes = (
+        db.query(models.KGNode)
+        .filter(models.KGNode.node_type == "EVENT")
+        .order_by(models.KGNode.last_seen_at.desc())
+        .limit(max_nodes)
+        .all()
+    )
+
+    # All asset/market/entity nodes
+    structural_nodes = (
+        db.query(models.KGNode)
+        .filter(models.KGNode.node_type.in_(["ASSET", "MARKET", "ENTITY", "INDICATOR"]))
+        .order_by(models.KGNode.last_seen_at.desc())
+        .limit(60)
+        .all()
+    )
+
+    all_node_ids = [n.node_id for n in event_nodes + structural_nodes]
+
+    # Active edges
+    edges = db.query(models.KGEdge).filter(
+        models.KGEdge.source_node_id.in_(all_node_ids),
+        models.KGEdge.target_node_id.in_(all_node_ids),
+        or_(models.KGEdge.expires_at.is_(None), models.KGEdge.expires_at > now),
+    ).order_by(models.KGEdge.confidence.desc()).limit(200).all()
+
+    nodes_by_id = {n.node_id: n for n in event_nodes + structural_nodes}
+
+    lines = ["=== EXISTING GRAPH SNAPSHOT ===\n"]
+
+    if event_nodes:
+        lines.append("## Recent Events (already in graph — do not re-emit these):")
+        for n in event_nodes[:30]:
+            meta = json.loads(n.metadata_json or "{}")
+            direction = meta.get("direction", "")
+            summary = meta.get("summary", "")[:120]
+            dir_icon = "▲" if direction == "bullish" else "▼" if direction == "bearish" else "●"
+            lines.append(f"  {dir_icon} [{n.node_id}] {n.label}")
+            if summary:
+                lines.append(f"      {summary}")
+        lines.append("")
+
+    if edges:
+        lines.append("## Key Relationships (already in graph):")
+        for e in edges[:60]:
+            src = nodes_by_id.get(e.source_node_id)
+            tgt = nodes_by_id.get(e.target_node_id)
+            src_label = src.label if src else e.source_node_id
+            tgt_label = tgt.label if tgt else e.target_node_id
+            lines.append(f"  {src_label} --[{e.relation}]--> {tgt_label} ({int(e.confidence*100)}%)")
+        lines.append("")
+
+    if not event_nodes and not edges:
+        lines.append("(Graph is empty — extract all facts from the news)")
+
+    return "\n".join(lines)
+
+
+# ── Batch extraction ───────────────────────────────────────────────────────────
+
+def _extract_batch(batch: list[dict], graph_snapshot: str) -> list[dict]:
+    """
+    Single LLM call: batch of news articles (title + snippet) + graph snapshot → net-new facts.
+    Each batch is ~25 articles — small enough for fast free-tier response (<30s).
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    articles = []
+    for i, r in enumerate(batch):
+        if not r.get("title"):
+            continue
+        snippet = r.get("snippet", "").strip()
+        if snippet:
+            articles.append(f"[{i+1}] {r['title']}\n    {snippet[:250]}")
+        else:
+            articles.append(f"[{i+1}] {r['title']}")
+    news_block = "\n".join(articles)
+    prompt_body = f"TODAY: {today}\n\n{graph_snapshot}\n\n=== NEWS BATCH ===\n{news_block}"
+
+    raw = _kg_llm(KG_EXTRACT_SYSTEM_PROMPT, prompt_body)
+    if not raw:
+        return []
+
+    facts = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            fact = json.loads(line)
+            if fact.get("event_id") and fact.get("event_label"):
+                facts.append(fact)
+        except Exception:
+            continue
+    return facts
+
+
+# ── Auto-market linking ────────────────────────────────────────────────────────
+
+def _detect_markets_for_event(event_label: str, event_summary: str,
+                               affected_assets: list[str]) -> list[str]:
+    """
+    Detect which market nodes an event should be linked to.
+    Uses keyword matching on label+summary AND asset membership.
+    """
+    text = (event_label + " " + event_summary).lower()
+    detected = set()
+
+    # Keyword-based detection
+    for market, keywords in MARKET_KEYWORDS.items():
+        if any(kw in text for kw in keywords):
+            detected.add(market)
+
+    # Asset-based detection
+    for asset_ref in affected_assets:
+        sym = asset_ref.replace("asset:", "").upper()
+        for market, tickers in MARKET_TICKERS.items():
+            if sym in tickers or sym + ".NS" in tickers or sym + "-USD" in tickers:
+                detected.add(market)
+
+    return list(detected)
+
+
+# ── Main ingestion ─────────────────────────────────────────────────────────────
+
+def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
+                               run_id: str, now: datetime = None) -> int:
+    """
+    Parallel batch KG ingest:
+      - Build graph snapshot (DB, fast) once
+      - Split articles into batches of 25, run each batch as a parallel LLM call
+      - Each call: ~25 titles + graph snapshot → up to 6 net-new facts
+      - 3 batches × parallel = ~1 LLM latency instead of 2 sequential
+
+    Returns number of new edges added.
+    """
+    if not research_items:
+        return 0
+
+    if now is None:
+        now = datetime.utcnow()
+
+    items = [r for r in research_items if r.get("title") and len(r.get("title", "")) > 10]
+    if not items:
+        return 0
+
+    # Build graph snapshot once (pure DB, fast)
+    t0 = time.time()
+    graph_snapshot = _build_graph_snapshot(db)
+    print(f"[KG] Graph snapshot built in {time.time()-t0:.1f}s")
+
+    # Split into batches of 25, cap at 3 batches (75 articles max)
+    batches = [items[i:i+25] for i in range(0, min(len(items), 75), 25)]
+    print(f"[KG] Running {len(batches)} parallel batch{'es' if len(batches)>1 else ''} ({len(items)} articles)...")
+
+    # Run all batches in parallel
+    t1 = time.time()
+    all_facts: list[dict] = []
+    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+        futures = [pool.submit(_extract_batch, batch, graph_snapshot) for batch in batches]
+        for f in as_completed(futures):
+            try:
+                all_facts.extend(f.result())
+            except Exception as e:
+                print(f"[KG] Batch failed: {e}")
+    print(f"[KG] All batches done in {time.time()-t1:.1f}s — {len(all_facts)} facts extracted")
+
+    facts = all_facts
+
+    if not facts:
+        return 0
+
+    # ── Write facts to DB ──────────────────────────────────────────────────────
+    nodes_by_id: dict[str, dict] = {}
+    total_edges_added = 0
+
+    for fact in facts:
+        event_id      = fact["event_id"]
+        event_label   = fact.get("event_label", "")
+        event_summary = fact.get("event_summary", "")
+        direction     = fact.get("direction", "neutral")
+        magnitude     = fact.get("magnitude", "medium")
+        expires_days  = int(fact.get("expires_days", 7))
+        catalyst_type = fact.get("catalyst_type", "")
+        key_numbers   = fact.get("key_numbers", [])
+        price_targets = fact.get("price_targets", [])
+        source_region = fact.get("source_region", "")
+        affected      = fact.get("affected_assets", [])
+        markets       = fact.get("affected_markets", [])
+        entities      = fact.get("related_entities", [])
+        relations     = fact.get("relations", [])
+
+        event_node_id = f"event:{event_id[:60]}"
+        expires_at = now + timedelta(days=expires_days)
+
+        _upsert_node(db, event_node_id, "EVENT", event_label[:80], metadata={
+            "summary":       event_summary[:600],
+            "direction":     direction,
+            "magnitude":     magnitude,
+            "expires_days":  expires_days,
+            "catalyst_type": catalyst_type,
+            "key_numbers":   key_numbers[:8],
+            "price_targets": price_targets[:5],
+            "source_region": source_region,
+            "run_id":        run_id,
+            "extracted_at":  now.isoformat(),
+        })
+        nodes_by_id[event_node_id] = {"label": event_label, "type": "EVENT"}
+
+        # Affected assets → event edges
+        for asset_ref in affected:
+            a_node_id = asset_ref if asset_ref.startswith("asset:") else f"asset:{asset_ref}"
+            a_sym = a_node_id.replace("asset:", "")
+            a_label = TICKER_LABELS.get(a_sym, a_sym)
+            _upsert_node(db, a_node_id, "ASSET", a_label, symbol=a_sym)
+            nodes_by_id[a_node_id] = {"label": a_label, "type": "ASSET"}
+            db.add(models.KGEdge(
+                source_node_id=event_node_id, target_node_id=a_node_id,
+                relation="affects", confidence=0.75,
+                source_run_id=run_id, expires_at=expires_at,
+            ))
+            total_edges_added += 1
+
+        # Entity nodes → event edges
+        for ent_ref in entities:
+            if ent_ref.startswith("entity:") or ent_ref.startswith("indicator:"):
+                ent_node_id = ent_ref
+                ent_label = ent_ref.split(":", 1)[1].replace("-", " ").replace("_", " ")
+                ent_type = "ENTITY" if ent_ref.startswith("entity:") else "INDICATOR"
+            else:
+                ent_node_id = f"entity:{ent_ref}"
+                ent_label = ent_ref
+                ent_type = "ENTITY"
+            _upsert_node(db, ent_node_id, ent_type, ent_label)
+            nodes_by_id[ent_node_id] = {"label": ent_label, "type": ent_type}
+            db.add(models.KGEdge(
+                source_node_id=ent_node_id, target_node_id=event_node_id,
+                relation="caused_by", confidence=0.65,
+                source_run_id=run_id, expires_at=expires_at,
+            ))
+            total_edges_added += 1
+
+        # Explicit relations from LLM
+        for rel in relations:
+            src_id = rel.get("source", "")
+            tgt_id = rel.get("target", "")
+            rtype  = rel.get("relation", "related_to")
+            conf   = float(rel.get("confidence", 0.5))
+            if not src_id or not tgt_id or conf < 0.4:
+                continue
+            if rtype not in ("affects", "correlated_with", "caused_by",
+                             "related_to", "sector_peer"):
+                continue
+            for nid in [src_id, tgt_id]:
+                if nid not in nodes_by_id:
+                    ntype = ("ASSET" if nid.startswith("asset:") else
+                             "INDICATOR" if nid.startswith("indicator:") else
+                             "MARKET" if nid.startswith("market:") else
+                             "EVENT" if nid.startswith("event:") else "ENTITY")
+                    nlabel = nid.split(":", 1)[1].replace("-", " ") if ":" in nid else nid
+                    nsym = nid.replace("asset:", "") if nid.startswith("asset:") else None
+                    _upsert_node(db, nid, ntype, nlabel, symbol=nsym)
+                    nodes_by_id[nid] = {"label": nlabel, "type": ntype}
+            db.add(models.KGEdge(
+                source_node_id=src_id, target_node_id=tgt_id,
+                relation=rtype, confidence=conf,
+                source_run_id=run_id, expires_at=expires_at,
+            ))
+            total_edges_added += 1
+
+        # ── Auto-market linking ────────────────────────────────────────────────
+        # Detect which markets this event relates to (keyword + asset membership)
+        auto_markets = _detect_markets_for_event(event_label, event_summary, affected)
+        # Merge with explicitly declared markets from LLM
+        all_markets = set(auto_markets) | set(m for m in markets if m in MARKET_LABELS)
+
+        for market in all_markets:
+            market_node_id = f"market:{market}"
+            # Ensure market node exists
+            _upsert_node(db, market_node_id, "MARKET", MARKET_LABELS.get(market, market))
+            nodes_by_id[market_node_id] = {"label": MARKET_LABELS.get(market, market), "type": "MARKET"}
+
+            # Link event → market
+            db.add(models.KGEdge(
+                source_node_id=event_node_id, target_node_id=market_node_id,
+                relation="affects", confidence=0.80,
+                source_run_id=run_id, expires_at=expires_at,
+            ))
+            total_edges_added += 1
+
+            # Link all affected assets that belong to this market → market node
+            for asset_ref in affected:
+                a_sym = asset_ref.replace("asset:", "").upper()
+                market_tickers_upper = [t.upper() for t in MARKET_TICKERS.get(market, [])]
+                if a_sym in market_tickers_upper:
+                    a_node_id = f"asset:{asset_ref.replace('asset:', '')}"
+                    # event → asset already added; add asset → market if not already structural
+                    exists = db.query(models.KGEdge).filter(
+                        models.KGEdge.source_node_id == a_node_id,
+                        models.KGEdge.target_node_id == market_node_id,
+                        models.KGEdge.relation == "sector_peer",
+                    ).first()
+                    if not exists:
+                        db.add(models.KGEdge(
+                            source_node_id=a_node_id,
+                            target_node_id=market_node_id,
+                            relation="sector_peer", confidence=1.0,
+                            source_run_id="__system__", expires_at=None,
+                        ))
+                        total_edges_added += 1
+
+    try:
+        db.commit()
+    except Exception as e:
+        print(f"[KG] DB commit failed: {e}")
+        db.rollback()
+
+    return total_edges_added
+
+
+# ── Subgraph retrieval ─────────────────────────────────────────────────────────
+
+def get_ticker_subgraph(db: Session, ticker: str, hops: int = 2) -> dict:
+    """BFS from asset:<ticker>, deduplicating edges by max confidence."""
+    start_node_id = f"asset:{ticker}"
+    visited_ids: set[str] = {start_node_id}
+    frontier: set[str] = {start_node_id}
+    all_edges: list = []
+    now = datetime.utcnow()
+
+    for _ in range(min(hops, 3)):
+        if not frontier:
+            break
+        edges = db.query(models.KGEdge).filter(
+            or_(
+                models.KGEdge.source_node_id.in_(list(frontier)),
+                models.KGEdge.target_node_id.in_(list(frontier)),
+            )
+        ).all()
+        active = [e for e in edges if e.expires_at is None or e.expires_at > now]
+        all_edges.extend(active)
+        new_ids: set[str] = set()
+        for e in active:
+            new_ids.add(e.source_node_id)
+            new_ids.add(e.target_node_id)
+        frontier = new_ids - visited_ids
+        visited_ids.update(new_ids)
+
+    nodes = db.query(models.KGNode).filter(
+        models.KGNode.node_id.in_(list(visited_ids))
+    ).all()
+
+    seen_edges: dict[tuple, models.KGEdge] = {}
+    for e in all_edges:
+        key = (e.source_node_id, e.target_node_id, e.relation)
+        if key not in seen_edges or e.confidence > seen_edges[key].confidence:
+            seen_edges[key] = e
+
+    return {
+        "nodes":  [_node_to_dict(n) for n in nodes],
+        "edges":  [_edge_to_dict(e) for e in seen_edges.values()],
+        "center": start_node_id,
+    }
+
+
+def get_full_graph(db: Session, limit_nodes: int = 500) -> dict:
+    """Return all non-expired nodes/edges, capped for performance."""
+    now = datetime.utcnow()
+    nodes = db.query(models.KGNode).order_by(
+        models.KGNode.last_seen_at.desc()
+    ).limit(limit_nodes).all()
+    node_ids = [n.node_id for n in nodes]
+
+    edges = db.query(models.KGEdge).filter(
+        models.KGEdge.source_node_id.in_(node_ids),
+        models.KGEdge.target_node_id.in_(node_ids),
+    ).filter(
+        or_(models.KGEdge.expires_at.is_(None), models.KGEdge.expires_at > now)
+    ).order_by(models.KGEdge.confidence.desc()).limit(2000).all()
+
+    seen_edges: dict[tuple, models.KGEdge] = {}
+    for e in edges:
+        key = (e.source_node_id, e.target_node_id, e.relation)
+        if key not in seen_edges or e.confidence > seen_edges[key].confidence:
+            seen_edges[key] = e
+
+    return {
+        "nodes": [_node_to_dict(n) for n in nodes],
+        "edges": [_edge_to_dict(e) for e in seen_edges.values()],
+    }
+
+
+# ── Agent context formatting ───────────────────────────────────────────────────
+
+def format_subgraph_for_agent(subgraph: dict) -> str:
+    nodes = subgraph.get("nodes", [])
+    edges = subgraph.get("edges", [])
+    if len(nodes) <= 1:
+        return ""
+
+    nodes_by_id = {n["id"]: n for n in nodes}
+    center = subgraph.get("center", "")
+    center_label = nodes_by_id.get(center, {}).get("label", center)
+
+    lines = [f"## Knowledge Graph: {center_label} ({len(edges)} active relationships)\n"]
+
+    event_nodes = [n for n in nodes if n["type"] == "EVENT"]
+    if event_nodes:
+        lines.append("**Recent Market Events (compressed):**")
+        for n in sorted(event_nodes, key=lambda x: x.get("last_seen_at") or "", reverse=True)[:8]:
+            meta = n.get("metadata", {})
+            direction  = meta.get("direction", "")
+            magnitude  = meta.get("magnitude", "")
+            summary    = meta.get("summary", "")
+            dir_icon   = "▲" if direction == "bullish" else "▼" if direction == "bearish" else "●"
+            mag_tag    = f"[{magnitude.upper()}]" if magnitude else ""
+            lines.append(f"  {dir_icon} **{n['label']}** {mag_tag}")
+            if summary:
+                lines.append(f"    {summary[:250]}")
+        lines.append("")
+
+    by_relation: dict[str, list] = {}
+    for e in edges:
+        by_relation.setdefault(e["relation"], []).append(e)
+
+    for relation, rel_edges in sorted(by_relation.items()):
+        label = relation.replace("_", " ").title()
+        lines.append(f"**{label}:**")
+        for e in sorted(rel_edges, key=lambda x: -x["confidence"])[:5]:
+            src_label = nodes_by_id.get(e["source"], {}).get("label", e["source"])
+            tgt_label = nodes_by_id.get(e["target"], {}).get("label", e["target"])
+            lines.append(f"  - {src_label} → {tgt_label} ({int(e['confidence'] * 100)}%)")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def build_kg_context_for_ticker(db: Session, ticker: str) -> str:
+    try:
+        subgraph = get_ticker_subgraph(db, ticker, hops=2)
+        return format_subgraph_for_agent(subgraph)
+    except Exception as e:
+        print(f"[KG] Subgraph failed for {ticker}: {e}")
+        return ""
+
+
+# ── Serialization helpers ──────────────────────────────────────────────────────
+
+def _node_to_dict(n: models.KGNode) -> dict:
+    return {
+        "id":           n.node_id,
+        "type":         n.node_type,
+        "label":        n.label,
+        "symbol":       n.symbol,
+        "metadata":     json.loads(n.metadata_json or "{}"),
+        "last_seen_at": n.last_seen_at.isoformat() if n.last_seen_at else None,
+        "created_at":   n.created_at.isoformat() if n.created_at else None,
+    }
+
+
+def _edge_to_dict(e: models.KGEdge) -> dict:
+    return {
+        "source":     e.source_node_id,
+        "target":     e.target_node_id,
+        "relation":   e.relation,
+        "confidence": round(e.confidence, 3),
+        "expires_at": e.expires_at.isoformat() if e.expires_at else None,
+        "created_at": e.created_at.isoformat() if e.created_at else None,
+    }

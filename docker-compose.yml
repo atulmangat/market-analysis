@@ -35,19 +35,20 @@ services:
     volumes:
       # Hot-reload: mount source so uvicorn --reload picks up changes
       - ./backend:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --timeout-graceful-shutdown 3
 
-  # ── React frontend (nginx, built with local backend URL) ──────────────────
+  # ── React frontend (Vite dev server with HMR) ────────────────────────────
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
-      args:
-        # nginx proxies /api/* → backend:8000, so the browser uses relative URL
-        VITE_API_URL: /api
-    restart: unless-stopped
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install --legacy-peer-deps && npm run dev -- --host"
+    environment:
+      VITE_API_URL: http://localhost:8000/api
     ports:
-      - "5173:80"
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
     depends_on:
       - backend
 

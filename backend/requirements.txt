@@ -13,3 +13,7 @@ yfinance==1.2.0
 openai==1.93.0
 feedparser
 python-dotenv
+# Optional enrichment sources (add API keys to .env to enable)
+# FRED_API_KEY      → https://fred.stlouisfed.org/docs/api/api_key.html (free)
+# FINNHUB_API_KEY   → https://finnhub.io/ (free tier available)
+# ALPHA_VANTAGE_API_KEY → https://www.alphavantage.co/ (free tier available)

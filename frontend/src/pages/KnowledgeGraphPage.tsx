@@ -1,5 +1,5 @@
 import { KnowledgeGraphViewer } from '../components/KnowledgeGraphViewer';
 
-export function KnowledgeGraphPage() {
-  return <KnowledgeGraphViewer />;
+export function KnowledgeGraphPage({ refreshTrigger }: { refreshTrigger?: number }) {
+  return <KnowledgeGraphViewer refreshTrigger={refreshTrigger} />;
 }

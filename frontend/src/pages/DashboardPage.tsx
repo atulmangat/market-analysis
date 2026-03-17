@@ -1,4 +1,4 @@
-import type { Strategy, DebateRound, AgentMemory, Prediction } from '../types';
+import type { Strategy, DebateRound, AgentMemory } from '../types';
 import { MARKET_ICONS } from '../constants';
 import { parseProposals } from '../utils';
 import { Badge } from '../components/Badge';
@@ -7,8 +7,6 @@ import { Card } from '../components/Card';
 import { StatDrawer } from '../components/StatDrawer';
 
 interface DashboardPageProps {
-  predictions: Prediction[];
-  strategies: Strategy[];
   strategiesLoaded: boolean;
   activeStrategies: Strategy[];
   pendingStrategies: Strategy[];
@@ -39,7 +37,7 @@ interface DashboardPageProps {
 }
 
 export function DashboardPage({
-  predictions, strategies, strategiesLoaded,
+  strategiesLoaded,
   activeStrategies, pendingStrategies, debates, memories, groupedMemories,
   debatesByMarketAndTicker, strategiesByMarketAndTicker, marketsWithStrategies,
   activeStratMarket, expandedStratTicker,
@@ -92,222 +90,214 @@ export function DashboardPage({
         />
       )}
 
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-        {/* Strategies — market → ticker hierarchy */}
-        <div className="xl:col-span-2 space-y-4">
-          <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Active Trades</h2>
-          {!strategiesLoaded && (
-            <Card className="p-6 space-y-3">
-              {[1,2,3].map(i => (
-                <div key={i} className="animate-pulse flex items-center gap-4">
-                  <div className="h-8 w-8 rounded-full bg-surface3 shrink-0" style={{opacity: 1 - i*0.2}} />
-                  <div className="flex-1 space-y-2">
-                    <div className="h-3 bg-surface3 rounded w-1/4" style={{opacity: 1 - i*0.2}} />
-                    <div className="h-2.5 bg-surface3 rounded w-1/2" style={{opacity: 1 - i*0.2}} />
+      <div className="space-y-6">
+        {/* Strategies — two sections: active + pending */}
+        <div className="space-y-6">
+
+          {/* ── Active Trades ── */}
+          <div className="space-y-3">
+            <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Active Trades</h2>
+            {!strategiesLoaded && (
+              <Card className="p-6 space-y-3">
+                {[1,2,3].map(i => (
+                  <div key={i} className="animate-pulse flex items-center gap-4">
+                    <div className="h-8 w-8 rounded-full bg-surface3 shrink-0" style={{opacity: 1 - i*0.2}} />
+                    <div className="flex-1 space-y-2">
+                      <div className="h-3 bg-surface3 rounded w-1/4" style={{opacity: 1 - i*0.2}} />
+                      <div className="h-2.5 bg-surface3 rounded w-1/2" style={{opacity: 1 - i*0.2}} />
+                    </div>
                   </div>
-                </div>
-              ))}
-            </Card>
-          )}
-          {strategiesLoaded && strategies.length === 0 && (
-            <Card className="p-10 text-center text-textMuted text-sm">
-              No trades yet — awaiting the next debate cycle.
-            </Card>
-          )}
-          {strategies.length > 0 && (
-            <Card className="overflow-hidden">
-              {/* Market tabs */}
-              <div className="flex border-b border-borderLight overflow-x-auto">
-                {marketsWithStrategies.map(market => (
-                  <button
-                    key={market}
-                    onClick={() => { setExpandedStratMarket(market); setExpandedStratTicker(null); }}
-                    className={`flex items-center gap-2 px-6 py-3.5 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
-                      activeStratMarket === market
-                        ? 'border-brand-500 text-textMain bg-surface2'
-                        : 'border-transparent text-textMuted hover:text-textMain hover:bg-surface2/50'
-                    }`}
-                  >
-                    <span className="text-base">{MARKET_ICONS[market] ?? '📊'}</span>
-                    <span>{market}</span>
-                    <span className="text-[10px] bg-surface3 text-textDim rounded-full px-1.5 py-0.5">
-                      {Object.keys(strategiesByMarketAndTicker[market] ?? {}).length}
-                    </span>
-                  </button>
                 ))}
-              </div>
-
-              {/* Ticker rows */}
-              <div className="divide-y divide-borderLight">
-                {Object.entries(strategiesByMarketAndTicker[activeStratMarket] ?? {}).map(([ticker, tickerStrats]) => {
-                  const isOpen = expandedStratTicker === ticker;
-                  const latestStrat = tickerStrats[0];
-                  const hasPending = tickerStrats.some(s => s.status === 'PENDING');
-
-                  return (
-                    <div key={ticker}>
-                      <button
-                        className="w-full flex items-center justify-between px-5 py-4 hover:bg-surface2 transition-colors text-left group"
-                        onClick={() => { setExpandedStratTicker(isOpen ? null : ticker); if (!isOpen) setTimelineTicker(ticker); else setTimelineTicker(null); }}
-                      >
-                        <div className="flex items-center gap-3">
-                          <div className={`h-1.5 w-1.5 rounded-full ${latestStrat.strategy_type === 'LONG' ? 'bg-up' : 'bg-down'}`} />
-                          <div className="h-9 w-9 rounded-lg bg-surface3 border border-borderMid flex items-center justify-center text-xs font-bold text-textMain">
-                            {ticker.replace(/[.\-=]/g, '').substring(0, 3)}
-                          </div>
-                          <div>
-                            <p className="text-sm font-semibold text-textMain">{ticker}</p>
-                            <p className="text-[11px] text-textMuted">{tickerStrats.length} trade{tickerStrats.length !== 1 ? 's' : ''}</p>
-                          </div>
-                        </div>
-                        <div className="flex items-center gap-3">
-                          {hasPending && (
-                            <span className="text-[10px] text-amber-700 dark:text-amber-300 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 px-2 py-0.5 rounded-full animate-pulse">
-                              Pending
-                            </span>
-                          )}
-                          {latestStrat.status === 'ACTIVE' && (
-                            <span className={`text-xs font-mono font-semibold tabular-nums ${(latestStrat.current_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                              {(latestStrat.current_return ?? 0) >= 0 ? '+' : ''}{(latestStrat.current_return ?? 0).toFixed(2)}%
-                            </span>
-                          )}
-                          <Badge type={latestStrat.strategy_type} />
-                          <span className="text-textDim group-hover:text-textMuted transition-colors text-xs">{isOpen ? '▲' : '▼'}</span>
-                        </div>
-                      </button>
-
-                      {isOpen && (
-                        <div className="bg-background/60 border-t border-borderLight divide-y divide-borderLight">
-                          {tickerStrats.map(strat => (
-                            <div key={strat.id} className={`p-5 ${strat.status === 'PENDING' ? 'ring-inset ring-1 ring-amber-500/20' : ''}`}>
-                              <div className="flex items-start justify-between mb-3">
-                                <div className="flex items-center gap-2">
-                                  <Badge type={strat.strategy_type} />
-                                  <StatusChip status={strat.status} />
-                                  <span className="text-[11px] text-textDim">{new Date(strat.timestamp).toLocaleString()}</span>
-                                </div>
-                                <div className="text-right shrink-0 ml-4">
-                                  {strat.status === 'PENDING' ? (
-                                    <div className="flex gap-2">
-                                      <button
-                                        onClick={() => handleApproval(strat.id, 'approve')}
-                                        className="px-3 py-1.5 bg-up text-white rounded-lg text-xs font-semibold hover:opacity-80 transition-opacity"
-                                      >
-                                        Approve
-                                      </button>
-                                      <button
-                                        onClick={() => handleApproval(strat.id, 'reject')}
-                                        className="px-3 py-1.5 bg-down text-white rounded-lg text-xs font-semibold hover:opacity-80 transition-opacity"
-                                      >
-                                        Reject
-                                      </button>
+              </Card>
+            )}
+            {strategiesLoaded && activeStrategies.length === 0 && (
+              <Card className="p-8 text-center text-textMuted text-sm">
+                No active trades — awaiting next pipeline run.
+              </Card>
+            )}
+            {activeStrategies.length > 0 && (() => {
+              // Build market → ticker map for active only
+              const activeByMarketAndTicker: Record<string, Record<string, Strategy[]>> = {};
+              for (const strat of activeStrategies) {
+                const market = marketsWithStrategies.find(m => Object.keys(strategiesByMarketAndTicker[m] ?? {}).some(t => t === strat.symbol)) ?? 'Other';
+                if (!activeByMarketAndTicker[market]) activeByMarketAndTicker[market] = {};
+                if (!activeByMarketAndTicker[market][strat.symbol]) activeByMarketAndTicker[market][strat.symbol] = [];
+                activeByMarketAndTicker[market][strat.symbol].push(strat);
+              }
+              const activeMarkets = Object.keys(activeByMarketAndTicker);
+              const currentMarket = activeMarkets.includes(activeStratMarket) ? activeStratMarket : activeMarkets[0] ?? '';
+              return (
+                <Card className="overflow-hidden">
+                  {activeMarkets.length > 1 && (
+                    <div className="flex border-b border-borderLight overflow-x-auto">
+                      {activeMarkets.map(market => (
+                        <button key={market} onClick={() => { setExpandedStratMarket(market); setExpandedStratTicker(null); }}
+                          className={`flex items-center gap-2 px-5 py-3 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${
+                            currentMarket === market ? 'border-brand-500 text-textMain bg-surface2' : 'border-transparent text-textMuted hover:text-textMain hover:bg-surface2/50'
+                          }`}>
+                          <span className="text-base">{MARKET_ICONS[market] ?? '📊'}</span>
+                          <span>{market}</span>
+                          <span className="text-[10px] bg-surface3 text-textDim rounded-full px-1.5 py-0.5">
+                            {Object.keys(activeByMarketAndTicker[market] ?? {}).length}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <div className="divide-y divide-borderLight">
+                    {Object.entries(activeByMarketAndTicker[currentMarket] ?? {}).map(([ticker, tickerStrats]) => {
+                      const isOpen = expandedStratTicker === ticker;
+                      const latestStrat = tickerStrats[0];
+                      return (
+                        <div key={ticker}>
+                          <button className="w-full flex items-center justify-between px-5 py-4 hover:bg-surface2 transition-colors text-left group"
+                            onClick={() => { setExpandedStratTicker(isOpen ? null : ticker); if (!isOpen) setTimelineTicker(ticker); else setTimelineTicker(null); }}>
+                            <div className="flex items-center gap-3">
+                              <div className={`h-1.5 w-1.5 rounded-full ${latestStrat.strategy_type === 'LONG' ? 'bg-up' : 'bg-down'}`} />
+                              <div className="h-9 w-9 rounded-lg bg-surface3 border border-borderMid flex items-center justify-center text-xs font-bold text-textMain">
+                                {ticker.replace(/[.\-=]/g, '').substring(0, 3)}
+                              </div>
+                              <div>
+                                <p className="text-sm font-semibold text-textMain">{ticker}</p>
+                                <p className="text-[11px] text-textMuted">{tickerStrats.length} trade{tickerStrats.length !== 1 ? 's' : ''}</p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <span className={`text-xs font-mono font-semibold tabular-nums ${(latestStrat.current_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                                {(latestStrat.current_return ?? 0) >= 0 ? '+' : ''}{(latestStrat.current_return ?? 0).toFixed(2)}%
+                              </span>
+                              <Badge type={latestStrat.strategy_type} />
+                              <span className="text-textDim group-hover:text-textMuted transition-colors text-xs">{isOpen ? '▲' : '▼'}</span>
+                            </div>
+                          </button>
+                          {isOpen && (
+                            <div className="bg-background/60 border-t border-borderLight divide-y divide-borderLight">
+                              {tickerStrats.map(strat => (
+                                <div key={strat.id} className="p-5">
+                                  <div className="flex items-start justify-between mb-3">
+                                    <div className="flex items-center gap-2">
+                                      <Badge type={strat.strategy_type} />
+                                      <StatusChip status={strat.status} />
+                                      <span className="text-[11px] text-textDim">{new Date(strat.timestamp).toLocaleString()}</span>
                                     </div>
-                                  ) : (
-                                    <div className="text-right">
+                                    <div className="text-right shrink-0 ml-4">
                                       <p className="text-[10px] text-textDim uppercase tracking-wider mb-0.5">Return</p>
                                       <p className={`text-2xl font-light tabular-nums ${(strat.current_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
                                         {(strat.current_return ?? 0) >= 0 ? '+' : ''}{(strat.current_return ?? 0).toFixed(2)}%
                                       </p>
                                     </div>
+                                  </div>
+                                  <div className="flex items-center gap-3 text-[11px] text-textMuted mb-3 flex-wrap">
+                                    <span>Entry <span className="text-textMain font-medium font-mono">${strat.entry_price.toFixed(2)}</span></span>
+                                    {strat.position_size && <span>Size <span className="text-textMain font-medium font-mono">${strat.position_size.toLocaleString()}</span></span>}
+                                  </div>
+                                  {strat.notes && (
+                                    <div className="mb-3 px-3 py-2 bg-surface3/50 rounded-lg">
+                                      <p className="text-[11px] text-textMuted italic">{strat.notes}</p>
+                                    </div>
                                   )}
-                                </div>
-                              </div>
-                              <div className="flex items-center gap-3 text-[11px] text-textMuted mb-3 flex-wrap">
-                                <span>Entry <span className="text-textMain font-medium font-mono">${strat.entry_price.toFixed(2)}</span></span>
-                                {strat.position_size && <span>Size <span className="text-textMain font-medium font-mono">${strat.position_size.toLocaleString()}</span></span>}
-                                {strat.exit_price && <span>Exit <span className="text-textMain font-medium font-mono">${strat.exit_price.toFixed(2)}</span></span>}
-                                {strat.close_reason && <span className="text-textDim">{strat.close_reason}</span>}
-                              </div>
-                              {strat.notes && (
-                                <div className="mb-3 px-3 py-2 bg-surface3/50 rounded-lg">
-                                  <p className="text-[11px] text-textMuted italic">{strat.notes}</p>
-                                </div>
-                              )}
-
-                              {/* Edit form */}
-                              {editStratId === strat.id && (
-                                <div className="mb-3 p-3 bg-surface3/50 border border-borderMid rounded-lg space-y-2">
-                                  <div className="flex gap-2">
-                                    <input
-                                      type="number"
-                                      placeholder="Position size ($)"
-                                      value={editStratForm.position_size}
-                                      onChange={e => setEditStratForm({ ...editStratForm, position_size: e.target.value })}
-                                      className="flex-1 bg-surface border border-borderLight rounded px-2 py-1 text-xs text-textMain placeholder-textDim focus:outline-none focus:border-brand-500"
-                                    />
-                                  </div>
-                                  <textarea
-                                    placeholder="Notes..."
-                                    value={editStratForm.notes}
-                                    onChange={e => setEditStratForm({ ...editStratForm, notes: e.target.value })}
-                                    rows={2}
-                                    className="w-full bg-surface border border-borderLight rounded px-2 py-1 text-xs text-textMain placeholder-textDim focus:outline-none focus:border-brand-500 resize-none"
-                                  />
-                                  <div className="flex gap-2">
-                                    <button onClick={() => handleStrategyUpdate(strat.id)} className="px-3 py-1 bg-brand-600 text-white rounded text-xs font-semibold hover:bg-brand-500">Save</button>
-                                    <button onClick={() => setEditStratId(null)} className="px-3 py-1 bg-surface border border-borderLight text-textMuted rounded text-xs">Cancel</button>
+                                  {editStratId === strat.id && (
+                                    <div className="mb-3 p-3 bg-surface3/50 border border-borderMid rounded-lg space-y-2">
+                                      <input type="number" placeholder="Position size ($)" value={editStratForm.position_size}
+                                        onChange={e => setEditStratForm({ ...editStratForm, position_size: e.target.value })}
+                                        className="w-full bg-surface border border-borderLight rounded px-2 py-1 text-xs text-textMain placeholder-textDim focus:outline-none focus:border-brand-500" />
+                                      <textarea placeholder="Notes..." value={editStratForm.notes} rows={2}
+                                        onChange={e => setEditStratForm({ ...editStratForm, notes: e.target.value })}
+                                        className="w-full bg-surface border border-borderLight rounded px-2 py-1 text-xs text-textMain placeholder-textDim focus:outline-none focus:border-brand-500 resize-none" />
+                                      <div className="flex gap-2">
+                                        <button onClick={() => handleStrategyUpdate(strat.id)} className="px-3 py-1 bg-brand-600 text-white rounded text-xs font-semibold hover:bg-brand-500">Save</button>
+                                        <button onClick={() => setEditStratId(null)} className="px-3 py-1 bg-surface border border-borderLight text-textMuted rounded text-xs">Cancel</button>
+                                      </div>
+                                    </div>
+                                  )}
+                                  <div className="pt-3 border-t border-borderLight flex items-start justify-between gap-3">
+                                    <div className="flex-1 min-w-0">
+                                      <p className="text-[10px] text-textDim uppercase tracking-wider mb-1">Rationale</p>
+                                      <p className="text-[11px] text-textMuted leading-relaxed">{strat.reasoning_summary}</p>
+                                    </div>
+                                    <div className="shrink-0 flex gap-2">
+                                      <button onClick={() => openReport(strat.id)}
+                                        className="px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-brand-500/10 border border-brand-500/30 text-brand-400 hover:bg-brand-500/20 transition-all flex items-center gap-1.5">
+                                        <span className="text-xs">◈</span> Full Research Report
+                                      </button>
+                                      <button onClick={() => { setEditStratId(strat.id); setEditStratForm({ position_size: strat.position_size?.toString() ?? '', notes: strat.notes ?? '' }); }}
+                                        className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors">✎ Edit</button>
+                                      <button onClick={() => handleUndeploy(strat.id)} className="px-2 py-1 text-[10px] bg-down-bg text-down-text border border-down/20 rounded hover:opacity-80 transition-opacity font-semibold">✕ Close</button>
+                                    </div>
                                   </div>
                                 </div>
-                              )}
-
-                              <div className="pt-3 border-t border-borderLight flex items-start justify-between gap-3">
-                                <div className="flex-1 min-w-0">
-                                  <p className="text-[10px] text-textDim uppercase tracking-wider mb-1">Rationale</p>
-                                  <p className="text-[11px] text-textMuted leading-relaxed">{strat.reasoning_summary}</p>
-                                </div>
-                                <div className="shrink-0 flex gap-2">
-                                    <button
-                                      onClick={() => openReport(strat.id)}
-                                      className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors"
-                                    >◈ Report</button>
-                                    {strat.status === 'ACTIVE' && <>
-                                      <button
-                                        onClick={() => { setEditStratId(strat.id); setEditStratForm({ position_size: strat.position_size?.toString() ?? '', notes: strat.notes ?? '' }); }}
-                                        className="px-2 py-1 text-[10px] bg-surface3 border border-borderLight text-textMuted rounded hover:text-textMain transition-colors"
-                                      >✎ Edit</button>
-                                      <button
-                                        onClick={() => handleUndeploy(strat.id)}
-                                        className="px-2 py-1 text-[10px] bg-down-bg text-down-text border border-down/20 rounded hover:opacity-80 transition-opacity font-semibold"
-                                      >✕ Undeploy</button>
-                                    </>}
-                                  </div>
-                              </div>
+                              ))}
                             </div>
-                          ))}
+                          )}
                         </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </Card>
-          )}
-        </div>
-
-        {/* Right col: Agent proposals */}
-        <div className="space-y-4">
-          <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Latest Agent Proposals</h2>
-          <Card>
-            <div className="divide-y divide-borderLight max-h-[600px] overflow-y-auto">
-              {predictions.length === 0 && (
-                <p className="p-5 text-xs text-textMuted">No recent proposals.</p>
-              )}
-              {predictions.slice(0, 8).map(pred => (
-                <div key={pred.id} className="p-4">
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-xs font-semibold text-brand-400">{pred.agent_name}</span>
-                    <Badge type={pred.prediction} />
+                      );
+                    })}
                   </div>
-                  <p className="text-[10px] text-textDim font-mono mb-1">{pred.symbol}</p>
-                  {pred.reasoning.includes('Agent error') ? (
-                    <p className="text-[11px] text-down bg-down-bg/50 p-2 rounded border border-down/20">LLM API error — check API key.</p>
-                  ) : (
-                    <p className="text-[11px] text-textMuted line-clamp-3 leading-relaxed">{pred.reasoning}</p>
-                  )}
-                </div>
-              ))}
+                </Card>
+              );
+            })()}
+          </div>
+
+          {/* ── Pending Approval ── */}
+          {pendingStrategies.length > 0 && (
+            <div className="space-y-3">
+              <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest flex items-center gap-2">
+                Pending Approval
+                <span className="text-[10px] bg-amber-500/15 text-amber-500 border border-amber-500/25 px-1.5 py-0.5 rounded-full tabular-nums">{pendingStrategies.length}</span>
+              </h2>
+              <div className="space-y-3">
+                {pendingStrategies.map(strat => (
+                  <Card key={strat.id} className="overflow-hidden">
+                    {/* Amber accent bar */}
+                    <div className="h-0.5 w-full bg-gradient-to-r from-amber-500/60 via-amber-400/30 to-transparent" />
+                    <div className="p-5 space-y-3">
+                      {/* Top row: ticker info + action buttons */}
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex items-center gap-3">
+                          <div className="h-10 w-10 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-xs font-bold text-amber-400 shrink-0">
+                            {strat.symbol.replace(/[.\-=]/g, '').substring(0, 3)}
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-semibold text-textMain font-mono">{strat.symbol}</span>
+                              <Badge type={strat.strategy_type} />
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5 text-[11px] text-textDim">
+                              <span>Entry <span className="font-mono text-textMuted">${strat.entry_price.toFixed(2)}</span></span>
+                              <span>·</span>
+                              <span>{new Date(strat.timestamp).toLocaleString()}</span>
+                            </div>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 shrink-0">
+                          <button onClick={() => handleApproval(strat.id, 'approve')}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold border bg-up-bg text-up-text border-up/25 hover:border-up/50 transition-colors">
+                            ✓ Approve
+                          </button>
+                          <button onClick={() => handleApproval(strat.id, 'reject')}
+                            className="px-3 py-1.5 rounded-lg text-xs font-semibold border bg-surface2 text-textMuted border-borderLight hover:bg-down-bg hover:text-down-text hover:border-down/25 transition-colors">
+                            ✕ Reject
+                          </button>
+                        </div>
+                      </div>
+                      {/* Reasoning */}
+                      {strat.reasoning_summary && (
+                        <p className="text-[11px] text-textMuted leading-relaxed line-clamp-2 pl-[52px]">{strat.reasoning_summary}</p>
+                      )}
+                      {/* Report link — subtle, below reasoning */}
+                      <div className="pl-[52px]">
+                        <button onClick={() => openReport(strat.id)}
+                          className="inline-flex items-center gap-1 text-[11px] text-brand-400 hover:text-brand-300 transition-colors">
+                          <span className="text-[10px]">◈</span> Full Research Report →
+                        </button>
+                      </div>
+                    </div>
+                  </Card>
+                ))}
+              </div>
             </div>
-          </Card>
+          )}
+
         </div>
       </div>
 

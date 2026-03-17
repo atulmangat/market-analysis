@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 
 import type {
-  Prediction, Strategy, StrategyReport, PortfolioPnl, MarketConfig, DebateRound,
-  AgentMemory, AgentPrompt, AgentFitness, AgentEvolution, WebResearch,
-  PipelineEvent, PipelineRun, LiveQuote, MarketEvent,
+  Strategy, StrategyReport, PortfolioPnl, MarketConfig, DebateRound,
+  AgentMemory, AgentPrompt, AgentFitness, WebResearch,
+  PipelineEvent, PipelineRun, LiveQuote, MarketEvent, Page
 } from './types';
 import { NAV } from './constants';
-import { getToken, clearToken, apiFetch, applyTheme, getMarketForTicker } from './utils';
+import { getToken, apiFetch, applyTheme, getMarketForTicker } from './utils';
 
 import { Badge } from './components/Badge';
 import { ToastList } from './components/ToastList';
@@ -18,15 +18,15 @@ import { DashboardPage } from './pages/DashboardPage';
 import { MarketsPage } from './pages/MarketsPage';
 import { KnowledgeGraphPage } from './pages/KnowledgeGraphPage';
 import { PortfolioPage } from './pages/PortfolioPage';
-import { MemoryPage } from './pages/MemoryPage';
+import { AgentPage } from './pages/AgentPage';
 import { PipelinePage } from './pages/PipelinePage';
 import { SettingsPage } from './pages/SettingsPage';
+import { PageLoader } from './components/PageLoader';
 
 // ── Main App ───────────────────────────────────────────────────────────────
 
 function AppInner() {
   const { toasts, push: toast } = useToast();
-  const [predictions, setPredictions]       = useState<Prediction[]>([]);
   const [strategies, setStrategies]         = useState<Strategy[]>([]);
   const [markets, setMarkets]               = useState<MarketConfig[]>(() => {
     try { return JSON.parse(localStorage.getItem('markets') ?? 'null') ?? []; } catch { return []; }
@@ -35,8 +35,6 @@ function AppInner() {
   const [memories, setMemories]             = useState<AgentMemory[]>([]);
   const [agents, setAgents]                 = useState<AgentPrompt[]>([]);
   const [agentFitness, setAgentFitness]     = useState<AgentFitness[]>([]);
-  const [agentEvolution, setAgentEvolution] = useState<AgentEvolution[]>([]);
-  const [evolutionAgent, setEvolutionAgent] = useState<string | null>(null);
   const [research, setResearch]             = useState<WebResearch[]>(() => { try { return JSON.parse(localStorage.getItem('cache_research') ?? 'null') ?? []; } catch { return []; } });
   const [liveQuotes, setLiveQuotes]         = useState<LiveQuote[]>(() => { try { return JSON.parse(localStorage.getItem('cache_quotes') ?? 'null') ?? []; } catch { return []; } });
   const [marketEvents, setMarketEvents]     = useState<MarketEvent[]>(() => { try { return JSON.parse(localStorage.getItem('cache_market_events') ?? 'null') ?? []; } catch { return []; } });
@@ -66,7 +64,52 @@ function AppInner() {
   const [investmentFocus, setInvestmentFocus] = useState('');
   const [investmentFocusSaved, setInvestmentFocusSaved] = useState(false);
   const [strategiesLoaded, setStrategiesLoaded] = useState(false);
-  const [page, setPage]                     = useState<import('./types').Page>('dashboard');
+  const [dataLoaded, setDataLoaded] = useState(false);
+  // URL path ↔ Page mapping. '/agents' maps to the internal 'memory' page id.
+  const URL_TO_PAGE: Record<string, Page> = {
+    '/dashboard': 'dashboard',
+    '/markets':   'markets',
+    '/data':      'graph',
+    '/portfolio': 'portfolio',
+    '/agents':    'memory',
+    '/pipeline':  'pipeline',
+    '/settings':  'settings',
+  };
+  const PAGE_TO_URL: Record<Page, string> = {
+    dashboard: '/dashboard',
+    markets:   '/markets',
+    graph:     '/data',
+    portfolio: '/portfolio',
+    memory:    '/agents',
+    pipeline:  '/pipeline',
+    settings:  '/settings',
+  };
+
+  const pageFromPath = (): Page => {
+    const path = window.location.pathname;
+    return URL_TO_PAGE[path] ?? 'dashboard';
+  };
+
+  const [page, setPage] = useState<Page>(pageFromPath);
+
+  const navigate = (p: Page) => {
+    window.history.pushState(null, '', PAGE_TO_URL[p]);
+    setPage(p);
+  };
+
+  useEffect(() => {
+    const handlePopState = () => setPage(pageFromPath());
+    window.addEventListener('popstate', handlePopState);
+    // Sync URL on first load (handles bare '/' → '/dashboard')
+    if (!URL_TO_PAGE[window.location.pathname]) {
+      window.history.replaceState(null, '', PAGE_TO_URL[page]);
+    }
+    return () => window.removeEventListener('popstate', handlePopState);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+
+
   const userNavigatedRef = useRef(false);
   const [darkMode, setDarkMode]             = useState<boolean>(() => {
     const saved = localStorage.getItem('theme');
@@ -74,7 +117,6 @@ function AppInner() {
     applyTheme(isDark);
     return isDark;
   });
-  const [selectedAgent, setSelectedAgent]   = useState<string | null>(null);
   const [editingPromptAgent, setEditingPromptAgent] = useState<string | null>(null);
   const [editPromptText, setEditPromptText] = useState('');
 
@@ -82,11 +124,7 @@ function AppInner() {
   const [expandedDebateId, setExpandedDebateId]   = useState<number | null>(null);
   const [timelineTicker, setTimelineTicker]       = useState<string | null>(null);
 
-  const loadEvolution = async (agentName: string) => {
-    const res = await apiFetch(`/agents/evolution/${encodeURIComponent(agentName)}`);
-    if (res.ok) setAgentEvolution(await res.json());
-    setEvolutionAgent(agentName);
-  };
+
 
   const toggleDarkMode = () => {
     const next = !darkMode;
@@ -110,22 +148,21 @@ function AppInner() {
 
   const fetchData = async () => {
     try {
-      const [stratRes, predRes, mktRes, debRes, appRes, memRes, resRes, schedRes, statRes, agentRes] = await Promise.all([
-        apiFetch('/strategies'), apiFetch('/predictions'),
+      const [stratRes, mktRes, debRes, appRes, memRes, resRes, schedRes, agentRes] = await Promise.all([
+        apiFetch('/strategies'),
         apiFetch('/config/markets'), apiFetch('/debates'), apiFetch('/config/approval_mode'),
-        apiFetch('/memory'), apiFetch('/research'), apiFetch('/config/schedule'), apiFetch('/system/status'),
+        apiFetch('/memory'), apiFetch('/research'), apiFetch('/config/schedule'),
         apiFetch('/agents'),
       ]);
       if (stratRes.ok) setStrategies(await stratRes.json());
       setStrategiesLoaded(true);
-      if (predRes.ok) setPredictions(await predRes.json());
+      setDataLoaded(true);
       if (mktRes.ok) { const mktData = await mktRes.json(); setMarkets(mktData); localStorage.setItem('markets', JSON.stringify(mktData)); }
       if (debRes.ok) setDebates(await debRes.json());
       if (appRes.ok) { const d = await appRes.json(); setApprovalMode(d.approval_mode); }
       if (memRes.ok) setMemories(await memRes.json());
       if (resRes.ok) { const d = await resRes.json(); setResearch(d); try { localStorage.setItem('cache_research', JSON.stringify(d)); } catch { /* storage quota */ } }
       if (schedRes.ok) { const d = await schedRes.json(); setScheduleInterval(d.interval_minutes); }
-      if (statRes.ok) { const d = await statRes.json(); setIsTriggering(d.is_running); }
       if (agentRes.ok) setAgents(await agentRes.json());
       const [fitnessRes, budgetRes, pnlRes, focusRes] = await Promise.all([
         apiFetch('/agents/fitness'),
@@ -191,6 +228,8 @@ function AppInner() {
   const [selectedRunEvents, setSelectedRunEvents] = useState<PipelineEvent[]>([]);
   const [selectedRunLoading, setSelectedRunLoading] = useState(false);
   const [statFocus, setStatFocus]           = useState<'active' | 'pending' | 'debates' | 'memories' | null>(null);
+  const [kgRefreshTrigger, setKgRefreshTrigger] = useState(0);
+  const lastKgRunIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     const pollPipeline = async () => {
@@ -198,17 +237,29 @@ function AppInner() {
         const res = await apiFetch('/pipeline/events');
         if (res.ok) {
           const data = await res.json();
+          const runId = data.run_id as string | null;
+          // Trust the backend's is_running flag — it includes the stale-lock guard.
+          // Do NOT re-derive from run_step: an intermediate step with is_running=false
+          // means the pipeline died mid-step, not that it's still running.
           const running = !!data.is_running;
           isTriggeringRef.current = running;
           setIsTriggering(running);
-          setPipelineRunId(data.run_id ?? null);
-          if (running) {
-            setPipelineEvents(data.events ?? []);
-            if (!initialPollDoneRef.current && !userNavigatedRef.current) {
-              setPage('pipeline');
-            }
+          setPipelineRunId(runId);
+          // Always show events for the current run_id — don't clear on refresh
+          const events: PipelineEvent[] = data.events ?? [];
+          if (runId) {
+            setPipelineEvents(events);
           } else {
             setPipelineEvents([]);
+          }
+          if (running && !initialPollDoneRef.current && !userNavigatedRef.current) {
+            navigate('pipeline');
+          }
+          // Refresh KG viewer as soon as KG_INGEST DONE appears (once per run)
+          const kgDone = events.some(e => e.step === 'KG_INGEST' && e.status === 'DONE');
+          if (kgDone && runId && lastKgRunIdRef.current !== runId) {
+            lastKgRunIdRef.current = runId;
+            setKgRefreshTrigger(t => t + 1);
           }
           initialPollDoneRef.current = true;
         }
@@ -232,6 +283,7 @@ function AppInner() {
 
     pollPipeline();
     return () => { if (pollTimerRef.current) clearTimeout(pollTimerRef.current); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const loadRunEvents = async (runId: string) => {
@@ -459,11 +511,11 @@ function AppInner() {
   const activeStratMarket = marketsWithStrategies.includes(expandedStratMarket) ? expandedStratMarket : (marketsWithStrategies[0] ?? 'US');
 
   const renderPage = () => {
+    if (!dataLoaded) return <PageLoader />;
     switch (page) {
       case 'dashboard':
         return (
           <DashboardPage
-            strategies={strategies}
             strategiesLoaded={strategiesLoaded}
             debates={debates}
             memories={memories}
@@ -491,7 +543,6 @@ function AppInner() {
             handleUndeploy={handleUndeploy}
             handleStrategyUpdate={handleStrategyUpdate}
             openReport={openReport}
-            predictions={predictions}
           />
         );
       case 'markets':
@@ -499,6 +550,7 @@ function AppInner() {
           <MarketsPage
             enabledMarketNames={enabledMarketNames}
             activeStrategies={activeStrategies}
+            pendingStrategies={pendingStrategies}
             liveQuotes={liveQuotes}
             marketEvents={marketEvents}
             quotesLoading={quotesLoading}
@@ -517,12 +569,15 @@ function AppInner() {
             marketsSearchLoading={marketsSearchLoading}
             setMarketsSearchLoading={setMarketsSearchLoading}
             marketsSearchTimer={marketsSearchTimer}
+            isTriggering={isTriggering}
             fetchQuotes={fetchQuotes}
             openReport={openReport}
+            onTrigger={handleManualTrigger}
+            onApprove={handleApproval}
           />
         );
       case 'graph':
-        return <KnowledgeGraphPage />;
+        return <KnowledgeGraphPage refreshTrigger={kgRefreshTrigger} />;
       case 'portfolio':
         return (
           <PortfolioPage
@@ -542,14 +597,16 @@ function AppInner() {
         );
       case 'memory':
         return (
-          <MemoryPage
+          <AgentPage
             agents={agents}
             groupedMemories={groupedMemories}
+            agentFitness={agentFitness}
             editingPromptAgent={editingPromptAgent}
             editPromptText={editPromptText}
             setEditingPromptAgent={setEditingPromptAgent}
             setEditPromptText={setEditPromptText}
             saveAgentPrompt={saveAgentPrompt}
+            onRefresh={fetchData}
           />
         );
       case 'pipeline':
@@ -604,15 +661,6 @@ function AppInner() {
             handleScheduleUpdate={handleScheduleUpdate}
             handleManualTrigger={handleManualTrigger}
             isTriggering={isTriggering}
-            agents={agents}
-            agentFitness={agentFitness}
-            agentEvolution={agentEvolution}
-            evolutionAgent={evolutionAgent}
-            selectedAgent={selectedAgent}
-            setSelectedAgent={setSelectedAgent}
-            loadEvolution={loadEvolution}
-            setEvolutionAgent={setEvolutionAgent}
-            memories={memories}
           />
         );
       default:
@@ -622,100 +670,116 @@ function AppInner() {
 
   return (
     <div className="flex min-h-screen bg-background overflow-hidden">
-      {/* Sidebar */}
-      <aside className="w-56 min-w-[14rem] max-w-[14rem] shrink-0 border-r border-borderLight bg-surface flex flex-col overflow-hidden">
+      {/* ── Sidebar ── */}
+      <aside className="w-52 shrink-0 border-r border-borderLight bg-surface flex flex-col overflow-hidden">
         {/* Logo */}
-        <div className="px-5 py-5 border-b border-borderLight">
-          <div className="flex items-center gap-2.5">
-            <div className="h-7 w-7 rounded-md bg-brand-600 flex items-center justify-center text-white text-xs font-bold">MI</div>
+        <div className="px-5 py-[18px] border-b border-borderLight">
+          <div className="flex items-center gap-3">
+            <div className="h-8 w-8 rounded-lg bg-brand-600 flex items-center justify-center shrink-0">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+                <path d="M2 12 L5 8 L8 10 L11 5 L14 7" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
+                <circle cx="14" cy="7" r="1.5" fill="white"/>
+              </svg>
+            </div>
             <div>
-              <p className="text-sm font-semibold text-textMain leading-none">Market Intel</p>
-              <p className="text-[10px] text-textDim mt-0.5">AI Strategy Engine</p>
+              <p className="text-[13px] font-semibold text-textMain leading-none tracking-tight">Market Intel</p>
+              <p className="text-[10px] text-textDim mt-0.5 tracking-wide">AI Strategy Engine</p>
             </div>
           </div>
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 py-4 px-3 space-y-0.5">
+        <nav className="flex-1 py-3 px-2.5 space-y-px">
           {NAV.map(n => (
             <button
               key={n.id}
-              onClick={() => { userNavigatedRef.current = true; setPage(n.id); }}
-              className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors text-left ${
+              onClick={() => { userNavigatedRef.current = true; navigate(n.id); }}
+              className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all text-left group ${
                 page === n.id
-                  ? 'bg-brand-600/15 text-brand-400'
-                  : 'text-textMuted hover:text-textMain hover:bg-surface2'
+                  ? 'bg-brand-600/12 text-brand-400'
+                  : 'text-textDim hover:text-textMuted hover:bg-surface2'
               }`}
             >
-              <span className={`text-base w-4 text-center ${n.id === 'pipeline' && isTriggering ? 'animate-spin text-amber-400' : ''}`}>{n.icon}</span>
-              <span className="flex-1">{n.label}</span>
+              <span className={`text-sm w-4 text-center shrink-0 transition-colors ${
+                page === n.id ? 'text-brand-400' :
+                n.id === 'pipeline' && isTriggering ? 'text-amber-400 animate-spin' :
+                'text-textDim group-hover:text-textMuted'
+              }`}>{n.icon}</span>
+              <span className="flex-1 truncate">{n.label}</span>
               {n.id === 'pipeline' && isTriggering && (
-                <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               )}
             </button>
           ))}
         </nav>
 
-        {/* Theme toggle + status */}
-        <div className="px-5 py-4 border-t border-borderLight space-y-3">
-          <button
-            onClick={toggleDarkMode}
-            className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-surface2 border border-borderLight hover:bg-surface3 transition-colors"
-          >
-            <span className="text-[11px] text-textMuted">{darkMode ? 'Dark Mode' : 'Light Mode'}</span>
-            <span className="text-base">{darkMode ? '🌙' : '☀️'}</span>
-          </button>
-          <div className="flex items-center gap-2">
-            <span className={`h-1.5 w-1.5 rounded-full ${isTriggering ? 'bg-amber-400 animate-pulse' : 'bg-up animate-pulse'}`} />
-            <button onClick={() => isTriggering && setPage('pipeline')} className={`text-[11px] ${isTriggering ? 'text-amber-400 hover:underline cursor-pointer' : 'text-textMuted'}`}>
-              {isTriggering ? 'Debate running…' : 'System active'}
+        {/* Footer */}
+        <div className="px-3 py-3 border-t border-borderLight space-y-2">
+          <div className="flex items-center gap-2 px-3 py-2">
+            <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${isTriggering ? 'bg-amber-400 animate-pulse' : 'bg-up'}`} />
+            <button
+              onClick={() => isTriggering && navigate('pipeline')}
+              className={`text-[11px] truncate ${isTriggering ? 'text-amber-400 hover:underline cursor-pointer' : 'text-textDim'}`}
+            >
+              {isTriggering ? 'Pipeline running…' : 'System active'}
             </button>
           </div>
+          <button
+            onClick={toggleDarkMode}
+            className="w-full flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface2 transition-colors group"
+          >
+            <span className="text-[11px] text-textDim group-hover:text-textMuted">{darkMode ? 'Dark' : 'Light'}</span>
+            <span className="text-xs text-textDim">{darkMode ? '○' : '●'}</span>
+          </button>
         </div>
       </aside>
 
-      {/* Main content */}
+      {/* ── Main content ── */}
       <main className="flex-1 min-w-0 overflow-y-auto h-screen">
         {/* Top bar */}
-        <header className="sticky top-0 z-10 bg-background/80 backdrop-blur border-b border-borderLight px-8 py-4 flex items-center justify-between">
-          <div>
-            <h1 className="text-base font-semibold text-textMain capitalize">{NAV.find(n => n.id === page)?.label}</h1>
-            <p className="text-[11px] text-textDim mt-0.5">{new Date().toLocaleString()}</p>
-          </div>
+        <header className="sticky top-0 z-10 bg-background/90 backdrop-blur-md border-b border-borderLight px-7 py-3.5 flex items-center justify-between">
           <div className="flex items-center gap-3">
+            <h1 className="text-sm font-semibold text-textMain">
+              {NAV.find(n => n.id === page)?.label}
+            </h1>
+            <span className="text-borderMid">·</span>
+            <p className="text-[11px] text-textDim tabular-nums">{new Date().toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>
+          </div>
+          <div className="flex items-center gap-2">
             {pendingStrategies.length > 0 && (
               <div className="relative">
                 <button
                   onClick={() => setPendingDropdownOpen(o => !o)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-100 dark:bg-amber-950 border border-amber-300 dark:border-amber-500/30 text-amber-700 dark:text-amber-300 rounded-lg text-xs font-medium animate-pulse hover:bg-amber-200 dark:hover:bg-amber-900 transition-colors"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-400/8 border border-amber-400/20 text-amber-400 rounded-lg text-[11px] font-medium hover:bg-amber-400/12 transition-colors"
                 >
-                  <span>⚠</span> {pendingStrategies.length} pending {pendingStrategies.length === 1 ? 'trade' : 'trades'}
+                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  {pendingStrategies.length} pending
                 </button>
                 {pendingDropdownOpen && (
-                  <div className="absolute right-0 top-full mt-2 z-50 w-80 bg-surface border border-borderMid rounded-xl shadow-2xl overflow-hidden">
-                    <div className="px-4 py-3 border-b border-borderLight bg-surface2 flex items-center justify-between">
-                      <span className="text-xs font-semibold text-amber-400">Pending Approval</span>
-                      <button onClick={() => setPendingDropdownOpen(false)} className="text-textDim hover:text-textMain text-base leading-none">×</button>
+                  <div className="absolute right-0 top-full mt-2 z-50 w-72 bg-surface border border-borderMid rounded-xl shadow-2xl overflow-hidden">
+                    <div className="px-4 py-2.5 border-b border-borderLight flex items-center justify-between">
+                      <span className="text-[11px] font-semibold text-textMuted uppercase tracking-wider">Pending Approval</span>
+                      <button onClick={() => setPendingDropdownOpen(false)} className="text-textDim hover:text-textMain text-base leading-none w-5 h-5 flex items-center justify-center">×</button>
                     </div>
                     <div className="divide-y divide-borderLight max-h-96 overflow-y-auto">
                       {pendingStrategies.map(s => (
-                        <div key={s.id} className="px-4 py-3 space-y-2">
+                        <div key={s.id} className="px-4 py-3 space-y-2.5">
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">
-                              <span className={`text-xs font-bold px-2 py-0.5 rounded ${s.strategy_type === 'LONG' ? 'bg-up/10 text-up' : 'bg-down/10 text-down'}`}>{s.strategy_type}</span>
-                              <span className="text-sm font-semibold text-textMain">{s.symbol}</span>
+                              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${s.strategy_type === 'LONG' ? 'bg-up/10 text-up border border-up/15' : 'bg-down/10 text-down border border-down/15'}`}>{s.strategy_type}</span>
+                              <span className="text-sm font-semibold text-textMain font-mono">{s.symbol}</span>
                             </div>
-                            <span className="text-[10px] text-textDim">${(s.entry_price ?? 0).toFixed(2)}</span>
+                            <span className="text-[11px] text-textDim font-mono">${(s.entry_price ?? 0).toFixed(2)}</span>
                           </div>
                           <p className="text-[11px] text-textMuted leading-relaxed line-clamp-2">{s.reasoning_summary}</p>
-                          <div className="flex gap-2 pt-1">
+                          <div className="flex gap-2">
                             <button
                               onClick={() => { handleApproval(s.id, 'approve'); setPendingDropdownOpen(false); }}
-                              className="flex-1 py-1.5 text-xs font-semibold rounded-lg bg-up/10 border border-up/30 text-up hover:bg-up/20 transition-colors"
+                              className="flex-1 py-1.5 text-[11px] font-semibold rounded-lg bg-up/10 border border-up/20 text-up hover:bg-up/15 transition-colors"
                             >Approve</button>
                             <button
                               onClick={() => { handleApproval(s.id, 'reject'); setPendingDropdownOpen(false); }}
-                              className="flex-1 py-1.5 text-xs font-semibold rounded-lg bg-down/10 border border-down/30 text-down hover:bg-down/20 transition-colors"
+                              className="flex-1 py-1.5 text-[11px] font-semibold rounded-lg bg-down/10 border border-down/20 text-down hover:bg-down/15 transition-colors"
                             >Reject</button>
                           </div>
                         </div>
@@ -727,32 +791,15 @@ function AppInner() {
             )}
             <button
               onClick={toggleDarkMode}
-              className="h-8 w-8 flex items-center justify-center rounded-lg bg-surface2 border border-borderLight hover:bg-surface3 transition-colors text-base"
-              title={darkMode ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              className="h-8 w-8 flex items-center justify-center rounded-lg border border-borderLight hover:bg-surface2 transition-colors text-textDim hover:text-textMuted"
+              title={darkMode ? 'Light mode' : 'Dark mode'}
             >
-              {darkMode ? '☀️' : '🌙'}
-            </button>
-            <button
-              onClick={() => { clearToken(); window.location.reload(); }}
-              className="h-8 w-8 flex items-center justify-center rounded-lg bg-surface2 border border-borderLight hover:bg-red-900/40 hover:border-red-700/50 hover:text-red-400 text-textDim transition-colors text-sm"
-              title="Sign out"
-            >⏻</button>
-            <button
-              onClick={() => handleManualTrigger()}
-              disabled={isTriggering}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                isTriggering
-                  ? 'bg-surface3 border-borderLight text-textDim cursor-not-allowed'
-                  : 'bg-brand-600 border-brand-500 text-white hover:bg-brand-500'
-              }`}
-            >
-              {isTriggering ? <span className="animate-spin">↻</span> : <span>▶</span>}
-              {isTriggering ? 'Running' : 'Run Now'}
+              <span className="text-xs">{darkMode ? '○' : '●'}</span>
             </button>
           </div>
         </header>
 
-        <div className="p-8">
+        <div className="px-7 py-6">
           {renderPage()}
         </div>
       </main>
@@ -817,14 +864,10 @@ function AppInner() {
 
 function App() {
   const [authed, setAuthed] = useState<boolean>(() => !!getToken());
+
   const handleLogin = () => {
-    window.history.replaceState(null, '', window.location.pathname);
     setAuthed(true);
   };
-  // If already authed and URL has a landing-page hash (e.g. #how-it-works), strip it
-  if (authed && window.location.hash) {
-    window.history.replaceState(null, '', window.location.pathname);
-  }
   if (!authed) return <LandingPage onLogin={handleLogin} />;
   return <AppInner />;
 }

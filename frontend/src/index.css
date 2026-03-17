@@ -1,39 +1,57 @@
 @import "tailwindcss";
 
-/* ── Dark theme (default) ── */
 @theme {
-  --color-brand-50: #eff6ff;
-  --color-brand-100: #dbeafe;
-  --color-brand-200: #bfdbfe;
-  --color-brand-400: #60a5fa;
-  --color-brand-500: #3b82f6;
-  --color-brand-600: #2563eb;
-  --color-brand-700: #1d4ed8;
-  --color-brand-900: #1e3a8a;
+  /* ── Brand: indigo/violet accent ── */
+  --color-brand-50: #eef2ff;
+  --color-brand-100: #e0e7ff;
+  --color-brand-200: #c7d2fe;
+  --color-brand-400: #818cf8;
+  --color-brand-500: #6366f1;
+  --color-brand-600: #4f46e5;
+  --color-brand-700: #4338ca;
+  --color-brand-900: #1e1b4b;
 
-  --color-surface: #1e2433;
-  --color-surface2: #252d3d;
-  --color-surface3: #2d3748;
-  --color-background: #141921;
-  --color-borderLight: #2d3748;
-  --color-borderMid: #374151;
-  --color-textMain: #f1f5f9;
-  --color-textMuted: #94a3b8;
-  --color-textDim: #64748b;
+  /* ── Dark surfaces: true zinc ── */
+  --color-surface: #111118;
+  --color-surface2: #18181f;
+  --color-surface3: #1f1f2a;
+  --color-background: #09090f;
 
-  --color-up: #10b981;
-  --color-up-bg: #064e3b;
-  --color-up-text: #6ee7b7;
-  --color-down: #f43f5e;
-  --color-down-bg: #4c0519;
-  --color-down-text: #fda4af;
+  /* ── Borders ── */
+  --color-borderLight: #26263a;
+  --color-borderMid: #32324a;
 
+  /* ── Text ── */
+  --color-textMain: #f4f4f8;
+  --color-textMuted: #9090a8;
+  --color-textDim: #52526a;
+
+  /* ── Sentiment (Soft Mint / Rose) ── */
+  --color-up: oklch(0.75 0.15 145);
+  --color-up-bg: oklch(0.3 0.1 145 / 0.2);
+  --color-up-text: oklch(0.85 0.1 145);
+
+  --color-down: oklch(0.7 0.15 15);
+  --color-down-bg: oklch(0.3 0.1 15 / 0.2);
+  --color-down-text: oklch(0.85 0.1 15);
+
+  --color-warning: #fbbf24;
+  --color-warning-bg: #451a03;
+  --color-warning-text: #fef3c7;
+
+  --color-info: #60a5fa;
+  --color-info-bg: #172554;
+  --color-info-text: #dbeafe;
+
+  /* ── Fonts ── */
   --font-sans: "Inter", "system-ui", sans-serif;
-  --font-mono: "JetBrains Mono", "Fira Code", monospace;
+  --font-mono: "JetBrains Mono", "Fira Code", "ui-monospace", monospace;
 }
 
 @layer base {
-  * { box-sizing: border-box; }
+  * {
+    box-sizing: border-box;
+  }
 
   body {
     background-color: var(--color-background);
@@ -42,29 +60,81 @@
     margin: 0;
     min-height: 100vh;
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
-  /* ── Light mode overrides ── */
+  /* ── Light mode ── */
   html:not(.dark) {
     --color-surface: #ffffff;
-    --color-surface2: #f8fafc;
-    --color-surface3: #f1f5f9;
-    --color-background: #f0f4f8;
-    --color-borderLight: #e2e8f0;
-    --color-borderMid: #cbd5e1;
-    --color-textMain: #0f172a;
-    --color-textMuted: #475569;
-    --color-textDim: #94a3b8;
+    --color-surface2: #fafafa;
+    --color-surface3: #f4f4f5;
+    --color-background: #f1f1f5;
 
-    --color-up: #059669;
-    --color-up-bg: #d1fae5;
-    --color-up-text: #065f46;
-    --color-down: #e11d48;
-    --color-down-bg: #ffe4e6;
-    --color-down-text: #9f1239;
+    --color-borderLight: #e4e4ec;
+    --color-borderMid: #d4d4de;
+
+    --color-textMain: #09090f;
+    --color-textMuted: #52526a;
+    --color-textDim: #a0a0b8;
+
+    --color-up: oklch(0.6 0.15 145);
+    --color-up-bg: oklch(0.95 0.05 145);
+    --color-up-text: oklch(0.3 0.1 145);
+
+    --color-down: oklch(0.6 0.15 15);
+    --color-down-bg: oklch(0.95 0.05 15);
+    --color-down-text: oklch(0.3 0.1 15);
+
+    --color-warning: #d97706;
+    --color-warning-bg: #fef3c7;
+    --color-warning-text: #78350f;
+
+    --color-info: #2563eb;
+    --color-info-bg: #dbeafe;
+    --color-info-text: #1e3a8a;
   }
 
-  ::-webkit-scrollbar { width: 4px; height: 4px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--color-borderMid); border-radius: 2px; }
+  /* ── Scrollbar ── */
+  ::-webkit-scrollbar {
+    width: 3px;
+    height: 3px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-borderMid);
+    border-radius: 99px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-textDim);
+  }
+
+  /* ── Selection ── */
+  ::selection {
+    background: #4f46e5;
+    color: #fff;
+  }
+}
+
+/* ── Utility: glass card ── */
+@layer utilities {
+  .card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-borderLight);
+    border-radius: 12px;
+  }
+
+  .card-sm {
+    background: var(--color-surface2);
+    border: 1px solid var(--color-borderLight);
+    border-radius: 8px;
+  }
+
+  .inset-ring {
+    box-shadow: inset 0 0 0 1px var(--color-borderLight);
+  }
 }

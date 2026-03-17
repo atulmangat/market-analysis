@@ -26,7 +26,7 @@ export interface MarketConfig { id: number; market_name: string; is_enabled: num
 export interface DebateRound { id: number; timestamp: string; consensus_ticker: string; consensus_action: string; consensus_votes: string; proposals_json: string; enabled_markets: string; research_context?: string; judge_reasoning?: string; }
 export interface Proposal { agent_name: string; ticker: string; action: string; reasoning: string; }
 export interface AgentMemory { id: number; agent_name: string; note_type: string; content: string; created_at: string; }
-export interface AgentPrompt { id: number; agent_name: string; system_prompt: string; updated_at: string | null; }
+export interface AgentPrompt { id: number; agent_name: string; description?: string; system_prompt: string; updated_at: string | null; }
 export interface AgentFitness { agent_name: string; generation: number; fitness_score: number | null; win_rate: number | null; avg_return: number | null; total_scored: number; updated_at: string | null; }
 export interface AgentEvolution { id: number; generation: number; fitness_score: number | null; win_rate: number | null; avg_return: number | null; total_scored: number; evolution_reason: string | null; system_prompt: string; replaced_at: string | null; created_at: string; }
 export interface KGNode { id: string; type: 'ASSET' | 'EVENT' | 'ENTITY' | 'INDICATOR'; label: string; symbol: string | null; last_seen_at: string | null; metadata: Record<string, unknown>; x?: number; y?: number; vx?: number; vy?: number; fx?: number; fy?: number; }
@@ -34,8 +34,10 @@ export interface KGEdge { source: string; target: string; relation: string; conf
 export interface KnowledgeGraph { nodes: KGNode[]; edges: KGEdge[]; center?: string; }
 export interface WebResearch { id: number; title: string; snippet: string; source_url: string; fetched_at: string; }
 export interface PipelineEvent { id: number; step: string; agent_name: string | null; status: string; detail: string | null; created_at: string; }
-export interface PipelineRunOutput { ticker: string; action: string; votes: string; judge_reasoning: string; proposals: { agent_name: string; ticker: string; action: string; reasoning: string }[]; strategy_id: number | null; debate_id: number | null; }
-export interface PipelineRun { run_id: string; started_at: string; ended_at: string; event_count: number; status: 'running' | 'done' | 'error'; deploy_detail: string | null; output: PipelineRunOutput | null; }
+export interface PipelinePosition { ticker: string; action: string; horizon?: string; size?: string; target?: string; stop?: string; reasoning: string; strategy_id: number | null; }
+export interface PipelineRunOutput { positions: PipelinePosition[]; proposals: { agent_name: string; ticker: string; action: string; reasoning: string }[]; debate_id: number | null; ticker: string; action: string; votes: string; judge_reasoning: string; strategy_id: number | null; }
+export interface PipelineRunParams { focus?: string; tickers?: string[]; markets?: string[]; }
+export interface PipelineRun { run_id: string; started_at: string; ended_at: string; event_count: number; status: 'running' | 'done' | 'error'; deploy_detail: string | null; run_params: PipelineRunParams | null; output: PipelineRunOutput | null; }
 export interface LiveQuote { market: string; symbol: string; name: string; price: number | null; prev_close: number | null; change_pct: number | null; volume: number | null; week_closes?: number[]; week_change_pct?: number | null; error?: string; }
 export interface MarketEvent { market: string; symbol: string; name: string; event_type: string; date: string; detail: string | null; url?: string | null; title?: string | null; }
 

@@ -69,6 +69,11 @@ Create `backend/.env`:
 OPENROUTER_API_KEY=your_key_here
 LLM_MODEL=stepfun/step-3.5-flash:free          # optional override
 FALLBACK_LLM_MODEL=minimax/minimax-m2.5:nitro  # optional override
+
+# Optional enrichment data sources (all degrade gracefully if missing)
+FRED_API_KEY=your_key_here            # free at https://fred.stlouisfed.org/docs/api/api_key.html
+FINNHUB_API_KEY=your_key_here         # free tier at https://finnhub.io/
+ALPHA_VANTAGE_API_KEY=your_key_here   # free tier at https://www.alphavantage.co/
 ```
 
 The backend uses **OpenRouter** (OpenAI-compatible API) for all LLM calls. Primary model falls back to the secondary model on failure.

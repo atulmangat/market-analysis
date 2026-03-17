@@ -11,9 +11,9 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from database import engine, Base, get_db
-import models
-import api
+from core.database import engine, Base, get_db
+import core.models as models
+import api.routes as api
 from contextlib import asynccontextmanager
 
 # On Vercel (serverless), skip APScheduler — cron endpoints handle scheduling instead.
@@ -23,7 +23,7 @@ VERCEL = os.getenv("VERCEL", "") == "1"
 scheduler = None
 
 def get_initial_interval():
-    from database import SessionLocal
+    from core.database import SessionLocal
     db = SessionLocal()
     conf = db.query(models.AppConfig).filter(models.AppConfig.key == "schedule_interval_minutes").first()
     db.close()
@@ -35,8 +35,8 @@ async def lifespan(app: FastAPI):
     if not VERCEL:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.interval import IntervalTrigger
-        from orchestrator import run_debate
-        from validator import evaluate_predictions
+        from pipeline.orchestrator import run_debate
+        from pipeline.validator import evaluate_predictions
 
         interval = get_initial_interval()
         print(f"[Scheduler] Starting jobs with an interval of {interval} minutes.")
@@ -52,8 +52,17 @@ async def lifespan(app: FastAPI):
 
 # Create database tables + run migrations
 Base.metadata.create_all(bind=engine)
-from database import run_migrations
+from core.database import run_migrations
 run_migrations(engine)
+
+# Seed all agent prompts (core + specialists) — safe to run on every cold start
+from pipeline.orchestrator import setup_agent_prompts
+from core.database import SessionLocal as _SessionLocal
+_db = _SessionLocal()
+try:
+    setup_agent_prompts(_db)
+finally:
+    _db.close()
 
 app = FastAPI(title="AI Stock Market Suggestion API", lifespan=lifespan)
 
@@ -92,7 +101,7 @@ def _verify_cron(x_vercel_cron_signature: str = Header(default="")):
 def cron_debate(focus_tickers: list[str] | None = None):
     """Kick off the lambda chain pipeline."""
     import uuid as _uuid
-    from database import SessionLocal
+    from core.database import SessionLocal
     db = SessionLocal()
     try:
         # Concurrency lock
@@ -130,7 +139,7 @@ def cron_debate(focus_tickers: list[str] | None = None):
         db.close()
         raise
 
-    from pipeline import run_full_pipeline
+    from pipeline.runner import run_full_pipeline
     run_full_pipeline(run_id)
     return {"status": "pipeline_started", "run_id": run_id}
 
@@ -139,7 +148,7 @@ def cron_debate(focus_tickers: list[str] | None = None):
 def cron_evaluate():
     """Vercel Cron endpoint: runs the prediction evaluator."""
     import threading
-    from validator import evaluate_predictions
+    from pipeline.validator import evaluate_predictions
     t = threading.Thread(target=evaluate_predictions, daemon=True)
     t.start()
     return {"status": "triggered"}

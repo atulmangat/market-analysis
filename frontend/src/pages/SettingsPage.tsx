@@ -1,8 +1,31 @@
-import type { AgentMemory, AgentPrompt, AgentFitness, AgentEvolution, MarketConfig } from '../types';
-import { MARKET_ICONS, MARKET_TICKERS, NOTE_COLORS } from '../constants';
+import { useEffect, useState } from 'react';
+import type { MarketConfig } from '../types';
+import { MARKET_ICONS, MARKET_TICKERS } from '../constants';
 import { Card } from '../components/Card';
 import { SectionHeader } from '../components/SectionHeader';
+import { clearToken, apiFetch } from '../utils';
 import { Toggle } from '../components/Toggle';
+
+interface DataSource {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  configured: boolean;
+  required: boolean;
+  url?: string;
+  signup_url?: string;
+  env_key?: string;
+}
+
+interface RssFeed {
+  id: number;
+  url: string;
+  label: string;
+  market: string;
+  is_enabled: number;
+  is_builtin: number;
+}
 
 interface SettingsPageProps {
   darkMode: boolean;
@@ -15,81 +38,169 @@ interface SettingsPageProps {
   handleScheduleUpdate: (minutes: number) => void;
   handleManualTrigger: () => void;
   isTriggering: boolean;
-  agents: AgentPrompt[];
-  agentFitness: AgentFitness[];
-  agentEvolution: AgentEvolution[];
-  evolutionAgent: string | null;
-  selectedAgent: string | null;
-  setSelectedAgent: (name: string | null) => void;
-  loadEvolution: (agentName: string) => void;
-  setEvolutionAgent: (name: string | null) => void;
-  memories: AgentMemory[];
 }
+
+const CATEGORY_ORDER = ['LLM', 'Market Data', 'News', 'Macro', 'Sentiment', 'Social'];
+const CATEGORY_ICON: Record<string, string> = {
+  LLM: '◈', 'Market Data': '◆', News: '◎', Macro: '◉', Sentiment: '▣', Social: '▦',
+};
+
+const FEED_MARKETS = ['US', 'Crypto', 'India', 'MCX', 'All'];
 
 export function SettingsPage({
   darkMode, toggleDarkMode,
   approvalMode, setMode,
   markets, toggleMarket,
   scheduleInterval, handleScheduleUpdate, handleManualTrigger, isTriggering,
-  agents, agentFitness, agentEvolution, evolutionAgent,
-  selectedAgent, setSelectedAgent, loadEvolution, setEvolutionAgent,
-  memories,
 }: SettingsPageProps) {
-  const agentMemoriesFor = (name: string) => memories.filter(m => m.agent_name === name);
-  const noteColors = NOTE_COLORS;
+  const [sources, setSources] = useState<DataSource[]>([]);
+  const [feeds, setFeeds] = useState<RssFeed[]>([]);
+  const [addingFeed, setAddingFeed] = useState(false);
+  const [newFeed, setNewFeed] = useState({ url: '', label: '', market: 'US' });
+  const [feedError, setFeedError] = useState('');
+  const [feedSaving, setFeedSaving] = useState(false);
+  const [feedMarketTab, setFeedMarketTab] = useState('All');
+
+  useEffect(() => {
+    apiFetch('/config/data-sources')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d?.sources) setSources(d.sources); })
+      .catch(() => {});
+    loadFeeds();
+  }, []);
+
+  function loadFeeds() {
+    apiFetch('/config/rss-feeds')
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (Array.isArray(d)) setFeeds(d); })
+      .catch(() => {});
+  }
+
+  function toggleFeed(id: number) {
+    apiFetch(`/config/rss-feeds/${id}/toggle`, { method: 'PATCH' })
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (d) setFeeds(prev => prev.map(f => f.id === id ? { ...f, is_enabled: d.is_enabled } : f));
+      });
+  }
+
+  function deleteFeed(id: number) {
+    apiFetch(`/config/rss-feeds/${id}`, { method: 'DELETE' })
+      .then(r => { if (r.ok) setFeeds(prev => prev.filter(f => f.id !== id)); });
+  }
+
+  async function submitFeed() {
+    setFeedError('');
+    if (!newFeed.url.trim()) { setFeedError('URL is required'); return; }
+    if (!newFeed.label.trim()) { setFeedError('Label is required'); return; }
+    try { new URL(newFeed.url.trim()); } catch { setFeedError('Enter a valid URL'); return; }
+    setFeedSaving(true);
+    try {
+      const r = await apiFetch('/config/rss-feeds', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: newFeed.url.trim(), label: newFeed.label.trim(), market: newFeed.market }),
+      });
+      if (r.status === 409) { setFeedError('This feed URL already exists'); return; }
+      if (!r.ok) { setFeedError('Failed to add feed'); return; }
+      const d = await r.json();
+      setFeeds(prev => [...prev, d]);
+      setNewFeed({ url: '', label: '', market: 'US' });
+      setAddingFeed(false);
+    } finally {
+      setFeedSaving(false);
+    }
+  }
+
+  const grouped = CATEGORY_ORDER.reduce<Record<string, DataSource[]>>((acc, cat) => {
+    acc[cat] = sources.filter(s => s.category === cat);
+    return acc;
+  }, {});
+
+  const visibleFeeds = feedMarketTab === 'All' ? feeds : feeds.filter(f => f.market === feedMarketTab);
+  const feedMarkets = ['All', ...Array.from(new Set(feeds.map(f => f.market)))];
 
   return (
-    <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-      {/* Left column: system settings */}
-      <div className="xl:col-span-1 space-y-5">
-        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">System Settings</h2>
+    <div className="max-w-3xl mx-auto space-y-8">
 
-        {/* Theme */}
-        <Card>
-          <SectionHeader title="Appearance" />
-          <div className="p-5">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-sm font-medium text-textMain">{darkMode ? 'Dark Mode' : 'Light Mode'}</p>
-                <p className="text-[11px] text-textMuted mt-0.5">{darkMode ? 'Easy on the eyes at night' : 'Bright and clear'}</p>
+      {/* Display & Strategy */}
+      <section className="space-y-3">
+        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Display &amp; Strategy</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <Card>
+            <SectionHeader title="Appearance" />
+            <div className="p-5">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-sm font-medium text-textMain">{darkMode ? 'Dark Mode' : 'Light Mode'}</p>
+                  <p className="text-[11px] text-textMuted mt-0.5">{darkMode ? 'Easy on the eyes at night' : 'Bright and clear'}</p>
+                </div>
+                <button
+                  onClick={toggleDarkMode}
+                  className={`relative inline-flex h-7 w-14 items-center rounded-full transition-colors duration-300 focus:outline-none ${darkMode ? 'bg-brand-600' : 'bg-surface3 border border-borderLight'}`}
+                >
+                  <span className={`absolute text-sm transition-all duration-300 ${darkMode ? 'left-1.5' : 'right-1.5'}`}>
+                    {darkMode ? '🌙' : '☀️'}
+                  </span>
+                  <span className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-md transition-transform duration-300 ${darkMode ? 'translate-x-7' : 'translate-x-1'}`} />
+                </button>
               </div>
-              <button
-                onClick={toggleDarkMode}
-                className={`relative inline-flex h-7 w-14 items-center rounded-full transition-colors duration-300 focus:outline-none ${darkMode ? 'bg-brand-600' : 'bg-surface3 border border-borderLight'}`}
-              >
-                <span className={`absolute text-sm transition-all duration-300 ${darkMode ? 'left-1.5' : 'right-1.5'}`}>
-                  {darkMode ? '🌙' : '☀️'}
-                </span>
-                <span className={`inline-block h-5 w-5 transform rounded-full bg-white shadow-md transition-transform duration-300 ${darkMode ? 'translate-x-7' : 'translate-x-1'}`} />
-              </button>
             </div>
-          </div>
-        </Card>
+          </Card>
 
-        {/* Approval mode */}
+          <Card>
+            <SectionHeader title="Approval Mode" />
+            <div className="p-5 space-y-3">
+              <div className="flex rounded-lg overflow-hidden border border-borderLight">
+                <button onClick={() => setMode('auto')} className={`flex-1 py-2.5 text-sm font-medium transition-colors ${approvalMode === 'auto' ? 'bg-brand-600 text-white' : 'bg-surface2 text-textMuted hover:bg-surface3'}`}>
+                  Auto Deploy
+                </button>
+                <button onClick={() => setMode('manual')} className={`flex-1 py-2.5 text-sm font-medium transition-colors ${approvalMode === 'manual' ? 'bg-amber-600 text-white' : 'bg-surface2 text-textMuted hover:bg-surface3'}`}>
+                  Manual
+                </button>
+              </div>
+              <p className="text-xs text-textMuted">{approvalMode === 'auto' ? 'Strategies deploy automatically after consensus.' : 'Each strategy requires your approval before going live.'}</p>
+            </div>
+          </Card>
+        </div>
+      </section>
+
+      {/* Pipeline Run */}
+      <section className="space-y-3">
+        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Pipeline Run</h2>
         <Card>
-          <SectionHeader title="Approval Mode" />
-          <div className="p-5 space-y-3">
-            <div className="flex rounded-lg overflow-hidden border border-borderLight">
-              <button onClick={() => setMode('auto')} className={`flex-1 py-2.5 text-sm font-medium transition-colors ${approvalMode === 'auto' ? 'bg-brand-600 text-white' : 'bg-surface2 text-textMuted hover:bg-surface3'}`}>
-                Auto Deploy
-              </button>
-              <button onClick={() => setMode('manual')} className={`flex-1 py-2.5 text-sm font-medium transition-colors ${approvalMode === 'manual' ? 'bg-amber-600 text-white' : 'bg-surface2 text-textMuted hover:bg-surface3'}`}>
-                Manual
-              </button>
+          <SectionHeader title="Schedule" />
+          <div className="p-5 space-y-4">
+            <p className="text-xs text-textMuted">Automatically run a new pipeline cycle every:</p>
+            <div className="grid grid-cols-4 gap-2">
+              {[15, 30, 60, 120].map(mins => (
+                <button key={mins} onClick={() => handleScheduleUpdate(mins)}
+                  className={`py-2.5 text-xs font-semibold rounded-lg border transition-colors ${scheduleInterval === mins ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface2 border-borderLight text-textMuted hover:bg-surface3 hover:text-textMain'}`}>
+                  {mins >= 60 ? `${mins / 60}h` : `${mins}m`}
+                </button>
+              ))}
             </div>
-            <p className="text-xs text-textMuted">{approvalMode === 'auto' ? 'Strategies deploy automatically after consensus.' : 'Each strategy requires your approval before going live.'}</p>
+            <div className="flex items-center gap-3 pt-1">
+              <button onClick={() => handleManualTrigger()} disabled={isTriggering}
+                className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium border transition-colors ${isTriggering ? 'bg-surface3 border-borderLight text-textDim cursor-not-allowed' : 'bg-brand-600 border-brand-500 text-white hover:bg-brand-500'}`}>
+                {isTriggering ? <><span className="animate-spin inline-block">↻</span> Pipeline running…</> : <><span>▶</span> Run Pipeline Now</>}
+              </button>
+              <span className="text-[11px] text-textDim whitespace-nowrap">Next in ~{scheduleInterval}m</span>
+            </div>
           </div>
         </Card>
+      </section>
 
-        {/* Markets */}
+      {/* Markets */}
+      <section className="space-y-3">
+        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Markets</h2>
         <Card>
           <SectionHeader title="Enabled Markets" />
-          <div className="p-5 space-y-4">
+          <div className="p-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
             {markets.map(m => (
-              <div key={m.id} className="flex items-center justify-between">
+              <div key={m.id} className="flex items-center justify-between bg-surface2 rounded-lg px-4 py-3 border border-borderLight">
                 <div className="flex items-center gap-3">
-                  <span className="text-xl">{MARKET_ICONS[m.market_name] ?? '📊'}</span>
+                  <span className="text-xl leading-none">{MARKET_ICONS[m.market_name] ?? '📊'}</span>
                   <div>
                     <p className="text-sm font-medium text-textMain">{m.market_name}</p>
                     <p className="text-[11px] text-textMuted">{MARKET_TICKERS[m.market_name]?.length ?? 0} tickers</p>
@@ -100,210 +211,174 @@ export function SettingsPage({
             ))}
           </div>
         </Card>
+      </section>
 
-        {/* Schedule */}
+      {/* Data Sources */}
+      <section className="space-y-3">
+        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Data Sources</h2>
+
+        {/* API / service sources — 2-col grid of compact cards */}
+        {sources.length > 0 && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {CATEGORY_ORDER.filter(cat => cat !== 'News' && grouped[cat]?.length > 0).flatMap(cat =>
+              grouped[cat].map(src => (
+                <div key={src.id} className="flex items-start gap-3 p-4 bg-surface2 border border-borderLight rounded-xl">
+                  <div className="mt-1 shrink-0">
+                    <span className={`inline-block w-2 h-2 rounded-full ${src.configured ? 'bg-up' : src.required ? 'bg-down' : 'bg-borderMid'}`} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap mb-0.5">
+                      <span className="text-xs font-semibold text-textMain">{src.name}</span>
+                      <span className="text-[9px] text-textDim uppercase tracking-wider">{src.category}</span>
+                    </div>
+                    <div className="flex items-center gap-1.5 mb-1">
+                      {src.required && <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-brand-600/10 text-brand-500 border border-brand-500/20">required</span>}
+                      {!src.required && src.configured && <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-up-bg text-up-text border border-up/20">active</span>}
+                      {!src.required && !src.configured && <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-surface3 text-textDim border border-borderLight">not configured</span>}
+                    </div>
+                    <p className="text-[11px] text-textMuted leading-relaxed">{src.description}</p>
+                    {src.env_key && !src.configured && (
+                      <p className="text-[10px] text-textDim mt-1 font-mono truncate">
+                        <span className="text-amber-500">{src.env_key}</span>
+                        {src.signup_url && <> · <a href={src.signup_url} target="_blank" rel="noopener noreferrer" className="text-brand-400 hover:underline">get key ↗</a></>}
+                      </p>
+                    )}
+                    {src.env_key && src.configured && (
+                      <p className="text-[10px] text-textDim mt-1 font-mono"><span className="text-up-text">{src.env_key}</span></p>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+
+        {/* RSS Feeds — full CRUD */}
         <Card>
-          <SectionHeader title="Debate Schedule" />
-          <div className="p-5 space-y-4">
-            <p className="text-xs text-textMuted">Run a new debate cycle every:</p>
-            <div className="grid grid-cols-4 gap-2">
-              {[15, 30, 60, 120].map(mins => (
-                <button key={mins} onClick={() => handleScheduleUpdate(mins)}
-                  className={`py-2 text-xs font-medium rounded-lg border transition-colors ${scheduleInterval === mins ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface2 border-borderLight text-textMuted hover:bg-surface3 hover:text-textMain'}`}>
-                  {mins >= 60 ? `${mins / 60}h` : `${mins}m`}
+          <div className="px-5 pt-4 pb-3 border-b border-borderLight flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="text-textMuted text-sm">{CATEGORY_ICON['News']}</span>
+              <span className="text-xs font-semibold text-textMuted uppercase tracking-widest">RSS Feeds</span>
+              <span className="text-[10px] bg-surface3 text-textDim rounded-full px-1.5 py-0.5 ml-1">{feeds.filter(f => f.is_enabled).length} active</span>
+            </div>
+            <button
+              onClick={() => { setAddingFeed(v => !v); setFeedError(''); }}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-semibold rounded-lg bg-brand-600/10 border border-brand-500/30 text-brand-400 hover:bg-brand-600/20 transition-all"
+            >
+              {addingFeed ? '✕ Cancel' : '+ Add Feed'}
+            </button>
+          </div>
+
+          {/* Add feed form */}
+          {addingFeed && (
+            <div className="px-5 py-4 border-b border-borderLight bg-surface2/50 space-y-3">
+              <p className="text-xs font-medium text-textMain">Add RSS Feed</p>
+              <div className="space-y-2">
+                <input
+                  type="url"
+                  placeholder="Feed URL (https://...)"
+                  value={newFeed.url}
+                  onChange={e => setNewFeed(v => ({ ...v, url: e.target.value }))}
+                  className="w-full bg-surface border border-borderLight rounded-lg px-3 py-2 text-xs text-textMain placeholder-textDim focus:outline-none focus:border-brand-500 font-mono"
+                />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="Label (e.g. Reuters Markets)"
+                    value={newFeed.label}
+                    onChange={e => setNewFeed(v => ({ ...v, label: e.target.value }))}
+                    className="flex-1 bg-surface border border-borderLight rounded-lg px-3 py-2 text-xs text-textMain placeholder-textDim focus:outline-none focus:border-brand-500"
+                  />
+                  <select
+                    value={newFeed.market}
+                    onChange={e => setNewFeed(v => ({ ...v, market: e.target.value }))}
+                    className="bg-surface border border-borderLight rounded-lg px-3 py-2 text-xs text-textMain focus:outline-none focus:border-brand-500"
+                  >
+                    {FEED_MARKETS.map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </div>
+                {feedError && <p className="text-[11px] text-down">{feedError}</p>}
+                <button
+                  onClick={submitFeed}
+                  disabled={feedSaving}
+                  className="px-4 py-1.5 bg-brand-600 text-white text-xs font-semibold rounded-lg hover:bg-brand-500 disabled:opacity-50 transition-colors"
+                >
+                  {feedSaving ? 'Adding…' : 'Add Feed'}
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Market tabs */}
+          {feedMarkets.length > 1 && (
+            <div className="flex border-b border-borderLight overflow-x-auto">
+              {feedMarkets.map(m => (
+                <button key={m}
+                  onClick={() => setFeedMarketTab(m)}
+                  className={`px-4 py-2.5 text-xs font-medium border-b-2 transition-colors whitespace-nowrap ${feedMarketTab === m ? 'border-brand-500 text-textMain' : 'border-transparent text-textMuted hover:text-textMain'}`}
+                >
+                  {m === 'All' ? `All (${feeds.length})` : `${MARKET_ICONS[m] ?? ''} ${m} (${feeds.filter(f => f.market === m).length})`}
                 </button>
               ))}
             </div>
-            <button onClick={() => handleManualTrigger()} disabled={isTriggering}
-              className={`w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium border transition-colors ${isTriggering ? 'bg-surface3 border-borderLight text-textDim cursor-not-allowed' : 'bg-brand-600 border-brand-500 text-white hover:bg-brand-500'}`}>
-              {isTriggering ? <><span className="animate-spin inline-block">↻</span> Running…</> : <><span>▶</span> Run Now</>}
-            </button>
-            <p className="text-[11px] text-textDim text-center">Next auto-run in ~{scheduleInterval} min</p>
+          )}
+
+          {/* Feed list */}
+          <div className="divide-y divide-borderLight">
+            {visibleFeeds.length === 0 && (
+              <p className="px-5 py-4 text-sm text-textMuted">No feeds in this market.</p>
+            )}
+            {visibleFeeds.map(feed => (
+              <div key={feed.id} className="flex items-center gap-3 px-5 py-3">
+                <div className="shrink-0">
+                  <span className={`inline-block w-2 h-2 rounded-full ${feed.is_enabled ? 'bg-up' : 'bg-borderMid'}`} />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-medium text-textMain truncate">{feed.label}</span>
+                    {feedMarketTab === 'All' && (
+                      <span className="text-[10px] text-textDim bg-surface3 px-1.5 py-0.5 rounded shrink-0">{feed.market}</span>
+                    )}
+                    {feed.is_builtin ? (
+                      <span className="text-[10px] text-textDim shrink-0">built-in</span>
+                    ) : (
+                      <span className="text-[10px] text-brand-400 shrink-0">custom</span>
+                    )}
+                  </div>
+                  <p className="text-[10px] text-textDim font-mono truncate mt-0.5">{feed.url}</p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Toggle checked={!!feed.is_enabled} onChange={() => toggleFeed(feed.id)} />
+                  {!feed.is_builtin && (
+                    <button
+                      onClick={() => deleteFeed(feed.id)}
+                      className="px-2 py-1 text-[10px] bg-down-bg text-down-text border border-down/20 rounded hover:opacity-80 transition-opacity"
+                    >
+                      ✕
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
           </div>
         </Card>
-      </div>
+      </section>
 
-      {/* Right columns: agent transparency */}
-      <div className="xl:col-span-2 space-y-5">
-        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Agent Darwinian Evolution</h2>
+      {/* Account */}
+      <section className="space-y-3">
+        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Account</h2>
+        <Card>
+          <div className="p-5">
+            <button
+              onClick={() => { clearToken(); window.location.reload(); }}
+              className="w-full flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium border border-borderMid bg-surface2 text-textMain hover:bg-down-bg hover:border-down/30 hover:text-down-text transition-colors"
+            >
+              <span className="text-base leading-none">⏻</span> Sign Out
+            </button>
+          </div>
+        </Card>
+      </section>
 
-        {agents.length === 0 && (
-          <Card className="p-8 text-center text-sm text-textMuted">No agents found. Run a debate first.</Card>
-        )}
-
-        {/* Darwin fitness leaderboard */}
-        {agentFitness.length > 0 && (() => {
-          const sorted = [...agentFitness].sort((a, b) =>
-            (b.fitness_score ?? -1) - (a.fitness_score ?? -1)
-          );
-          return (
-            <Card className="overflow-hidden">
-              <div className="flex items-center justify-between px-5 py-4 border-b border-borderLight bg-surface2">
-                <span className="text-sm font-semibold text-textMain">Fitness Leaderboard</span>
-                <span className="text-[10px] text-textDim">Updates after each evaluation cycle</span>
-              </div>
-              <div className="divide-y divide-borderLight">
-                {sorted.map((af, rank) => {
-                  const fitness = af.fitness_score;
-                  const hasData = fitness !== null && af.total_scored >= 1;
-                  const barWidth = hasData ? `${(fitness! / 100) * 100}%` : '0%';
-                  const barColor = !hasData ? 'bg-surface3'
-                    : fitness! >= 65 ? 'bg-up'
-                    : fitness! >= 45 ? 'bg-amber-500'
-                    : 'bg-down';
-                  const rankEmoji = rank === 0 ? '🥇' : rank === 1 ? '🥈' : rank === 2 ? '🥉' : `#${rank + 1}`;
-                  return (
-                    <div key={af.agent_name} className="px-5 py-4">
-                      <div className="flex items-center justify-between mb-2">
-                        <div className="flex items-center gap-3">
-                          <span className="text-base w-6 text-center">{rankEmoji}</span>
-                          <div className="h-8 w-8 rounded-lg bg-brand-600/20 border border-brand-500/30 flex items-center justify-center text-brand-400 font-bold text-xs">
-                            {af.agent_name.split(' ').map(w => w[0]).join('')}
-                          </div>
-                          <div>
-                            <p className="text-sm font-semibold text-textMain">{af.agent_name}</p>
-                            <p className="text-[10px] text-textDim">
-                              Gen {af.generation}
-                              {af.total_scored > 0 && <> · {af.total_scored} scored</>}
-                            </p>
-                          </div>
-                        </div>
-                        <div className="text-right">
-                          {hasData ? (
-                            <>
-                              <p className={`text-lg font-light tabular-nums ${fitness! >= 65 ? 'text-up' : fitness! >= 45 ? 'text-amber-400' : 'text-down'}`}>
-                                {fitness!.toFixed(1)}
-                                <span className="text-xs text-textDim">/100</span>
-                              </p>
-                              <p className="text-[10px] text-textDim">
-                                {((af.win_rate ?? 0) * 100).toFixed(0)}% wins
-                                {af.avg_return !== null && <> · {af.avg_return > 0 ? '+' : ''}{af.avg_return.toFixed(1)} ret</>}
-                              </p>
-                            </>
-                          ) : (
-                            <p className="text-xs text-textDim">Awaiting data</p>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Fitness bar */}
-                      <div className="h-1.5 w-full bg-surface3 rounded-full overflow-hidden mb-2">
-                        <div className={`h-full rounded-full transition-all duration-700 ${barColor}`} style={{ width: barWidth }} />
-                      </div>
-
-                      {/* Action buttons */}
-                      <div className="flex items-center justify-between">
-                        <div className="flex gap-2">
-                          <button
-                            onClick={() => setSelectedAgent(selectedAgent === af.agent_name ? null : af.agent_name)}
-                            className={`text-[10px] px-2 py-1 rounded border transition-colors ${selectedAgent === af.agent_name ? 'bg-brand-600/20 border-brand-500/40 text-brand-400' : 'border-borderLight text-textDim hover:text-textMuted hover:bg-surface2'}`}
-                          >
-                            {selectedAgent === af.agent_name ? '▲ Prompt' : '▼ Prompt'}
-                          </button>
-                          <button
-                            onClick={() => evolutionAgent === af.agent_name ? setEvolutionAgent(null) : loadEvolution(af.agent_name)}
-                            className={`text-[10px] px-2 py-1 rounded border transition-colors ${evolutionAgent === af.agent_name ? 'bg-purple-600/20 border-purple-500/40 text-purple-400' : 'border-borderLight text-textDim hover:text-textMuted hover:bg-surface2'}`}
-                          >
-                            {evolutionAgent === af.agent_name ? '▲ History' : '🧬 History'}
-                          </button>
-                        </div>
-                        {fitness !== null && fitness < 45 && af.total_scored >= 3 && (
-                          <span className="text-[10px] text-down bg-down-bg px-2 py-0.5 rounded-full border border-down/20 animate-pulse">
-                            Evolution candidate
-                          </span>
-                        )}
-                        {fitness !== null && fitness >= 65 && (
-                          <span className="text-[10px] text-up bg-up-bg px-2 py-0.5 rounded-full border border-up/20">
-                            Elite donor
-                          </span>
-                        )}
-                      </div>
-
-                      {/* Inline prompt panel */}
-                      {selectedAgent === af.agent_name && (() => {
-                        const agent = agents.find(a => a.agent_name === af.agent_name);
-                        const agentMems = agentMemoriesFor(af.agent_name);
-                        if (!agent) return null;
-                        return (
-                          <div className="mt-3 space-y-3">
-                            <div className="bg-surface2 border border-borderLight rounded-lg p-3">
-                              <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2">Current System Prompt</p>
-                              <pre className="text-[11px] text-textMuted leading-relaxed whitespace-pre-wrap font-sans">{agent.system_prompt}</pre>
-                              {agent.updated_at && <p className="text-[10px] text-textDim mt-2">Last evolved: {new Date(agent.updated_at).toLocaleString()}</p>}
-                            </div>
-                            {agentMems.length > 0 && (
-                              <div className="bg-surface2 border border-borderLight rounded-lg p-3">
-                                <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2">Memory Notes ({agentMems.length})</p>
-                                <div className="space-y-2 max-h-48 overflow-y-auto">
-                                  {agentMems.map(m => (
-                                    <div key={m.id} className="flex gap-2 text-[11px]">
-                                      <span className={`shrink-0 text-[9px] font-bold uppercase px-1 py-0.5 rounded h-fit ${noteColors[m.note_type] ?? 'text-textDim bg-surface3'}`}>{m.note_type}</span>
-                                      <p className="text-textMuted leading-relaxed">{m.content}</p>
-                                    </div>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })()}
-
-                      {/* Inline evolution history */}
-                      {evolutionAgent === af.agent_name && agentEvolution.length > 0 && (
-                        <div className="mt-3 bg-surface2 border border-borderLight rounded-lg overflow-hidden">
-                          <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider px-3 py-2 border-b border-borderLight">
-                            Evolution History — {agentEvolution.length} generation{agentEvolution.length !== 1 ? 's' : ''}
-                          </p>
-                          <div className="divide-y divide-borderLight max-h-64 overflow-y-auto">
-                            {agentEvolution.map(ev => {
-                              const reasonColor: Record<string, string> = {
-                                MUTATION:  'text-amber-700 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800/40',
-                                CROSSOVER: 'text-purple-700 dark:text-purple-400 bg-purple-50 dark:bg-purple-950/50 border border-purple-200 dark:border-purple-800/40',
-                                RESET:     'text-blue-700 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-800/40',
-                                SEED:      'text-teal-700 dark:text-teal-400 bg-teal-50 dark:bg-teal-950/50 border border-teal-200 dark:border-teal-800/40',
-                                MANUAL:    'text-textMuted bg-surface2 border border-borderLight',
-                              };
-                              return (
-                                <div key={ev.id} className="px-3 py-3">
-                                  <div className="flex items-center justify-between mb-1.5">
-                                    <div className="flex items-center gap-2">
-                                      <span className="text-[10px] font-bold text-textMuted">Gen {ev.generation}</span>
-                                      {ev.evolution_reason && (
-                                        <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded ${reasonColor[ev.evolution_reason] ?? 'text-textDim bg-surface3'}`}>
-                                          {ev.evolution_reason}
-                                        </span>
-                                      )}
-                                    </div>
-                                    <div className="text-right">
-                                      {ev.fitness_score !== null && (
-                                        <span className={`text-[11px] font-medium ${ev.fitness_score >= 65 ? 'text-up' : ev.fitness_score >= 45 ? 'text-amber-400' : 'text-down'}`}>
-                                          {ev.fitness_score.toFixed(1)}/100
-                                        </span>
-                                      )}
-                                      {ev.replaced_at && <p className="text-[10px] text-textDim">{new Date(ev.replaced_at).toLocaleDateString()}</p>}
-                                    </div>
-                                  </div>
-                                  <pre className="text-[10px] text-textDim leading-relaxed whitespace-pre-wrap font-sans line-clamp-3">{ev.system_prompt}</pre>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                      )}
-                      {evolutionAgent === af.agent_name && agentEvolution.length === 0 && (
-                        <div className="mt-3 bg-surface2 border border-borderLight rounded-lg p-3 text-center text-[11px] text-textMuted">
-                          No evolution history yet — this agent is still in its original form.
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            </Card>
-          );
-        })()}
-
-      </div>
     </div>
   );
 }

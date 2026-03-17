@@ -63,10 +63,10 @@ export const MARKET_SECTORS: Record<string, string[]> = TICKER_DB.reduce((acc, t
 export const NAV: { id: Page; label: string; icon: string }[] = [
   { id: 'dashboard', label: 'Dashboard',    icon: '▦' },
   { id: 'markets',   label: 'Markets',      icon: '◈' },
-  { id: 'graph',     label: 'Knowledge Graph', icon: '◎' },
+  { id: 'graph',     label: 'Data',         icon: '◎' },
   { id: 'portfolio', label: 'Portfolio',    icon: '$' },
-  { id: 'memory',    label: 'Agent Memory', icon: '◉' },
-  { id: 'pipeline',  label: 'Live Pipeline', icon: '⟳' },
+  { id: 'memory',    label: 'Agents', icon: '◉' },
+  { id: 'pipeline',  label: 'Pipeline', icon: '⟳' },
   { id: 'settings',  label: 'Settings',     icon: '⚙' },
 ];
 
@@ -95,4 +95,5 @@ export const KG_COLORS: Record<string, string> = {
   ENTITY:    '#8b5cf6',
   EVENT:     '#f59e0b',
   INDICATOR: '#10b981',
+  MARKET:    '#ec4899',
 };
