@@ -1062,22 +1062,47 @@ export function PipelinePage({
     );
   };
 
-  // ── Decide what to render in main panel ──────────────────────────────────
-  const renderPanel = () => {
-    if (selectedRunLoading && !viewingLive) {
-      return (
-        <div className="flex-1 flex flex-col items-center justify-center px-8 py-12 space-y-4">
-          {[1, 2, 3].map(i => (
-            <div key={i} className="w-full max-w-sm flex items-center gap-3 animate-pulse">
-              <div className="h-7 w-7 rounded-full bg-surface3 shrink-0" />
-              <div className="flex-1 space-y-1.5">
-                <div className="h-3 bg-surface3 rounded" style={{ width: `${55 - i * 5}%` }} />
-                <div className="h-2.5 bg-surface3 rounded" style={{ width: `${75 - i * 5}%` }} />
-              </div>
-            </div>
+  const renderLoadingSkeleton = () => (
+    <div className="flex-1 flex flex-col gap-4 px-6 py-6 animate-pulse">
+      {/* Step pills row */}
+      <div className="flex gap-2 flex-wrap">
+        {[90, 110, 100, 95, 105, 88].map((w, i) => (
+          <div key={i} className="h-7 rounded-full bg-surface3" style={{ width: w }} />
+        ))}
+      </div>
+      {/* Summary card */}
+      <div className="rounded-xl border border-borderLight bg-surface2 p-5 space-y-3">
+        <div className="flex items-center gap-3">
+          <div className="h-10 w-10 rounded-full bg-surface3 shrink-0" />
+          <div className="space-y-1.5 flex-1">
+            <div className="h-4 bg-surface3 rounded w-48" />
+            <div className="h-3 bg-surface3 rounded w-32" />
+          </div>
+        </div>
+        <div className="space-y-2 pt-1">
+          {[70, 85, 60, 75].map((w, i) => (
+            <div key={i} className="h-3 bg-surface3 rounded" style={{ width: `${w}%` }} />
           ))}
         </div>
-      );
+      </div>
+      {/* Event rows */}
+      {[1, 2, 3, 4].map(i => (
+        <div key={i} className="flex items-start gap-3">
+          <div className="h-6 w-6 rounded-full bg-surface3 shrink-0 mt-0.5" />
+          <div className="flex-1 space-y-1.5">
+            <div className="h-3 bg-surface3 rounded" style={{ width: `${50 + i * 8}%` }} />
+            <div className="h-2.5 bg-surface3 rounded" style={{ width: `${65 + i * 5}%` }} />
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+
+  // ── Decide what to render in main panel ──────────────────────────────────
+  const renderPanel = () => {
+    // Show skeleton while fetching a selected run's events
+    if (!viewingLive && (selectedRunLoading || (selectedRunId && panelEvents.length === 0))) {
+      return renderLoadingSkeleton();
     }
 
     if (!viewingLive) {
