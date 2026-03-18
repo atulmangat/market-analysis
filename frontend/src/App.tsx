@@ -346,8 +346,8 @@ function AppInner() {
             apiFetch(`/pipeline/runs/${ridE}`).then(r => r.ok ? r.json() : null)
               .then(d => { if (d) setPipelineTabEvents(s => ({ ...s, evalEvents: d.events ?? [] })); }).catch(() => {})
           );
-          // Fire all event fetches in parallel — results update state as they arrive
-          void Promise.all(fetches);
+          // No need to await — updates will arrive and trigger re-renders naturally
+          void fetches;
         }
       } catch { /* ignore */ }
       pollTimerRef.current = setTimeout(pollPipeline, isTriggeringRef.current ? 2000 : 8000);
@@ -616,22 +616,26 @@ function AppInner() {
 
   // Track run transitions: new run started → go to Live; run finished → show completed run
   const prevIsTriggering = useRef(false);
+  const prevPipelineRunId = useRef<string | null>(null);
   useEffect(() => {
     const wasRunning = prevIsTriggering.current;
     const isNowRunning = isTriggering;
     if (!wasRunning && isNowRunning) {
-      // New pipeline started — clear selection and show live view
+      // A new pipeline just started — always clear any past run selection and show live view.
+      // Reset the guard so the "finished" branch can auto-select when it completes.
       userSelectedRunRef.current = false;
       setSelectedRunId(null);
       setSelectedRunEvents([]);
-    } else if (wasRunning && !isNowRunning) {
-      // Pipeline just finished — pick the most recently active run ID
-      const finishedRunId = currentRunIdTrade ?? currentRunIdResearch ?? currentRunIdEval ?? pipelineRunId;
-      if (finishedRunId && !userSelectedRunRef.current) {
+    } else if (wasRunning && !isNowRunning && pipelineRunId) {
+      // A pipeline just finished — only auto-select the finished run if user hasn't picked one
+      if (!userSelectedRunRef.current) {
+        const finishedRunId = pipelineRunId;
         setPipelineEvents([]);
         setSelectedRunId(finishedRunId);
         setSelectedRunEvents([]);
         setSelectedRunLoading(true);
+        // Only fetch the finished run's events — pipelineRuns list is refreshed
+        // lazily by PipelinePage when tabActive flips (running→stopped).
         apiFetch(`/pipeline/runs/${finishedRunId}`)
           .then(r => r.ok ? r.json() : null)
           .then(eventsData => { if (eventsData) setSelectedRunEvents(eventsData.events ?? []); })
@@ -640,7 +644,8 @@ function AppInner() {
       }
     }
     prevIsTriggering.current = isNowRunning;
-  }, [isTriggering, pipelineRunId, currentRunIdTrade, currentRunIdResearch, currentRunIdEval]);
+    prevPipelineRunId.current = pipelineRunId;
+  }, [isTriggering, pipelineRunId]);
 
   const visibleStrategies = strategies.filter(s =>
     enabledMarketNames.length === 0 || enabledMarketNames.includes(getMarketForTicker(s.symbol))

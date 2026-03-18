@@ -18,5 +18,3 @@ python-dotenv
 # FINNHUB_API_KEY   → https://finnhub.io/ (free tier available)
 # ALPHA_VANTAGE_API_KEY → https://www.alphavantage.co/ (free tier available)
 alembic>=1.13.0
-langgraph>=0.2.0
-langgraph-checkpoint>=1.0.0
