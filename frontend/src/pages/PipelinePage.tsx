@@ -1253,13 +1253,17 @@ export function PipelinePage({
                 <p className={`text-xs font-semibold leading-tight ${isActive_ ? tab.color : 'text-textMuted'}`}>{tab.label}</p>
                 <p className="text-[10px] text-textDim mt-0.5 truncate">{tab.sublabel}</p>
               </div>
-              {/* Run count badge */}
+              {/* Run count badge with hover popup */}
               {tabRunCount > 0 && (
-                <span
-                  title={`${tabRunCount} completed run${tabRunCount !== 1 ? 's' : ''}`}
-                  className={`shrink-0 text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${isActive_ ? `${tab.activeBg} ${tab.activeBorder} ${tab.color}` : 'bg-surface3 border-borderLight text-textDim'}`}
-                >
-                  {tabRunCount}
+                <span className="relative group/badge shrink-0">
+                  <span className={`block text-[9px] font-bold px-1.5 py-0.5 rounded-full border cursor-default ${isActive_ ? `${tab.activeBg} ${tab.activeBorder} ${tab.color}` : 'bg-surface3 border-borderLight text-textDim'}`}>
+                    {tabRunCount}
+                  </span>
+                  <span className="pointer-events-none absolute bottom-full right-0 mb-1.5 w-max max-w-[160px] opacity-0 group-hover/badge:opacity-100 transition-opacity duration-150 z-50">
+                    <span className="block bg-surface border border-borderMid rounded-lg px-2.5 py-1.5 shadow-lg text-[11px] text-textMuted whitespace-nowrap">
+                      <span className="font-semibold text-textMain">{tabRunCount}</span> completed run{tabRunCount !== 1 ? 's' : ''}
+                    </span>
+                  </span>
                 </span>
               )}
               {/* Running indicator */}
