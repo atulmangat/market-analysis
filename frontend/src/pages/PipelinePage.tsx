@@ -1399,12 +1399,19 @@ export function PipelinePage({
                       ? 'border-purple-700/50 bg-purple-900/20 text-purple-400 hover:bg-purple-800/30'
                       : 'bg-surface2 border-borderLight text-textDim cursor-not-allowed opacity-50'
                   }`}
-                  title={pipelineReadiness.active_positions === 0 ? 'No active positions to evaluate' : `Evaluate ${pipelineReadiness.active_positions} active position${pipelineReadiness.active_positions !== 1 ? 's' : ''}`}
+                  title={pipelineReadiness.active_positions === 0 ? 'No active positions to evaluate' : undefined}
                 >
                   ◉ Evaluate Agents
                   {pipelineReadiness.active_positions > 0 && (
-                    <span className="ml-1 px-1.5 py-0.5 rounded-full bg-purple-700/40 text-purple-300 text-[10px] font-semibold leading-none">
-                      {pipelineReadiness.active_positions}
+                    <span className="relative group/evalbadge ml-1">
+                      <span className="px-1.5 py-0.5 rounded-full bg-purple-700/40 text-purple-300 text-[10px] font-semibold leading-none inline-block">
+                        {pipelineReadiness.active_positions}
+                      </span>
+                      <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 opacity-0 group-hover/evalbadge:opacity-100 transition-opacity duration-150 z-50">
+                        <span className="block bg-surface border border-borderMid rounded-lg px-2.5 py-1.5 shadow-lg text-[11px] text-textMuted whitespace-nowrap">
+                          <span className="font-semibold text-textMain">{pipelineReadiness.active_positions}</span> active position{pipelineReadiness.active_positions !== 1 ? 's' : ''} to evaluate
+                        </span>
+                      </span>
                     </span>
                   )}
                 </button>
