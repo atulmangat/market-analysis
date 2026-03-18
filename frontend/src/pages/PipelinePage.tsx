@@ -1325,7 +1325,12 @@ export function PipelinePage({
                   }`}
                   title={pipelineReadiness.active_positions === 0 ? 'No active positions to evaluate' : `Evaluate ${pipelineReadiness.active_positions} active position${pipelineReadiness.active_positions !== 1 ? 's' : ''}`}
                 >
-                  ◉ Evaluate Agents{pipelineReadiness.active_positions > 0 ? ` · ${pipelineReadiness.active_positions}` : ''}
+                  ◉ Evaluate Agents
+                  {pipelineReadiness.active_positions > 0 && (
+                    <span className="ml-1 px-1.5 py-0.5 rounded-full bg-purple-700/40 text-purple-300 text-[10px] font-semibold leading-none">
+                      {pipelineReadiness.active_positions}
+                    </span>
+                  )}
                 </button>
               )}
             </>
