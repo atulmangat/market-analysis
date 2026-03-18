@@ -37,7 +37,7 @@ def _log(db, run_id: str, step: str, status: str, detail: str = None, agent_name
 
 MARKET_TICKERS = {
     "US":     ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA", "META", "AMD"],
-    "India":  ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "WIPRO.NS", "SBIN.NS", "TATAMOTORS.NS"],
+    "India":  ["RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS", "ICICIBANK.NS", "WIPRO.NS", "SBIN.NS", "BAJFINANCE.NS"],
     "Crypto": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD", "XRP-USD", "DOGE-USD", "ADA-USD"],
     "MCX":    ["GC=F", "SI=F", "CL=F", "NG=F", "HG=F"],
 }

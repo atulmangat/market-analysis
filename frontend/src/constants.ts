@@ -14,12 +14,9 @@ export const TICKER_DB: TickerMeta[] = [
   // US — Consumer / E-commerce
   { symbol: 'AMZN',  name: 'Amazon',             market: 'US',     sector: 'Consumer' },
   { symbol: 'TSLA',  name: 'Tesla',              market: 'US',     sector: 'Consumer' },
-  // US — ETFs
-  { symbol: 'SPY',   name: 'S&P 500 ETF',        market: 'US',     sector: 'ETF' },
-  { symbol: 'QQQ',   name: 'Nasdaq 100 ETF',     market: 'US',     sector: 'ETF' },
   // India — Energy / Conglomerate
   { symbol: 'RELIANCE.NS',   name: 'Reliance Industries', market: 'India', sector: 'Energy' },
-  { symbol: 'TATAMOTORS.NS', name: 'Tata Motors',         market: 'India', sector: 'Consumer' },
+  { symbol: 'BAJFINANCE.NS', name: 'Bajaj Finance',        market: 'India', sector: 'Finance' },
   // India — IT / Tech
   { symbol: 'TCS.NS',  name: 'Tata Consultancy',  market: 'India', sector: 'Tech' },
   { symbol: 'INFY.NS', name: 'Infosys',            market: 'India', sector: 'Tech' },
