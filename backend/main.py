@@ -99,9 +99,27 @@ def _run_trade_scheduled():
     run_trade_pipeline(run_id)
 
 
+def _startup_init():
+    """Run migrations + seed in a background thread so uvicorn starts immediately."""
+    from core.database import ensure_tables, SessionLocal as _SessionLocal
+    ensure_tables(engine)
+    from pipeline.orchestrator import setup_agent_prompts
+    _db = _SessionLocal()
+    try:
+        setup_agent_prompts(_db)
+    except Exception as e:
+        print(f"[startup] seed failed (non-fatal): {e}")
+    finally:
+        _db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler
+
+    # Run migrations + seed in background so the server accepts requests immediately
+    threading.Thread(target=_startup_init, daemon=True).start()
+
     if not VERCEL:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.interval import IntervalTrigger
@@ -121,19 +139,6 @@ async def lifespan(app: FastAPI):
     yield
     if scheduler:
         scheduler.shutdown()
-
-# Create database tables + run migrations
-from core.database import ensure_tables
-ensure_tables(engine)
-
-# Seed all agent prompts (core + specialists) — safe to run on every cold start
-from pipeline.orchestrator import setup_agent_prompts
-from core.database import SessionLocal as _SessionLocal
-_db = _SessionLocal()
-try:
-    setup_agent_prompts(_db)
-finally:
-    _db.close()
 
 app = FastAPI(title="AI Stock Market Suggestion API", lifespan=lifespan)
 

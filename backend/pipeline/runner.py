@@ -9,17 +9,30 @@ Public API (unchanged — api/routes.py calls these directly):
 """
 
 import json
-from core.database import SessionLocal, engine, ensure_tables
+from core.database import SessionLocal
 import core.models as models
 
-ensure_tables(engine)
-
-from pipeline.graphs.research_graph import build_research_graph
-from pipeline.graphs.trade_graph import build_trade_graph
 from pipeline.graphs.state import ResearchState, TradeState
 
-_research_graph = build_research_graph()
-_trade_graph    = build_trade_graph()
+# Lazy-initialised — built on first pipeline run, not at import time
+_research_graph = None
+_trade_graph    = None
+
+
+def _get_research_graph():
+    global _research_graph
+    if _research_graph is None:
+        from pipeline.graphs.research_graph import build_research_graph
+        _research_graph = build_research_graph()
+    return _research_graph
+
+
+def _get_trade_graph():
+    global _trade_graph
+    if _trade_graph is None:
+        from pipeline.graphs.trade_graph import build_trade_graph
+        _trade_graph = build_trade_graph()
+    return _trade_graph
 
 
 def _tag_run_events(run_id: str, run_type: str):
@@ -60,7 +73,7 @@ def run_research_pipeline(run_id: str):
         "kg_edges_added":   0,
         "error":            None,
     }
-    _research_graph.invoke(initial_state)
+    _get_research_graph().invoke(initial_state)
     _tag_run_events(run_id, "research")
 
     from core.cache import cache_invalidate
@@ -107,7 +120,7 @@ def run_trade_pipeline(run_id: str):
         "verdicts":         [],
         "error":            None,
     }
-    _trade_graph.invoke(initial_state)
+    _get_trade_graph().invoke(initial_state)
     _tag_run_events(run_id, "trade")
 
 
