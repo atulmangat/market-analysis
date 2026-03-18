@@ -1394,7 +1394,7 @@ export function PipelinePage({
                 <button
                   onClick={handleEvalTrigger}
                   disabled={pipelineReadiness.active_positions === 0}
-                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors overflow-visible ${
                     pipelineReadiness.active_positions > 0
                       ? 'border-purple-700/50 bg-purple-900/20 text-purple-400 hover:bg-purple-800/30'
                       : 'bg-surface2 border-borderLight text-textDim cursor-not-allowed opacity-50'
@@ -1403,12 +1403,12 @@ export function PipelinePage({
                 >
                   ◉ Evaluate Agents
                   {pipelineReadiness.active_positions > 0 && (
-                    <span className="relative group/evalbadge ml-1">
+                    <span className="relative group/evalbadge ml-1" style={{ overflow: 'visible' }}>
                       <span className="px-1.5 py-0.5 rounded-full bg-purple-700/40 text-purple-300 text-[10px] font-semibold leading-none inline-block">
                         {pipelineReadiness.active_positions}
                       </span>
-                      <span className="pointer-events-none absolute bottom-full left-1/2 -translate-x-1/2 mb-2 opacity-0 group-hover/evalbadge:opacity-100 transition-opacity duration-150 z-50">
-                        <span className="block bg-surface border border-borderMid rounded-lg px-2.5 py-1.5 shadow-lg text-[11px] text-textMuted whitespace-nowrap">
+                      <span className="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-2 opacity-0 group-hover/evalbadge:opacity-100 transition-opacity duration-150" style={{ zIndex: 9999 }}>
+                        <span className="block bg-surface border border-borderMid rounded-lg px-2.5 py-1.5 shadow-xl text-[11px] text-textMuted whitespace-nowrap">
                           <span className="font-semibold text-textMain">{pipelineReadiness.active_positions}</span> active position{pipelineReadiness.active_positions !== 1 ? 's' : ''} to evaluate
                         </span>
                       </span>
