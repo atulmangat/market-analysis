@@ -1247,7 +1247,10 @@ export function PipelinePage({
               </div>
               {/* Run count badge */}
               {tabRunCount > 0 && (
-                <span className={`shrink-0 text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${isActive_ ? `${tab.activeBg} ${tab.activeBorder} ${tab.color}` : 'bg-surface3 border-borderLight text-textDim'}`}>
+                <span
+                  title={`${tabRunCount} completed run${tabRunCount !== 1 ? 's' : ''}`}
+                  className={`shrink-0 text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${isActive_ ? `${tab.activeBg} ${tab.activeBorder} ${tab.color}` : 'bg-surface3 border-borderLight text-textDim'}`}
+                >
                   {tabRunCount}
                 </span>
               )}
