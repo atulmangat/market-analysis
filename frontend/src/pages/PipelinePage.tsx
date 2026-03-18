@@ -206,6 +206,7 @@ export function PipelinePage({
     tab === 'eval'     ? evalRunning : false;
   const focusSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [stepsExpanded, setStepsExpanded] = useState(false);
+  const [evalBadgeTooltip, setEvalBadgeTooltip] = useState<{ x: number; y: number } | null>(null);
   const [runsPage, setRunsPage] = useState(0);
   const [activeTab, setActiveTab] = useState<PipelineTab>('research');
   const RUNS_PER_PAGE = 10;
@@ -1232,6 +1233,17 @@ export function PipelinePage({
 
   return (
     <div className="space-y-4">
+      {/* ── Fixed-position tooltip (escapes overflow:hidden parents) ─────────── */}
+      {evalBadgeTooltip && (
+        <div
+          className="pointer-events-none fixed z-[9999] -translate-x-1/2 -translate-y-full"
+          style={{ left: evalBadgeTooltip.x, top: evalBadgeTooltip.y - 6 }}
+        >
+          <span className="block bg-surface border border-borderMid rounded-lg px-2.5 py-1.5 shadow-xl text-[11px] text-textMuted whitespace-nowrap">
+            <span className="font-semibold text-textMain">{pipelineReadiness.active_positions}</span> active position{pipelineReadiness.active_positions !== 1 ? 's' : ''} to evaluate
+          </span>
+        </div>
+      )}
       {/* ── Tab bar ──────────────────────────────────────────────────────────── */}
       <div className="grid grid-cols-3 gap-2">
         {TAB_CONFIG.map(tab => {
@@ -1394,24 +1406,20 @@ export function PipelinePage({
                 <button
                   onClick={handleEvalTrigger}
                   disabled={pipelineReadiness.active_positions === 0}
-                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors overflow-visible ${
+                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
                     pipelineReadiness.active_positions > 0
                       ? 'border-purple-700/50 bg-purple-900/20 text-purple-400 hover:bg-purple-800/30'
                       : 'bg-surface2 border-borderLight text-textDim cursor-not-allowed opacity-50'
                   }`}
-                  title={pipelineReadiness.active_positions === 0 ? 'No active positions to evaluate' : undefined}
                 >
                   ◉ Evaluate Agents
                   {pipelineReadiness.active_positions > 0 && (
-                    <span className="relative group/evalbadge ml-1" style={{ overflow: 'visible' }}>
-                      <span className="px-1.5 py-0.5 rounded-full bg-purple-700/40 text-purple-300 text-[10px] font-semibold leading-none inline-block">
-                        {pipelineReadiness.active_positions}
-                      </span>
-                      <span className="pointer-events-none absolute top-full left-1/2 -translate-x-1/2 mt-2 opacity-0 group-hover/evalbadge:opacity-100 transition-opacity duration-150" style={{ zIndex: 9999 }}>
-                        <span className="block bg-surface border border-borderMid rounded-lg px-2.5 py-1.5 shadow-xl text-[11px] text-textMuted whitespace-nowrap">
-                          <span className="font-semibold text-textMain">{pipelineReadiness.active_positions}</span> active position{pipelineReadiness.active_positions !== 1 ? 's' : ''} to evaluate
-                        </span>
-                      </span>
+                    <span
+                      className="px-1.5 py-0.5 rounded-full bg-purple-700/40 text-purple-300 text-[10px] font-semibold leading-none"
+                      onMouseEnter={e => { const r = e.currentTarget.getBoundingClientRect(); setEvalBadgeTooltip({ x: r.left + r.width / 2, y: r.top }); }}
+                      onMouseLeave={() => setEvalBadgeTooltip(null)}
+                    >
+                      {pipelineReadiness.active_positions}
                     </span>
                   )}
                 </button>
