@@ -99,13 +99,13 @@ def run_research_pipeline(run_id: str):
                     db.add(models.AppConfig(key=key, value=val))
             # Mark research run done
             run.step = "done"
-            _release_lock(db, "research_running")
+            _release_lock(db, _lock_key_for_run(run))
             db.commit()
             _log(db, run_id, "MEMORY_WRITE", "DONE",
                  "Research pipeline complete — context saved for trade pipeline")
         else:
             # pipeline_research already set error state, just make sure lock is released
-            _release_lock(db, "research_running")
+            _release_lock(db, _lock_key_for_run(run))
             db.commit()
     finally:
         db.close()
@@ -133,7 +133,7 @@ def run_trade_pipeline(run_id: str):
             _log(db, run_id, "AGENT_QUERY", "ERROR",
                  "No research context available — run the Research pipeline first to fetch news and build the knowledge graph.")
             run.step = "error"
-            _release_lock(db, "trade_running")
+            _release_lock(db, _lock_key_for_run(run))
             db.commit()
             _tag_run_events(run_id, "trade")
             return
@@ -388,9 +388,7 @@ def pipeline_agents(run_id: str):
 
     except Exception as e:
         _log(db, run_id, "DEBATE_PANEL", "ERROR", str(e)[:300])
-        run = _get_run(db, run_id)
-        if run:
-            _set_step(db, run, "error")
+        _fail_run(db, run_id)
     finally:
         db.close()
 
@@ -464,9 +462,7 @@ def pipeline_consensus(run_id: str):
 
     except Exception as e:
         _log(db, run_id, "JUDGE", "ERROR", str(e)[:300])
-        run = _get_run(db, run_id)
-        if run:
-            _set_step(db, run, "error")
+        _fail_run(db, run_id)
     finally:
         db.close()
 
@@ -641,9 +637,7 @@ def pipeline_deploy(run_id: str):
             print(f"[pipeline_deploy] Report generation failed (non-fatal): {re_err}")
 
         # Release per-pipeline lock and mark done atomically in one commit
-        run_type = getattr(run, "run_type", None) or "debate"
-        lock_key = {"trade": "trade_running", "debate": "trade_running"}.get(run_type, "trade_running")
-        _release_lock(db, lock_key)
+        _release_lock(db, _lock_key_for_run(run))
         run.step = "done"
         db.commit()
         _log(db, run_id, "MEMORY_WRITE", "DONE", "Pipeline complete")
