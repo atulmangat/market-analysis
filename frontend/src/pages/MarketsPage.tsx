@@ -60,12 +60,19 @@ function getMarketStatus(market: string, now: Date): {
   const session = MARKET_SESSIONS[market];
   if (!session) return { isOpen: false, label: market, statusText: 'Unknown', countdown: '', openPct: 0, localTime: '' };
 
-  // Get current time in exchange timezone
-  const localStr = now.toLocaleString('en-US', { timeZone: session.tz, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, weekday: 'short' });
-  const parts = localStr.split(', ');
-  const weekday = parts[0]; // e.g. "Mon"
-  const timeParts = (parts[1] ?? '').split(':').map(Number);
-  const localHour = (timeParts[0] ?? 0) + (timeParts[1] ?? 0) / 60 + (timeParts[2] ?? 0) / 3600;
+  // Get current time in exchange timezone using Intl.DateTimeFormat for reliable field extraction
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone: session.tz,
+    weekday: 'short',
+    hour: 'numeric',
+    minute: 'numeric',
+    second: 'numeric',
+    hour12: false,
+  });
+  const parts = dtf.formatToParts(now);
+  const get = (type: string) => parts.find(p => p.type === type)?.value ?? '0';
+  const weekday = get('weekday'); // 'Mon', 'Tue', etc.
+  const localHour = (parseInt(get('hour'), 10) % 24) + parseInt(get('minute'), 10) / 60 + parseInt(get('second'), 10) / 3600;
   const dayIdx = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(weekday);
 
   const localTimeDisplay = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: session.tz, hour12: false });
