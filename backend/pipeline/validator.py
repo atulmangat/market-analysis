@@ -200,6 +200,7 @@ def _build_exhaustive_analysis_prompt(
     )
 
     original_reasoning = prediction.reasoning or "(no reasoning recorded)"
+    exit_price_str = f"${strategy.exit_price:.4f}" if strategy.exit_price is not None else "N/A (position still open)"
 
     return f"""You are conducting an exhaustive post-mortem analysis of a market prediction made by the {agent_name} agent.
 
@@ -208,8 +209,8 @@ Agent: {agent_name}
 Symbol: {prediction.symbol}
 Call: {prediction.prediction} (deployed as {direction})
 Entry price: ${strategy.entry_price:.4f}
-Exit price: ${strategy.exit_price:.4f}
-Return: {pct_return:+.2f}%
+Current price: {exit_price_str}
+Return so far: {pct_return:+.2f}%
 Outcome: {outcome}
 Prediction timestamp: {prediction.timestamp}
 
