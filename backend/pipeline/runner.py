@@ -142,6 +142,8 @@ def run_trade_pipeline(run_id: str):
         run.shared_context = ctx_conf.value
         run.enabled_markets_json = markets_conf.value if markets_conf else "{}"
         db.commit()
+        _log(db, run_id, "START", "IN_PROGRESS", "Trade pipeline started — loading research context")
+        _log(db, run_id, "START", "DONE", "Research context loaded")
     finally:
         db.close()
 
