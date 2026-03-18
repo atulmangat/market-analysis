@@ -757,10 +757,11 @@ def evaluate_predictions(run_id: str = None):
                 except Exception:
                     pass
 
-            if pct_return <= STOP_LOSS_PCT:
-                strategies_to_close.append((strategy, current_price, pct_return, "STOP_LOSS"))
-            elif pct_return >= TAKE_PROFIT_PCT:
-                strategies_to_close.append((strategy, current_price, pct_return, "TAKE_PROFIT"))
+            # Auto-close disabled — positions are closed manually only
+            # if pct_return <= STOP_LOSS_PCT:
+            #     strategies_to_close.append((strategy, current_price, pct_return, "STOP_LOSS"))
+            # elif pct_return >= TAKE_PROFIT_PCT:
+            #     strategies_to_close.append((strategy, current_price, pct_return, "TAKE_PROFIT"))
 
         db.commit()
 
