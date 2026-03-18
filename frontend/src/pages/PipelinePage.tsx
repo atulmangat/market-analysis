@@ -1062,41 +1062,49 @@ export function PipelinePage({
     );
   };
 
-  const renderLoadingSkeleton = () => (
-    <div className="flex-1 flex flex-col gap-4 px-6 py-6 animate-pulse">
-      {/* Step pills row */}
-      <div className="flex gap-2 flex-wrap">
-        {[90, 110, 100, 95, 105, 88].map((w, i) => (
-          <div key={i} className="h-7 rounded-full bg-surface3" style={{ width: w }} />
-        ))}
-      </div>
-      {/* Summary card */}
-      <div className="rounded-xl border border-borderLight bg-surface2 p-5 space-y-3">
-        <div className="flex items-center gap-3">
-          <div className="h-10 w-10 rounded-full bg-surface3 shrink-0" />
-          <div className="space-y-1.5 flex-1">
-            <div className="h-4 bg-surface3 rounded w-48" />
-            <div className="h-3 bg-surface3 rounded w-32" />
+  const renderLoadingSkeleton = () => {
+    const steps = activeTab === 'eval' ? EVAL_ORDERED_STEPS
+      : activeTab === 'research' ? RESEARCH_ORDERED_STEPS
+      : TRADE_ORDERED_STEPS;
+    const labels = activeTab === 'eval' ? EVAL_STEP_LABELS : STEP_LABELS;
+    return (
+      <div className="flex-1 flex flex-col overflow-y-auto animate-pulse">
+        {/* Header banner — mirrors completed view */}
+        <div className="px-6 py-5 border-b border-borderLight bg-surface2/40">
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <div className="h-10 w-10 rounded-full bg-surface3 shrink-0" />
+              <div className="space-y-2">
+                <div className="h-3.5 bg-surface3 rounded w-36" />
+                <div className="h-2.5 bg-surface3 rounded w-24" />
+              </div>
+            </div>
+            <div className="h-7 w-24 rounded-lg bg-surface3 shrink-0" />
+          </div>
+          {/* Step chips — exact steps for this tab, all greyed out */}
+          <div className="mt-4 flex flex-wrap gap-1.5">
+            {steps.map(s => (
+              <span key={s} className="inline-flex items-center text-[10px] px-2.5 py-1 rounded-full border border-borderLight bg-surface3 text-transparent select-none">
+                {labels[s] ?? s}
+              </span>
+            ))}
           </div>
         </div>
-        <div className="space-y-2 pt-1">
-          {[70, 85, 60, 75].map((w, i) => (
-            <div key={i} className="h-3 bg-surface3 rounded" style={{ width: `${w}%` }} />
+        {/* Event rows */}
+        <div className="px-5 py-4 space-y-4">
+          {steps.map((s, i) => (
+            <div key={s} className="flex items-start gap-3">
+              <div className="h-6 w-6 rounded-full bg-surface3 shrink-0 mt-0.5" />
+              <div className="flex-1 space-y-1.5">
+                <div className="h-3 bg-surface3 rounded" style={{ width: `${40 + (i % 3) * 15}%` }} />
+                <div className="h-2.5 bg-surface3 rounded" style={{ width: `${55 + (i % 4) * 10}%` }} />
+              </div>
+            </div>
           ))}
         </div>
       </div>
-      {/* Event rows */}
-      {[1, 2, 3, 4].map(i => (
-        <div key={i} className="flex items-start gap-3">
-          <div className="h-6 w-6 rounded-full bg-surface3 shrink-0 mt-0.5" />
-          <div className="flex-1 space-y-1.5">
-            <div className="h-3 bg-surface3 rounded" style={{ width: `${50 + i * 8}%` }} />
-            <div className="h-2.5 bg-surface3 rounded" style={{ width: `${65 + i * 5}%` }} />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
+    );
+  };
 
   // ── Decide what to render in main panel ──────────────────────────────────
   const renderPanel = () => {
