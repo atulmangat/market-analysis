@@ -215,26 +215,32 @@ export function PipelinePage({
   selectedRunIdRef.current = selectedRunId;
 
   // ── Lazy-load pipeline runs per tab ─────────────────────────────────────────
-  // Fetch /pipeline/runs only when the user opens the pipeline page and switches
-  // tabs — not on every global poll tick. Re-fetch when a pipeline just finished
-  // (tabIsActive flips from true → false) so the new completed run appears.
+  // Fetch /pipeline/runs on tab switch or when a pipeline just finished.
+  // When just finished, delay 1.5s so the backend has time to commit the final
+  // step="done" before we query — otherwise the run appears as "running" or
+  // is missing from the list and the panel seems to vanish.
   const prevTabActiveRef = useRef(false);
   const tabActive = tabIsActive(activeTab);
+  const fetchRuns = (delay = 0) => {
+    const doFetch = () =>
+      apiFetch('/pipeline/runs')
+        .then(r => r.ok ? r.json() : null)
+        .then(runs => {
+          if (runs) {
+            setPipelineRuns(runs);
+            setPipelineRunsLoaded(true);
+          }
+        })
+        .catch(() => { setPipelineRunsLoaded(true); });
+    if (delay > 0) setTimeout(doFetch, delay);
+    else doFetch();
+  };
   useEffect(() => {
     const wasActive = prevTabActiveRef.current;
     prevTabActiveRef.current = tabActive;
-    // Fetch on tab switch OR when pipeline just finished (running→stopped)
     const justFinished = wasActive && !tabActive;
-    apiFetch('/pipeline/runs')
-      .then(r => r.ok ? r.json() : null)
-      .then(runs => {
-        if (runs) {
-          setPipelineRuns(runs);
-          setPipelineRunsLoaded(true);
-        }
-      })
-      .catch(() => { setPipelineRunsLoaded(true); });
-    void justFinished; // used implicitly via effect re-run
+    // Delay re-fetch when pipeline just finished so backend has time to commit
+    fetchRuns(justFinished ? 1500 : 0);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab, tabActive]);
 

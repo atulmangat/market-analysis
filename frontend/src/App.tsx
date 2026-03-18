@@ -627,20 +627,24 @@ function AppInner() {
       setSelectedRunId(null);
       setSelectedRunEvents([]);
     } else if (wasRunning && !isNowRunning && pipelineRunId) {
-      // A pipeline just finished — only auto-select the finished run if user hasn't picked one
+      // A pipeline just finished — delay auto-select so the backend has time to
+      // commit step="done" and the PipelinePage runs-list fetch (also 1.5s delayed)
+      // arrives around the same time. Without the delay the run panel vanishes
+      // because selectedRunId points at a run not yet in pipelineRuns.
       if (!userSelectedRunRef.current) {
         const finishedRunId = pipelineRunId;
         setPipelineEvents([]);
-        setSelectedRunId(finishedRunId);
-        setSelectedRunEvents([]);
-        setSelectedRunLoading(true);
-        // Only fetch the finished run's events — pipelineRuns list is refreshed
-        // lazily by PipelinePage when tabActive flips (running→stopped).
-        apiFetch(`/pipeline/runs/${finishedRunId}`)
-          .then(r => r.ok ? r.json() : null)
-          .then(eventsData => { if (eventsData) setSelectedRunEvents(eventsData.events ?? []); })
-          .catch(() => {})
-          .finally(() => setSelectedRunLoading(false));
+        setTimeout(() => {
+          if (userSelectedRunRef.current) return; // user picked something else
+          setSelectedRunId(finishedRunId);
+          setSelectedRunEvents([]);
+          setSelectedRunLoading(true);
+          apiFetch(`/pipeline/runs/${finishedRunId}`)
+            .then(r => r.ok ? r.json() : null)
+            .then(eventsData => { if (eventsData) setSelectedRunEvents(eventsData.events ?? []); })
+            .catch(() => {})
+            .finally(() => setSelectedRunLoading(false));
+        }, 1500);
       }
     }
     prevIsTriggering.current = isNowRunning;
