@@ -23,22 +23,36 @@ _SECTION_MARKER = "=== {} ==="
 
 def _log(db: Session, run_id: str, step: str, status: str, detail: str = None, agent_name: str = None):
     """Write a PipelineEvent for the eval pipeline and immediately commit."""
-    ev = models.PipelineEvent(
-        run_id=run_id,
-        run_type="eval",
-        step=step,
-        agent_name=agent_name,
-        status=status,
-        detail=detail,
-    )
-    db.add(ev)
-    db.commit()
+    try:
+        ev = models.PipelineEvent(
+            run_id=run_id,
+            run_type="eval",
+            step=step,
+            agent_name=agent_name,
+            status=status,
+            detail=detail,
+        )
+        db.add(ev)
+        db.commit()
+    except Exception as e:
+        print(f"[eval/_log] DB write failed for {step}/{status}: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _update_run(db: Session, run: models.PipelineRun, step: str):
-    run.step = step
-    run.updated_at = datetime.utcnow()
-    db.commit()
+    try:
+        run.step = step
+        run.updated_at = datetime.utcnow()
+        db.commit()
+    except Exception as e:
+        print(f"[eval/_update_run] DB write failed for step={step}: {e}")
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _extract_section(prompt: str, section: str) -> str:
@@ -649,7 +663,7 @@ def _run_darwin_selection(
 
 # ── Public entry point ───────────────────────────────────────────────────────
 
-def evaluate_predictions():
+def evaluate_predictions(run_id: str = None):
     """
     Exhaustive evaluation pipeline:
     1. Create a PipelineRun of type "eval"
@@ -660,7 +674,8 @@ def evaluate_predictions():
     6. MEMORY_WRITE — write final lessons and prune old memory
     """
     db = SessionLocal()
-    run_id = str(uuid.uuid4())
+    if not run_id:
+        run_id = str(uuid.uuid4())
 
     # ── Create eval pipeline run ──────────────────────────────────────────────
     run = models.PipelineRun(
@@ -692,7 +707,11 @@ def evaluate_predictions():
         price_data = {}
         failed_fetches = []
         for strategy in active_strategies:
-            current_data = fetch_market_data(strategy.symbol)
+            try:
+                current_data = fetch_market_data(strategy.symbol, timeout=15)
+            except Exception as e:
+                print(f"[eval] fetch_market_data crashed for {strategy.symbol}: {e}")
+                current_data = None
             if current_data:
                 price_data[strategy.id] = current_data.price
             else:
@@ -729,7 +748,14 @@ def evaluate_predictions():
             )
 
             # Update prediction scores (mark partial performance)
-            _write_performance_feedback(db, strategy, current_price, pct_return)
+            try:
+                _write_performance_feedback(db, strategy, current_price, pct_return)
+            except Exception as e:
+                print(f"[eval] _write_performance_feedback failed for {strategy.symbol}: {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
             if pct_return <= STOP_LOSS_PCT:
                 strategies_to_close.append((strategy, current_price, pct_return, "STOP_LOSS"))

@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import type {
   Strategy, StrategyReport, PortfolioPnl, MarketConfig, DebateRound,
   AgentMemory, AgentPrompt, AgentFitness, WebResearch,
-  PipelineEvent, PipelineRun, LiveQuote, MarketEvent, Page
+  PipelineEvent, PipelineRun, LiveQuote, MarketEvent, Page, PipelineReadiness
 } from './types';
 import { NAV } from './constants';
 import { getToken, apiFetch, applyTheme, getMarketForTicker } from './utils';
@@ -59,6 +59,9 @@ function AppInner() {
   const [budgetInput, setBudgetInput]       = useState<string>('10000');
   const [approvalMode, setApprovalMode]     = useState('auto');
   const [scheduleInterval, setScheduleInterval] = useState<number>(60);
+  const [scheduleResearch, setScheduleResearch] = useState<number>(60);
+  const [scheduleTrade, setScheduleTrade]       = useState<number>(60);
+  const [scheduleEval, setScheduleEval]         = useState<number>(120);
   const [isTriggering, setIsTriggering]     = useState(false);
   const isTriggeringRef = useRef(false);
   const [investmentFocus, setInvestmentFocus] = useState('');
@@ -164,16 +167,22 @@ function AppInner() {
       if (resRes.ok) { const d = await resRes.json(); setResearch(d); try { localStorage.setItem('cache_research', JSON.stringify(d)); } catch { /* storage quota */ } }
       if (schedRes.ok) { const d = await schedRes.json(); setScheduleInterval(d.interval_minutes); }
       if (agentRes.ok) setAgents(await agentRes.json());
-      const [fitnessRes, budgetRes, pnlRes, focusRes] = await Promise.all([
+      const [fitnessRes, budgetRes, pnlRes, focusRes, schedRRes, schedTRes, schedERes] = await Promise.all([
         apiFetch('/agents/fitness'),
         apiFetch('/config/budget'),
         apiFetch('/portfolio/pnl'),
         apiFetch('/config/investment_focus'),
+        apiFetch('/config/schedule/research'),
+        apiFetch('/config/schedule/trade'),
+        apiFetch('/config/schedule/eval'),
       ]);
       if (fitnessRes.ok) setAgentFitness(await fitnessRes.json());
       if (budgetRes.ok) { const d = await budgetRes.json(); setBudgetInput(d.trading_budget.toString()); }
       if (pnlRes.ok) setPortfolio(await pnlRes.json());
       if (focusRes.ok) { const d = await focusRes.json(); setInvestmentFocus(d.investment_focus ?? ''); }
+      if (schedRRes.ok) { const d = await schedRRes.json(); setScheduleResearch(d.interval_minutes); }
+      if (schedTRes.ok) { const d = await schedTRes.json(); setScheduleTrade(d.interval_minutes); }
+      if (schedERes.ok) { const d = await schedERes.json(); setScheduleEval(d.interval_minutes); }
     } catch (err) { console.error('Fetch error', err); }
   };
 
@@ -216,17 +225,49 @@ function AppInner() {
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const triggerPollRef = useRef<(() => void) | null>(null);
   const initialPollDoneRef = useRef(false);
+  // Trigger-guard: track when each pipeline was last triggered to prevent the
+  // poller from overriding optimistic running=true before the backend sets the lock.
+  const lastTriggerAtRef = useRef<{ research: number; trade: number; eval: number }>({ research: 0, trade: 0, eval: 0 });
+  const TRIGGER_GUARD_MS = 6000; // ignore backend running=false for 6s after trigger
 
   const [pipelineEvents, setPipelineEvents]       = useState<PipelineEvent[]>([]);
   const [pipelineRunId, setPipelineRunId]         = useState<string | null>(null);
+  // Per-pipeline running state — single object so all fields update atomically
+  const [pipelineStatus, setPipelineStatus] = useState({
+    researchRunning: false, tradeRunning: false, evalRunning: false,
+    currentRunIdResearch: null as string | null,
+    currentRunIdTrade: null as string | null,
+    currentRunIdEval: null as string | null,
+  });
+  const { researchRunning, tradeRunning, evalRunning, currentRunIdResearch, currentRunIdTrade, currentRunIdEval } = pipelineStatus;
+  // Setters for trigger handlers
+  const setResearchRunning = (v: boolean) => setPipelineStatus(s => ({ ...s, researchRunning: v }));
+  const setTradeRunning    = (v: boolean) => setPipelineStatus(s => ({ ...s, tradeRunning: v }));
+  const setEvalRunning     = (v: boolean) => setPipelineStatus(s => ({ ...s, evalRunning: v }));
+  const setCurrentRunIdResearch = (v: string | null) => setPipelineStatus(s => ({ ...s, currentRunIdResearch: v }));
+  const setCurrentRunIdTrade    = (v: string | null) => setPipelineStatus(s => ({ ...s, currentRunIdTrade: v }));
+  const setCurrentRunIdEval     = (v: string | null) => setPipelineStatus(s => ({ ...s, currentRunIdEval: v }));
+  // Per-pipeline live events — single object for atomic updates
+  const [pipelineTabEvents, setPipelineTabEvents] = useState({
+    researchEvents: [] as PipelineEvent[],
+    tradeEvents:    [] as PipelineEvent[],
+    evalEvents:     [] as PipelineEvent[],
+  });
+  const { researchEvents, tradeEvents, evalEvents } = pipelineTabEvents;
+  const setResearchEvents = (v: PipelineEvent[]) => setPipelineTabEvents(s => ({ ...s, researchEvents: v }));
+  const setTradeEvents    = (v: PipelineEvent[]) => setPipelineTabEvents(s => ({ ...s, tradeEvents: v }));
+  const setEvalEvents     = (v: PipelineEvent[]) => setPipelineTabEvents(s => ({ ...s, evalEvents: v }));
   const [researchStepOpen, setResearchStepOpen]   = useState(false);
   const [pendingDropdownOpen, setPendingDropdownOpen] = useState(false);
   const [disableMarketPrompt, setDisableMarketPrompt] = useState<{ name: string; affected: Strategy[] } | null>(null);
   const [pipelineRuns, setPipelineRuns]           = useState<PipelineRun[]>([]);
   const [pipelineRunsLoaded, setPipelineRunsLoaded] = useState(false);
+  const [pipelineReadiness, setPipelineReadiness] = useState<PipelineReadiness>({ has_research_data: false, last_research_at: null, active_positions: 0 });
   const [selectedRunId, setSelectedRunId]         = useState<string | null>(null);
   const [selectedRunEvents, setSelectedRunEvents] = useState<PipelineEvent[]>([]);
   const [selectedRunLoading, setSelectedRunLoading] = useState(false);
+  // True when the user explicitly clicked a past run — prevents transition effects from overriding.
+  const userSelectedRunRef = useRef(false);
   const [statFocus, setStatFocus]           = useState<'active' | 'pending' | 'debates' | 'memories' | null>(null);
   const [kgRefreshTrigger, setKgRefreshTrigger] = useState(0);
   const lastKgRunIdRef = useRef<string | null>(null);
@@ -242,8 +283,11 @@ function AppInner() {
           // Do NOT re-derive from run_step: an intermediate step with is_running=false
           // means the pipeline died mid-step, not that it's still running.
           const running = !!data.is_running;
-          isTriggeringRef.current = running;
-          setIsTriggering(running);
+          // Do NOT call setIsTriggering here — /system/status is the single source of truth
+          // for isTriggering (it includes the per-pipeline flags + trigger guard). Calling it
+          // here too causes isTriggering to bounce between two values in a single poll tick,
+          // triggering the transition effect twice and making the UI flicker.
+          if (running) isTriggeringRef.current = true; // only set true optimistically; /system/status owns false
           setPipelineRunId(runId);
           // Always show events for the current run_id — don't clear on refresh
           const events: PipelineEvent[] = data.events ?? [];
@@ -265,14 +309,47 @@ function AppInner() {
         }
       } catch { /* ignore */ }
       try {
-        const r = await apiFetch('/pipeline/runs');
+        const r = await apiFetch('/system/status');
         if (r.ok) {
-          const runs = await r.json();
-          setPipelineRuns(runs);
+          const d = await r.json();
+          const now = Date.now();
+          const guard = lastTriggerAtRef.current;
+          // If a pipeline was recently triggered (<TRIGGER_GUARD_MS ago), keep running=true
+          // even if the backend hasn't persisted the lock yet (avoids optimistic flash).
+          const rr = !!d.research_running || (now - guard.research < TRIGGER_GUARD_MS);
+          const tr = !!d.trade_running    || (now - guard.trade    < TRIGGER_GUARD_MS);
+          const er = !!d.eval_running     || (now - guard.eval     < TRIGGER_GUARD_MS);
+          const ridR = d.current_run_id_research ?? null;
+          const ridT = d.current_run_id_trade ?? null;
+          const ridE = d.current_run_id_eval ?? null;
+          // Update all running state atomically in one setState call
+          setPipelineStatus({ researchRunning: rr, tradeRunning: tr, evalRunning: er, currentRunIdResearch: ridR, currentRunIdTrade: ridT, currentRunIdEval: ridE });
+          const anyRunning = rr || tr || er;
+          isTriggeringRef.current = anyRunning;
+          setIsTriggering(anyRunning);
+          setPipelineReadiness({
+            has_research_data: d.has_research_data ?? false,
+            last_research_at: d.last_research_at ?? null,
+            active_positions: d.active_positions ?? 0,
+          });
+          // Fetch live events only while running, then update events atomically
+          const fetches: Promise<void>[] = [];
+          if (rr && ridR) fetches.push(
+            apiFetch(`/pipeline/runs/${ridR}`).then(r => r.ok ? r.json() : null)
+              .then(d => { if (d) setPipelineTabEvents(s => ({ ...s, researchEvents: d.events ?? [] })); }).catch(() => {})
+          );
+          if (tr && ridT) fetches.push(
+            apiFetch(`/pipeline/runs/${ridT}`).then(r => r.ok ? r.json() : null)
+              .then(d => { if (d) setPipelineTabEvents(s => ({ ...s, tradeEvents: d.events ?? [] })); }).catch(() => {})
+          );
+          if (er && ridE) fetches.push(
+            apiFetch(`/pipeline/runs/${ridE}`).then(r => r.ok ? r.json() : null)
+              .then(d => { if (d) setPipelineTabEvents(s => ({ ...s, evalEvents: d.events ?? [] })); }).catch(() => {})
+          );
+          // No need to await — updates will arrive and trigger re-renders naturally
+          void fetches;
         }
-      } catch { /* ignore */ } finally {
-        setPipelineRunsLoaded(true);
-      }
+      } catch { /* ignore */ }
       pollTimerRef.current = setTimeout(pollPipeline, isTriggeringRef.current ? 2000 : 8000);
     };
 
@@ -287,7 +364,8 @@ function AppInner() {
   }, []);
 
   const loadRunEvents = async (runId: string) => {
-    if (selectedRunId === runId) { setSelectedRunId(null); setSelectedRunEvents([]); return; }
+    if (selectedRunId === runId) { setSelectedRunId(null); setSelectedRunEvents([]); userSelectedRunRef.current = false; return; }
+    userSelectedRunRef.current = true;
     setSelectedRunId(runId);
     setSelectedRunEvents([]);
     setSelectedRunLoading(true);
@@ -426,29 +504,83 @@ function AppInner() {
       .catch(console.error);
   };
 
-  const handleStopPipeline = () => {
-    setIsTriggering(false);
-    isTriggeringRef.current = false;
-    apiFetch('/system/stop', { method: 'POST' })
-      .then(r => { if (r.ok) toast('Pipeline stopped', 'info'); })
-      .catch(() => {});
+  const handleStopPipeline = (pipeline: 'research' | 'trade' | 'eval' = 'all' as never) => {
+    if (pipeline === 'research' || pipeline === ('all' as string)) setResearchRunning(false);
+    if (pipeline === 'trade'    || pipeline === ('all' as string)) setTradeRunning(false);
+    if (pipeline === 'eval'     || pipeline === ('all' as string)) setEvalRunning(false);
+    apiFetch('/system/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pipeline }),
+    }).then(r => { if (r.ok) toast('Pipeline stopped', 'info'); }).catch(() => {});
   };
 
   const handleEvalTrigger = () => {
-    if (isTriggering) return;
-    isTriggeringRef.current = true;
-    setIsTriggering(true);
+    if (evalRunning) return;
+    lastTriggerAtRef.current.eval = Date.now();
+    setEvalRunning(true);
+    setEvalEvents([]);
     setTimeout(() => { triggerPollRef.current?.(); }, 500);
     apiFetch('/eval/trigger', { method: 'POST' })
       .then(res => res.json())
       .then(data => {
-        if (data.status === 'error') { isTriggeringRef.current = false; setIsTriggering(false); toast(data.message, 'err'); }
+        if (data.status === 'error') { setEvalRunning(false); toast(data.message, 'err'); }
         else {
+          if (data.run_id) setCurrentRunIdEval(data.run_id);
           toast('Evaluation pipeline started', 'ok');
           setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000);
         }
       })
-      .catch(() => { isTriggeringRef.current = false; setIsTriggering(false); });
+      .catch(() => { setEvalRunning(false); });
+  };
+
+  const handleResearchTrigger = () => {
+    if (researchRunning) return;
+    lastTriggerAtRef.current.research = Date.now();
+    setResearchRunning(true);
+    setResearchEvents([]);
+    setTimeout(() => { triggerPollRef.current?.(); }, 500);
+    apiFetch('/research/trigger', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'error') { setResearchRunning(false); toast(data.message, 'err'); }
+        else {
+          if (data.run_id) { setCurrentRunIdResearch(data.run_id); setPipelineRunId(data.run_id); }
+          toast('Research pipeline started', 'ok');
+          setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000);
+        }
+      })
+      .catch(() => { setResearchRunning(false); });
+  };
+
+  const handleTradeTrigger = () => {
+    if (tradeRunning) return;
+    lastTriggerAtRef.current.trade = Date.now();
+    setTradeRunning(true);
+    setTradeEvents([]);
+    setTimeout(() => { triggerPollRef.current?.(); }, 500);
+    apiFetch('/trade/trigger', { method: 'POST' })
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'error') { setTradeRunning(false); toast(data.message, 'err'); }
+        else {
+          if (data.run_id) { setCurrentRunIdTrade(data.run_id); setPipelineRunId(data.run_id); }
+          toast('Trade pipeline started', 'ok');
+          setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000);
+        }
+      })
+      .catch(() => { setTradeRunning(false); });
+  };
+
+  const handlePipelineScheduleUpdate = (pipeline: 'research' | 'trade' | 'eval', minutes: number) => {
+    if (pipeline === 'research') setScheduleResearch(minutes);
+    else if (pipeline === 'trade') setScheduleTrade(minutes);
+    else setScheduleEval(minutes);
+    apiFetch(`/config/schedule/${pipeline}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ interval_minutes: minutes }),
+    }).catch(console.error);
   };
 
   const saveAgentPrompt = (agentName: string, prompt: string) => {
@@ -489,23 +621,27 @@ function AppInner() {
     const wasRunning = prevIsTriggering.current;
     const isNowRunning = isTriggering;
     if (!wasRunning && isNowRunning) {
+      // A new pipeline just started — always clear any past run selection and show live view.
+      // Reset the guard so the "finished" branch can auto-select when it completes.
+      userSelectedRunRef.current = false;
       setSelectedRunId(null);
       setSelectedRunEvents([]);
     } else if (wasRunning && !isNowRunning && pipelineRunId) {
-      const finishedRunId = pipelineRunId;
-      setPipelineEvents([]);
-      setSelectedRunId(finishedRunId);
-      setSelectedRunEvents([]);
-      setSelectedRunLoading(true);
-      // Refresh both the runs list and the events in parallel so the sidebar
-      // and output card populate immediately without waiting for the next poll.
-      Promise.all([
-        apiFetch('/pipeline/runs').then(r => r.ok ? r.json() : null),
-        apiFetch(`/pipeline/runs/${finishedRunId}`).then(r => r.ok ? r.json() : null),
-      ]).then(([runs, eventsData]) => {
-        if (runs) setPipelineRuns(runs);
-        if (eventsData) setSelectedRunEvents(eventsData.events ?? []);
-      }).catch(() => {}).finally(() => setSelectedRunLoading(false));
+      // A pipeline just finished — only auto-select the finished run if user hasn't picked one
+      if (!userSelectedRunRef.current) {
+        const finishedRunId = pipelineRunId;
+        setPipelineEvents([]);
+        setSelectedRunId(finishedRunId);
+        setSelectedRunEvents([]);
+        setSelectedRunLoading(true);
+        // Only fetch the finished run's events — pipelineRuns list is refreshed
+        // lazily by PipelinePage when tabActive flips (running→stopped).
+        apiFetch(`/pipeline/runs/${finishedRunId}`)
+          .then(r => r.ok ? r.json() : null)
+          .then(eventsData => { if (eventsData) setSelectedRunEvents(eventsData.events ?? []); })
+          .catch(() => {})
+          .finally(() => setSelectedRunLoading(false));
+      }
     }
     prevIsTriggering.current = isNowRunning;
     prevPipelineRunId.current = pipelineRunId;
@@ -630,6 +766,15 @@ function AppInner() {
         return (
           <PipelinePage
             isTriggering={isTriggering}
+            researchRunning={researchRunning}
+            tradeRunning={tradeRunning}
+            evalRunning={evalRunning}
+            currentRunIdResearch={currentRunIdResearch}
+            currentRunIdTrade={currentRunIdTrade}
+            currentRunIdEval={currentRunIdEval}
+            researchEvents={researchEvents}
+            tradeEvents={tradeEvents}
+            evalEvents={evalEvents}
             pipelineEvents={pipelineEvents}
             pipelineRunId={pipelineRunId}
             pipelineRuns={pipelineRuns}
@@ -640,6 +785,8 @@ function AppInner() {
             setSelectedRunEvents={setSelectedRunEvents}
             selectedRunLoading={selectedRunLoading}
             loadRunEvents={loadRunEvents}
+            setPipelineRuns={setPipelineRuns}
+            setPipelineRunsLoaded={setPipelineRunsLoaded}
             researchStepOpen={researchStepOpen}
             setResearchStepOpen={setResearchStepOpen}
             research={research}
@@ -660,8 +807,15 @@ function AppInner() {
             tickerSearchLoading={tickerSearchLoading}
             setTickerSearchLoading={setTickerSearchLoading}
             handleManualTrigger={handleManualTrigger}
-            handleStopPipeline={handleStopPipeline}
+            handleStopPipeline={(pipeline) => handleStopPipeline(pipeline ?? 'all' as never)}
             handleEvalTrigger={handleEvalTrigger}
+            handleResearchTrigger={handleResearchTrigger}
+            handleTradeTrigger={handleTradeTrigger}
+            scheduleResearch={scheduleResearch}
+            scheduleTrade={scheduleTrade}
+            scheduleEval={scheduleEval}
+            onScheduleUpdate={handlePipelineScheduleUpdate}
+            pipelineReadiness={pipelineReadiness}
             enabledMarketNames={enabledMarketNames}
             openReport={openReport}
           />

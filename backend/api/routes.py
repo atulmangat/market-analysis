@@ -23,10 +23,40 @@ _TTL_MARKET_EVT  = 1800    # 30 min — earnings/news calendar
 _TTL_MEMORY      = 300     # 5 min  — agent memories written after each run
 
 
+_PIPELINE_LOCK_KEYS = {"research": "research_running", "trade": "trade_running", "eval": "eval_running"}
+
+def _upsert_config(db, key: str, value: str):
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+    if conf:
+        conf.value = value
+    else:
+        db.add(models.AppConfig(key=key, value=value))
+
 def _is_pipeline_running(db) -> bool:
-    """Return True if a pipeline run is currently active. Used to skip caches during live runs."""
-    conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+    """Return True if any pipeline is currently active."""
+    rows = db.query(models.AppConfig).filter(
+        models.AppConfig.key.in_(list(_PIPELINE_LOCK_KEYS.values()))
+    ).all()
+    return any(r.value == "1" for r in rows)
+
+def _is_type_running(db, pipeline_type: str) -> bool:
+    key = _PIPELINE_LOCK_KEYS.get(pipeline_type, "trade_running")
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
     return conf is not None and conf.value == "1"
+
+def _acquire_lock(db, pipeline_type: str):
+    key = _PIPELINE_LOCK_KEYS.get(pipeline_type, "trade_running")
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+    if conf:
+        conf.value = "1"
+    else:
+        db.add(models.AppConfig(key=key, value="1"))
+
+def _release_lock(db, pipeline_type: str):
+    key = _PIPELINE_LOCK_KEYS.get(pipeline_type, "trade_running")
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+    if conf:
+        conf.value = "0"
 
 
 # Public router — no auth required
@@ -999,6 +1029,31 @@ def get_agent_evolution(agent_name: str, db: Session = Depends(get_db)):
     cache_set(cache_key, result, _TTL_EVOLUTION)
     return result
 
+@protected.get("/agents/predictions/{agent_name}")
+def get_agent_predictions(agent_name: str, db: Session = Depends(get_db)):
+    """Returns all predictions made by a specific agent, newest first."""
+    preds = (
+        db.query(models.AgentPrediction)
+        .filter(models.AgentPrediction.agent_name == agent_name)
+        .order_by(models.AgentPrediction.timestamp.desc())
+        .limit(100)
+        .all()
+    )
+    return [
+        {
+            "id":             p.id,
+            "symbol":         p.symbol,
+            "prediction":     p.prediction,
+            "confidence":     p.confidence,
+            "reasoning":      p.reasoning,
+            "actual_outcome": p.actual_outcome,
+            "score":          p.score,
+            "timestamp":      p.timestamp.isoformat() if p.timestamp else None,
+        }
+        for p in preds
+    ]
+
+
 # --- Agent Prompts Endpoint ---
 
 @protected.get("/agents")
@@ -1381,39 +1436,26 @@ class TriggerRequest(BaseModel):
 @protected.post("/trigger")
 def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depends(get_db)):
     """Manually triggers a new debate round via the pipeline chain. Optionally pass {"tickers": ["AAPL", "NVDA"]} to focus the run."""
-    is_running = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if is_running and is_running.value == "1":
+    if _is_type_running(db, "trade"):
         return {"status": "error", "message": "A data extraction is already running. Please wait."}
 
     focus = [t.strip().upper() for t in body.tickers if t.strip()] if body.tickers else None
 
-    # Acquire concurrency lock
-    lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if not lock:
-        db.add(models.AppConfig(key="debate_running", value="1"))
-    else:
-        lock.value = "1"
-
+    _acquire_lock(db, "trade")
     run_id = str(_uuid.uuid4())
 
-    # Load investment focus
     focus_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "investment_focus").first()
     investment_focus = focus_conf.value.strip() if focus_conf and focus_conf.value else ""
 
     run = models.PipelineRun(
         run_id=run_id,
+        run_type="trade",
         step="pending",
         investment_focus=investment_focus,
         focus_tickers=_json.dumps(focus) if focus else None,
     )
     db.add(run)
-
-    # Set current_run_id
-    run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-    if run_id_conf:
-        run_id_conf.value = run_id
-    else:
-        db.add(models.AppConfig(key="current_run_id", value=run_id))
+    _upsert_config(db, "current_run_id_trade", run_id)
     db.commit()
 
     from pipeline.runner import run_full_pipeline
@@ -1434,33 +1476,79 @@ def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depend
     msg = f"Focused pipeline run on: {', '.join(focus)}" if focus else "Full pipeline started."
     return {"status": "success", "message": msg, "run_id": run_id}
 
+@protected.post("/research/trigger")
+def trigger_research(db: Session = Depends(get_db)):
+    """Manually trigger a research pipeline run (web scraping + KG ingest only)."""
+    if _is_type_running(db, "research"):
+        return {"status": "error", "message": "Research pipeline is already running."}
+
+    _acquire_lock(db, "research")
+    run_id = str(_uuid.uuid4())
+    run = models.PipelineRun(run_id=run_id, step="pending", run_type="research")
+    db.add(run)
+    _upsert_config(db, "current_run_id_research", run_id)
+    db.commit()
+
+    from pipeline.runner import run_research_pipeline
+    t = threading.Thread(target=run_research_pipeline, args=(run_id,), daemon=True)
+    t.start()
+
+    cache_invalidate("pipeline_runs")
+    cache_invalidate("research")
+    cache_invalidate("kg_full")
+    cache_invalidate_prefix("kg_ticker:")
+    return {"status": "success", "message": "Research pipeline started.", "run_id": run_id}
+
+
+@protected.post("/trade/trigger")
+def trigger_trade(db: Session = Depends(get_db)):
+    """Manually trigger a trade pipeline run (agents + judge + deploy). Requires prior research run."""
+    if _is_type_running(db, "trade"):
+        return {"status": "error", "message": "Trade pipeline is already running."}
+
+    research_ctx = db.query(models.AppConfig).filter(models.AppConfig.key == "last_research_context").first()
+    if not research_ctx or not research_ctx.value:
+        return {"status": "error", "message": "No research context available. Run the research pipeline first."}
+
+    _acquire_lock(db, "trade")
+    run_id = str(_uuid.uuid4())
+    run = models.PipelineRun(run_id=run_id, step="pending", run_type="trade")
+    db.add(run)
+    _upsert_config(db, "current_run_id_trade", run_id)
+    db.commit()
+
+    from pipeline.runner import run_trade_pipeline
+    t = threading.Thread(target=run_trade_pipeline, args=(run_id,), daemon=True)
+    t.start()
+
+    cache_invalidate("pipeline_runs")
+    cache_invalidate("debates")
+    cache_invalidate("memory_all")
+    cache_invalidate("agents_fitness")
+    return {"status": "success", "message": "Trade pipeline started.", "run_id": run_id}
+
+
 @protected.post("/eval/trigger")
 def trigger_eval(db: Session = Depends(get_db)):
     """Manually trigger an evaluation pipeline run (score strategies, evolve agents)."""
-    is_running = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if is_running and is_running.value == "1":
-        return {"status": "error", "message": "A pipeline is already running. Please wait."}
+    import uuid as _uuid
+    if _is_type_running(db, "eval"):
+        return {"status": "error", "message": "Evaluation pipeline is already running."}
 
-    # Acquire concurrency lock
-    lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if not lock:
-        db.add(models.AppConfig(key="debate_running", value="1"))
-    else:
-        lock.value = "1"
+    run_id = str(_uuid.uuid4())
+    _acquire_lock(db, "eval")
+    _upsert_config(db, "current_run_id_eval", run_id)
     db.commit()
 
-    # Run eval in a background thread
     from pipeline.validator import evaluate_predictions
 
     def _run_eval_and_release():
         try:
-            evaluate_predictions()
+            evaluate_predictions(run_id=run_id)
         finally:
             _db = SessionLocal()
             try:
-                conf = _db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-                if conf:
-                    conf.value = "0"
+                _release_lock(_db, "eval")
                 _db.commit()
             except Exception:
                 pass
@@ -1475,22 +1563,93 @@ def trigger_eval(db: Session = Depends(get_db)):
     t.start()
 
     cache_invalidate("pipeline_runs")
-    return {"status": "success", "message": "Evaluation pipeline started."}
+    return {"status": "success", "message": "Evaluation pipeline started.", "run_id": run_id}
 
 
 @protected.get("/system/status")
 def get_system_status(db: Session = Depends(get_db)):
-    """Check if the system is currently running a data extraction."""
-    is_running = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    return {"is_running": is_running and is_running.value == "1"}
+    """Check per-pipeline running state and readiness."""
+    all_keys = [
+        "research_running", "trade_running", "eval_running",
+        "current_run_id_research", "current_run_id_trade", "current_run_id_eval",
+        "last_research_context", "last_research_run_id",
+    ]
+    configs = db.query(models.AppConfig).filter(models.AppConfig.key.in_(all_keys)).all()
+    cfg = {c.key: c.value for c in configs}
+
+    research_running = cfg.get("research_running") == "1"
+    trade_running    = cfg.get("trade_running") == "1"
+    eval_running     = cfg.get("eval_running") == "1"
+
+    # Stale-lock guard per pipeline
+    for flag, run_id_key in [
+        ("research_running", "current_run_id_research"),
+        ("trade_running",    "current_run_id_trade"),
+    ]:
+        if cfg.get(flag) == "1":
+            rid = cfg.get(run_id_key)
+            if rid:
+                r = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == rid).first()
+                if r and r.step in ("done", "error"):
+                    conf = db.query(models.AppConfig).filter(models.AppConfig.key == flag).first()
+                    if conf:
+                        conf.value = "0"
+                    db.commit()
+                    if flag == "research_running": research_running = False
+                    if flag == "trade_running":    trade_running = False
+
+    # Current run IDs per tab
+    current_run_id_research = cfg.get("current_run_id_research")
+    current_run_id_trade    = cfg.get("current_run_id_trade")
+    current_run_id_eval     = cfg.get("current_run_id_eval")
+
+    # Research freshness
+    last_research_run_id = cfg.get("last_research_run_id")
+    last_research_at = None
+    has_research_data = bool(cfg.get("last_research_context"))
+    if last_research_run_id:
+        last_evt = (
+            db.query(models.PipelineEvent)
+            .filter(models.PipelineEvent.run_id == last_research_run_id)
+            .order_by(models.PipelineEvent.created_at.desc())
+            .first()
+        )
+        if last_evt:
+            last_research_at = last_evt.created_at.isoformat()
+
+    active_positions = db.query(models.DeployedStrategy).filter(
+        models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"])
+    ).count()
+
+    return {
+        "research_running":        research_running,
+        "trade_running":           trade_running,
+        "eval_running":            eval_running,
+        "is_running":              research_running or trade_running or eval_running,
+        "current_run_id_research": current_run_id_research,
+        "current_run_id_trade":    current_run_id_trade,
+        "current_run_id_eval":     current_run_id_eval,
+        "has_research_data":       has_research_data,
+        "last_research_at":        last_research_at,
+        "active_positions":        active_positions,
+    }
+
+class StopRequest(BaseModel):
+    pipeline: str = "all"  # "research" | "trade" | "eval" | "all"
 
 @protected.post("/system/stop")
-def stop_pipeline(db: Session = Depends(get_db)):
-    """Force-stop the running pipeline by releasing the lock. The in-flight thread will finish its current LLM call but no new steps will deploy."""
-    conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if conf:
-        conf.value = "0"
-        db.commit()
+def stop_pipeline(body: StopRequest = StopRequest(), db: Session = Depends(get_db)):
+    """Force-stop one or all running pipelines by releasing their locks."""
+    keys_to_stop = (
+        list(_PIPELINE_LOCK_KEYS.values()) if body.pipeline == "all"
+        else [_PIPELINE_LOCK_KEYS[body.pipeline]] if body.pipeline in _PIPELINE_LOCK_KEYS
+        else list(_PIPELINE_LOCK_KEYS.values())
+    )
+    for key in keys_to_stop:
+        conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+        if conf:
+            conf.value = "0"
+    db.commit()
     cache_invalidate("pipeline_runs")
     cache_invalidate_prefix("pipeline_events")
     return {"status": "stopped"}
@@ -1506,16 +1665,13 @@ def resume_pipeline_run(run_id: str, db: Session = Depends(get_db)):
     if run.step == "done":
         return {"status": "already_complete", "run_id": run_id}
 
-    # Check concurrency lock
-    lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if lock and lock.value == "1":
+    # Check per-pipeline concurrency lock
+    run_type = getattr(run, "run_type", None) or "trade"
+    pipeline_type = run_type if run_type in _PIPELINE_LOCK_KEYS else "trade"
+    if _is_type_running(db, pipeline_type):
         return {"status": "already_running"}
 
-    # Acquire lock and clear error state if needed
-    if lock:
-        lock.value = "1"
-    else:
-        db.add(models.AppConfig(key="debate_running", value="1"))
+    _acquire_lock(db, pipeline_type)
     if run.step == "error":
         # Determine where to resume from based on saved checkpoint data
         if run.proposals_json and '"verdicts"' in (run.proposals_json or ""):
@@ -1554,19 +1710,55 @@ class ScheduleUpdate(BaseModel):
 def set_schedule(update: ScheduleUpdate, db: Session = Depends(get_db)):
     if update.interval_minutes < 1:
         return {"error": "Interval must be at least 1 minute."}
-        
+
     conf = db.query(models.AppConfig).filter(models.AppConfig.key == "schedule_interval_minutes").first()
     if conf:
         conf.value = str(update.interval_minutes)
     else:
         db.add(models.AppConfig(key="schedule_interval_minutes", value=str(update.interval_minutes)))
     db.commit()
-    
-    # Notice: we don't have access to the scheduler here directly.
-    # The frontend will hit this endpoint, but we need main.py to actually reload it.
-    # For now, we provide the updated value. main.py will provide a mechanism to sync it.
-    
     return {"status": "success", "interval_minutes": update.interval_minutes}
+
+
+# ── Per-pipeline schedule endpoints ─────────────────────────────────────────
+
+_PIPELINE_SCHEDULE_KEYS = {
+    "research": "schedule_research_minutes",
+    "trade":    "schedule_trade_minutes",
+    "eval":     "schedule_eval_minutes",
+}
+_PIPELINE_SCHEDULE_DEFAULTS = {"research": 60, "trade": 60, "eval": 120}
+
+
+def _get_pipeline_schedule(db: Session, pipeline: str) -> int:
+    key = _PIPELINE_SCHEDULE_KEYS.get(pipeline)
+    if not key:
+        return 60
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+    return int(conf.value) if conf else _PIPELINE_SCHEDULE_DEFAULTS.get(pipeline, 60)
+
+
+@protected.get("/config/schedule/{pipeline}")
+def get_pipeline_schedule(pipeline: str, db: Session = Depends(get_db)):
+    if pipeline not in _PIPELINE_SCHEDULE_KEYS:
+        raise HTTPException(status_code=404, detail=f"Unknown pipeline: {pipeline}")
+    return {"pipeline": pipeline, "interval_minutes": _get_pipeline_schedule(db, pipeline)}
+
+
+@protected.post("/config/schedule/{pipeline}")
+def set_pipeline_schedule(pipeline: str, update: ScheduleUpdate, db: Session = Depends(get_db)):
+    if pipeline not in _PIPELINE_SCHEDULE_KEYS:
+        raise HTTPException(status_code=404, detail=f"Unknown pipeline: {pipeline}")
+    if update.interval_minutes < 1:
+        return {"error": "Interval must be at least 1 minute."}
+    key = _PIPELINE_SCHEDULE_KEYS[pipeline]
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+    if conf:
+        conf.value = str(update.interval_minutes)
+    else:
+        db.add(models.AppConfig(key=key, value=str(update.interval_minutes)))
+    db.commit()
+    return {"status": "success", "pipeline": pipeline, "interval_minutes": update.interval_minutes}
 
 
 # --- Strategy Management (undeploy, edit) ---

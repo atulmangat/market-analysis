@@ -1,10 +1,21 @@
-import { useRef, useState } from 'react';
-import type { PipelineEvent, PipelineRun, WebResearch } from '../types';
+import { useEffect, useRef, useState } from 'react';
+import type { PipelineEvent, PipelineRun, WebResearch, PipelineReadiness } from '../types';
 import { STEP_META, MARKET_SECTORS, MARKET_ICONS, TICKER_DB } from '../constants';
 import { apiFetch, getMarketForTicker } from '../utils';
 
+type PipelineTab = 'research' | 'trade' | 'eval';
+
 interface PipelinePagesProps {
   isTriggering: boolean;
+  researchRunning: boolean;
+  tradeRunning: boolean;
+  evalRunning: boolean;
+  currentRunIdResearch: string | null;
+  currentRunIdTrade: string | null;
+  currentRunIdEval: string | null;
+  researchEvents: PipelineEvent[];
+  tradeEvents: PipelineEvent[];
+  evalEvents: PipelineEvent[];
   pipelineEvents: PipelineEvent[];
   pipelineRunId: string | null;
   pipelineRuns: PipelineRun[];
@@ -23,7 +34,13 @@ interface PipelinePagesProps {
   focusSectorFilter: { market: string; sector: string } | null;
   tickerSearchResults: { symbol: string; name: string; sector: string; exchange: string; type: string }[];
   tickerSearchLoading: boolean;
+  scheduleResearch: number;
+  scheduleTrade: number;
+  scheduleEval: number;
+  pipelineReadiness: PipelineReadiness;
   setResearchStepOpen: (v: boolean | ((prev: boolean) => boolean)) => void;
+  setPipelineRuns: (runs: PipelineRun[]) => void;
+  setPipelineRunsLoaded: (v: boolean) => void;
   setSelectedRunId: (id: string | null) => void;
   setSelectedRunEvents: (evts: PipelineEvent[]) => void;
   setInvestmentFocus: (v: string) => void;
@@ -35,14 +52,25 @@ interface PipelinePagesProps {
   setTickerSearchLoading: (v: boolean) => void;
   saveInvestmentFocus: (text: string) => void;
   handleManualTrigger: (tickers?: string[]) => void;
-  handleStopPipeline: () => void;
+  handleStopPipeline: (pipeline?: 'research' | 'trade' | 'eval') => void;
   handleEvalTrigger: () => void;
+  handleResearchTrigger: () => void;
+  handleTradeTrigger: () => void;
+  onScheduleUpdate: (pipeline: 'research' | 'trade' | 'eval', minutes: number) => void;
   loadRunEvents: (runId: string) => void;
   openReport: (id: number) => void;
 }
 
 const ORDERED_STEPS = [
   'START', 'WEB_RESEARCH', 'KG_INGEST', 'DEBATE_PANEL', 'AGENT_QUERY', 'JUDGE', 'DEPLOY', 'MEMORY_WRITE',
+];
+
+const RESEARCH_ORDERED_STEPS = [
+  'START', 'WEB_RESEARCH', 'KG_INGEST', 'MEMORY_WRITE',
+];
+
+const TRADE_ORDERED_STEPS = [
+  'START', 'DEBATE_PANEL', 'AGENT_QUERY', 'JUDGE', 'DEPLOY', 'MEMORY_WRITE',
 ];
 
 // Evaluation pipeline steps
@@ -72,16 +100,6 @@ const STEP_LABELS: Record<string, string> = {
   MEMORY_WRITE: 'Writing Memories',
 };
 
-const STEP_DESC: Record<string, string> = {
-  START:        'Acquiring lock and initialising the run',
-  WEB_RESEARCH: 'Fetching live news, prices and research for all tickers',
-  KG_INGEST:    'Extracting events and relationships into the knowledge graph',
-  DEBATE_PANEL: 'Spinning up 4 specialised agents with shared context',
-  AGENT_QUERY:  'Value Investor · Technical Analyst · Macro Economist · Sentiment Analyst',
-  JUDGE:        'Independent LLM reviewing all proposals and picking the best trade',
-  DEPLOY:       'Saving strategy with entry price and position sizing',
-  MEMORY_WRITE: 'Writing outcome notes to each agent\'s persistent memory',
-};
 
 const STEP_COLORS: Record<string, { ring: string; glow: string; text: string; bg: string }> = {
   // Pipeline event styling configs
@@ -102,7 +120,7 @@ function getCurrentStep(events: PipelineEvent[]): string | null {
   return inProgress?.step ?? null;
 }
 
-function getCompletedSteps(events: PipelineEvent[]): Set<string> {
+function getCompletedSteps(events: PipelineEvent[], stepsArray: string[] = ORDERED_STEPS): Set<string> {
   const done = new Set<string>();
   for (const e of events) {
     if (e.status === 'DONE') done.add(e.step);
@@ -117,12 +135,12 @@ function getCompletedSteps(events: PipelineEvent[]): Set<string> {
   const currentInProgressIdx = (() => {
     const inProgress = [...events].reverse().find(e => e.status === 'IN_PROGRESS');
     if (!inProgress) return -1;
-    return ORDERED_STEPS.indexOf(inProgress.step);
+    return stepsArray.indexOf(inProgress.step);
   })();
   if (currentInProgressIdx > 0) {
     for (let i = 0; i < currentInProgressIdx; i++) {
-      if (events.some(e => e.step === ORDERED_STEPS[i])) {
-        done.add(ORDERED_STEPS[i]);
+      if (events.some(e => e.step === stepsArray[i])) {
+        done.add(stepsArray[i]);
       }
     }
   }
@@ -134,12 +152,6 @@ function isRunComplete(events: PipelineEvent[]): boolean {
     events.some(e => e.step === 'START' && e.status === 'DONE');
 }
 
-function isEvalRun(events: PipelineEvent[]): boolean {
-  return events.some(e =>
-    e.step === 'PRICE_FETCH' || e.step === 'SCORE_STRATEGIES' ||
-    e.step === 'CLOSE_POSITIONS' || e.step === 'DARWIN_SELECTION' || e.step === 'AGENT_ANALYSIS'
-  );
-}
 
 function hasError(events: PipelineEvent[]): boolean {
   return events.some(e => e.status === 'ERROR');
@@ -152,25 +164,88 @@ function getRunDuration(events: PipelineEvent[]): number | null {
   );
 }
 
+const TAB_CONFIG: { id: PipelineTab; label: string; sublabel: string; icon: string; color: string; activeBg: string; activeBorder: string; dot: string; borderColor: string }[] = [
+  { id: 'research', label: 'Data Collection',  sublabel: 'News · KG · Research',       icon: '◎', color: 'text-cyan-400',   activeBg: 'bg-cyan-500/10',   activeBorder: 'border-cyan-500/40',   dot: 'bg-cyan-400',    borderColor: 'border-l-cyan-500'   },
+  { id: 'trade',    label: 'Generate Trades',  sublabel: 'Agents · Judge · Deploy',     icon: '◈', color: 'text-brand-400',  activeBg: 'bg-brand-500/10',  activeBorder: 'border-brand-500/40',  dot: 'bg-brand-400',   borderColor: 'border-l-brand-500'  },
+  { id: 'eval',     label: 'Agent Evaluation', sublabel: 'Score · Evolve · Improve',    icon: '◉', color: 'text-purple-400', activeBg: 'bg-purple-500/10', activeBorder: 'border-purple-500/40', dot: 'bg-purple-400',  borderColor: 'border-l-purple-500' },
+];
+
+
+// Map run_type to tab
+function runTypeToTab(runType: string): PipelineTab {
+  if (runType === 'eval') return 'eval';
+  if (runType === 'research') return 'research';
+  if (runType === 'trade' || runType === 'debate') return 'trade';
+  return 'trade';
+}
+
+const SCHEDULE_OPTIONS = [15, 30, 60, 120, 240, 480];
+
 export function PipelinePage({
-  isTriggering, pipelineEvents, pipelineRunId, pipelineRuns, pipelineRunsLoaded,
+  isTriggering: _isTriggering, researchRunning, tradeRunning, evalRunning,
+  currentRunIdResearch, currentRunIdTrade, currentRunIdEval,
+  researchEvents, tradeEvents, evalEvents,
+  pipelineEvents, pipelineRunId: _pipelineRunId, pipelineRuns, pipelineRunsLoaded,
   selectedRunId, selectedRunEvents, selectedRunLoading, research, researchStepOpen,
   enabledMarketNames, investmentFocus, investmentFocusSaved,
   focusTickers, focusSearch, focusSearchOpen, focusSectorFilter,
   tickerSearchResults, tickerSearchLoading,
+  scheduleResearch, scheduleTrade, scheduleEval, pipelineReadiness,
   setResearchStepOpen, setSelectedRunId, setSelectedRunEvents,
   setInvestmentFocus, setFocusTickers, setFocusSearch, setFocusSearchOpen,
   setFocusSectorFilter, setTickerSearchResults, setTickerSearchLoading,
-  saveInvestmentFocus, handleManualTrigger, handleStopPipeline, handleEvalTrigger, loadRunEvents, openReport,
+  saveInvestmentFocus, handleManualTrigger: _handleManualTrigger, handleStopPipeline, handleEvalTrigger,
+  handleResearchTrigger, handleTradeTrigger, onScheduleUpdate,
+  loadRunEvents, openReport, setPipelineRuns, setPipelineRunsLoaded,
 }: PipelinePagesProps) {
-  const isActive = isTriggering;
+  // Per-tab active state
+  const tabIsActive = (tab: PipelineTab) =>
+    tab === 'research' ? researchRunning :
+    tab === 'trade'    ? tradeRunning :
+    tab === 'eval'     ? evalRunning : false;
   const focusSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [stepsExpanded, setStepsExpanded] = useState(false);
   const [runsPage, setRunsPage] = useState(0);
+  const [activeTab, setActiveTab] = useState<PipelineTab>('research');
   const RUNS_PER_PAGE = 10;
 
+  // Keep a ref to selectedRunId so effects always read the current value without
+  // needing to include it in deps (avoids stale-closure bugs).
+  const selectedRunIdRef = useRef(selectedRunId);
+  selectedRunIdRef.current = selectedRunId;
+
+  // ── Lazy-load pipeline runs per tab ─────────────────────────────────────────
+  // Fetch /pipeline/runs only when the user opens the pipeline page and switches
+  // tabs — not on every global poll tick. Re-fetch when a pipeline just finished
+  // (tabIsActive flips from true → false) so the new completed run appears.
+  const prevTabActiveRef = useRef(false);
+  const tabActive = tabIsActive(activeTab);
+  useEffect(() => {
+    const wasActive = prevTabActiveRef.current;
+    prevTabActiveRef.current = tabActive;
+    // Fetch on tab switch OR when pipeline just finished (running→stopped)
+    const justFinished = wasActive && !tabActive;
+    apiFetch('/pipeline/runs')
+      .then(r => r.ok ? r.json() : null)
+      .then(runs => {
+        if (runs) {
+          setPipelineRuns(runs);
+          setPipelineRunsLoaded(true);
+        }
+      })
+      .catch(() => { setPipelineRunsLoaded(true); });
+    void justFinished; // used implicitly via effect re-run
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab, tabActive]);
+
   const viewingLive = selectedRunId === null;
-  const panelEvents = viewingLive ? pipelineEvents : selectedRunEvents;
+  // Live events per tab — use tab-specific events, fall back to shared pipelineEvents
+  const liveEvents: PipelineEvent[] =
+    activeTab === 'research' ? researchEvents :
+    activeTab === 'trade'    ? tradeEvents :
+    activeTab === 'eval'     ? evalEvents :
+    pipelineEvents;
+  const panelEvents = viewingLive ? liveEvents : selectedRunEvents;
 
 
   const focusVisibleResults = tickerSearchResults.filter(r => !focusTickers.includes(r.symbol));
@@ -182,11 +257,11 @@ export function PipelinePage({
   };
 
   // ── Active Run View ──────────────────────────────────────────────────────────
-  const renderActiveView = (events: PipelineEvent[]) => {
+  const renderActiveView = (events: PipelineEvent[], stepsArray: string[] = ORDERED_STEPS) => {
     const currentStep = getCurrentStep(events);
-    const completedSteps = getCompletedSteps(events);
-    const stepIndex = currentStep ? ORDERED_STEPS.indexOf(currentStep) : -1;
-    const totalSteps = ORDERED_STEPS.length;
+    const completedSteps = getCompletedSteps(events, stepsArray);
+    const stepIndex = currentStep ? stepsArray.indexOf(currentStep) : -1;
+    const totalSteps = stepsArray.length;
     const progressPct = stepIndex >= 0 ? Math.round(((stepIndex + 0.5) / totalSteps) * 100) : 0;
 
     // Latest detail message for each step
@@ -226,7 +301,7 @@ export function PipelinePage({
 
         {/* Step list — compact rows */}
         <div className="flex-1 px-5 py-3 space-y-0.5">
-          {ORDERED_STEPS.map(s => {
+          {stepsArray.map(s => {
             const isDone = completedSteps.has(s);
             const isActive = s === currentStep;
             const c = STEP_COLORS[s] ?? STEP_COLORS.START;
@@ -417,7 +492,8 @@ export function PipelinePage({
   // ── Eval Completed View ───────────────────────────────────────────────────
   const renderEvalCompletedView = (events: PipelineEvent[], run?: PipelineRun) => {
     const complete = run?.status === 'done' || isRunComplete(events);
-    const errored = !complete && (run?.status === 'error' || hasError(events));
+    const orphaned = !complete && events.length > 0 && events.every(e => e.status === 'IN_PROGRESS');
+    const errored = !complete && (run?.status === 'error' || hasError(events) || orphaned);
     const dur = getRunDuration(events);
 
     // Extract key data from events
@@ -616,13 +692,14 @@ export function PipelinePage({
   };
 
   // ── Completed / Past Run View ─────────────────────────────────────────────
-  const renderCompletedView = (events: PipelineEvent[], run?: PipelineRun) => {
+  const renderCompletedView = (events: PipelineEvent[], run?: PipelineRun, stepsArray: string[] = ORDERED_STEPS) => {
     // Use run.status as the authoritative signal — events may be incomplete if
     // the Vercel function timed out before the final MEMORY_WRITE DONE log.
     const complete = run?.status === 'done' || isRunComplete(events);
     // Only show as errored if the run didn't complete — intermediate errors (e.g. KG_INGEST)
     // are non-fatal and the pipeline can still finish successfully.
-    const errored = !complete && (run?.status === 'error' || hasError(events));
+    const orphaned = !complete && events.length > 0 && events.every(e => e.status === 'IN_PROGRESS');
+    const errored = !complete && (run?.status === 'error' || hasError(events) || orphaned);
     const wasStopped = !errored && !complete;
     const dur = getRunDuration(events);
     const errorEvent = events.find(e => e.status === 'ERROR');
@@ -707,7 +784,7 @@ export function PipelinePage({
           {/* Step summary chips */}
           {!stepsExpanded && (
             <div className="mt-4 flex flex-wrap gap-1.5">
-              {ORDERED_STEPS.map(s => {
+              {stepsArray.map(s => {
                 const ran = events.some(e => e.step === s);
                 const failed = events.some(e => e.step === s && e.status === 'ERROR');
                 const c = STEP_COLORS[s] ?? STEP_COLORS.START;
@@ -743,7 +820,7 @@ export function PipelinePage({
                   const hasLaterResolution = ev.status === 'IN_PROGRESS' && events.slice(idx + 1).some(e => e.step === ev.step && (e.status === 'DONE' || e.status === 'ERROR'));
                   let displayStatus = ev.status;
                   if (ev.status === 'IN_PROGRESS' && hasLaterResolution) displayStatus = 'DONE';
-                  if (ev.status === 'IN_PROGRESS' && !isActive && !hasLaterResolution) {
+                  if (ev.status === 'IN_PROGRESS' && !hasLaterResolution) {
                     displayStatus = hasError(events) ? 'ERROR' : 'DONE';
                   }
                   const c = STEP_COLORS[ev.step] ?? STEP_COLORS.START;
@@ -923,34 +1000,67 @@ export function PipelinePage({
     );
   };
 
+  // ── Per-tab idle step definitions ────────────────────────────────────────
+  const TAB_IDLE_STEPS: Record<PipelineTab, { step: string; label: string; desc: string }[]> = {
+    research: [
+      { step: 'START',        label: 'Initialise',             desc: 'Acquire lock and set up the run' },
+      { step: 'WEB_RESEARCH', label: 'Fetch News & Prices',    desc: 'Scrape RSS feeds, Google News, and Yahoo Finance for all enabled markets' },
+      { step: 'KG_INGEST',    label: 'Enrich Knowledge Graph', desc: 'LLM extracts EVENT nodes and relationships from research into the KG' },
+      { step: 'MEMORY_WRITE', label: 'Cache Research',         desc: 'Store research context for the next trade generation run' },
+    ],
+    trade: [
+      { step: 'START',        label: 'Initialise',             desc: 'Acquire lock and load last research context' },
+      { step: 'DEBATE_PANEL', label: 'Brief Agents',           desc: 'Spin up all specialist agents with shared research + KG context' },
+      { step: 'AGENT_QUERY',  label: 'Agents Deliberate',      desc: 'Value Investor · Technical Analyst · Macro Economist · Sentiment Analyst propose tickers' },
+      { step: 'JUDGE',        label: 'Judge Evaluates',        desc: 'Independent LLM reviews all proposals and picks the best trade' },
+      { step: 'DEPLOY',       label: 'Deploy Strategy',        desc: 'Save strategy with entry price, position sizing, and report' },
+      { step: 'MEMORY_WRITE', label: 'Write Agent Memories',   desc: 'Record outcome context into each agent\'s persistent memory' },
+    ],
+    eval: [
+      { step: 'START',            label: 'Initialise',           desc: 'Acquire lock and load active strategies' },
+      { step: 'PRICE_FETCH',      label: 'Fetch Live Prices',    desc: 'Pull current market prices for all open positions' },
+      { step: 'SCORE_STRATEGIES', label: 'Score Strategies',     desc: 'Compute P&L, win rate, and fitness for each agent\'s predictions' },
+      { step: 'CLOSE_POSITIONS',  label: 'Close Positions',      desc: 'Apply stop-loss (−10%) and take-profit (+15%) rules automatically' },
+      { step: 'AGENT_ANALYSIS',   label: 'Post-Mortem Analysis', desc: 'LLM analyses what each agent saw, what went wrong, and root causes' },
+      { step: 'DARWIN_SELECTION', label: 'Evolve Agents',        desc: 'Underperforming agents get their prompts mutated via Darwin selection' },
+      { step: 'MEMORY_WRITE',     label: 'Write Lessons',        desc: 'Store LESSON and STRATEGY_RESULT notes to agent memory' },
+    ],
+  };
+
   // ── Idle / Blueprint View ────────────────────────────────────────────────
-  const renderIdleView = () => (
-    <div className="flex-1 flex flex-col items-center justify-center px-8 py-12">
-      <div className="w-full max-w-sm">
-        <p className="text-[10px] font-semibold text-textDim uppercase tracking-widest mb-6 text-center">Pipeline steps</p>
-        <div className="relative">
-          <div className="absolute left-[13px] top-0 bottom-0 w-px bg-borderLight" />
-          <div className="space-y-0">
-            {ORDERED_STEPS.map((s, i) => {
-              const c = STEP_COLORS[s] ?? STEP_COLORS.START;
-              const m = STEP_META[s];
-              return (
-                <div key={i} className="flex items-start gap-4 py-2.5">
-                  <div className={`relative z-10 shrink-0 h-7 w-7 rounded-full bg-surface3 border border-borderMid flex items-center justify-center`}>
-                    <span className={`text-xs ${c.text} opacity-50`}>{m?.icon ?? '·'}</span>
+  const renderIdleView = () => {
+    const steps = TAB_IDLE_STEPS[activeTab];
+    const tab = TAB_CONFIG.find(t => t.id === activeTab)!;
+    return (
+      <div className="flex-1 flex flex-col items-center justify-start px-8 pt-6">
+        <div className="w-full max-w-sm">
+          <p className={`text-[10px] font-semibold uppercase tracking-widest mb-3 text-center ${tab.color}`}>
+            {tab.icon} {tab.label} · steps
+          </p>
+          <div className="relative">
+            <div className="absolute left-[13px] top-0 bottom-0 w-px bg-borderLight" />
+            <div className="space-y-0">
+              {steps.map((s, i) => {
+                const c = STEP_COLORS[s.step] ?? STEP_COLORS.START;
+                const m = STEP_META[s.step];
+                return (
+                  <div key={i} className="flex items-start gap-4 py-2.5">
+                    <div className="relative z-10 shrink-0 h-7 w-7 rounded-full bg-surface3 border border-borderMid flex items-center justify-center">
+                      <span className={`text-xs ${c.text} opacity-50`}>{m?.icon ?? '·'}</span>
+                    </div>
+                    <div className="pt-0.5">
+                      <p className="text-xs font-medium text-textMain">{s.label}</p>
+                      <p className="text-[11px] text-textDim mt-0.5">{s.desc}</p>
+                    </div>
                   </div>
-                  <div className="pt-0.5">
-                    <p className="text-xs font-medium text-textMain">{STEP_LABELS[s]}</p>
-                    <p className="text-[11px] text-textDim mt-0.5">{STEP_DESC[s]}</p>
-                  </div>
-                </div>
-              );
-            })}
+                );
+              })}
+            </div>
           </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   // ── Decide what to render in main panel ──────────────────────────────────
   const renderPanel = () => {
@@ -971,70 +1081,204 @@ export function PipelinePage({
     }
 
     if (!viewingLive) {
-      // Past run
       const run = pipelineRuns.find(r => r.run_id === selectedRunId);
       if (panelEvents.length === 0) return <p className="flex-1 flex items-center justify-center text-sm text-textMuted">No events recorded for this run.</p>;
-      const isEval = run?.run_type === 'eval' || isEvalRun(panelEvents);
-      if (isEval) return renderEvalCompletedView(panelEvents, run);
-      return renderCompletedView(panelEvents, run);
+      // Use activeTab as primary source of truth — the run is in this tab's sidebar,
+      // so it belongs to this tab's pipeline type. Fall back to run_type only if
+      // the run object is available (avoids misclassification during lazy-load race).
+      const effectiveTab = run ? runTypeToTab(run.run_type) : activeTab;
+      if (effectiveTab === 'eval') return renderEvalCompletedView(panelEvents, run);
+      if (effectiveTab === 'research') return renderCompletedView(panelEvents, run, RESEARCH_ORDERED_STEPS);
+      return renderCompletedView(panelEvents, run, TRADE_ORDERED_STEPS);
     }
 
-    // Live view
-    if (isActive && !isRunComplete(panelEvents)) {
-      if (isEvalRun(panelEvents)) return renderEvalActiveView(panelEvents);
-      return renderActiveView(panelEvents);
+    // Live view — tab's pipeline is running, always show active view
+    if (tabIsActive(activeTab)) {
+      if (activeTab === 'eval') return renderEvalActiveView(panelEvents);
+      if (activeTab === 'research') return renderActiveView(panelEvents, RESEARCH_ORDERED_STEPS);
+      return renderActiveView(panelEvents, TRADE_ORDERED_STEPS);
     }
-    // Not active and no run selected → show idle blueprint
+
+    // Idle with no past runs yet — show blueprint
     return renderIdleView();
   };
 
+  // Determine schedule value and label for current tab
+  const tabSchedule = activeTab === 'research' ? scheduleResearch : activeTab === 'trade' ? scheduleTrade : scheduleEval;
+
   return (
     <div className="space-y-4">
+      {/* ── Tab bar ──────────────────────────────────────────────────────────── */}
+      <div className="grid grid-cols-3 gap-2">
+        {TAB_CONFIG.map(tab => {
+          const isThisTabRunning = tabIsActive(tab.id);
+          const tabRunCount = pipelineRuns.filter(r => runTypeToTab(r.run_type) === tab.id && r.status !== 'running').length;
+          const isActive_ = activeTab === tab.id;
+          return (
+            <button
+              key={tab.id}
+              onClick={() => { setActiveTab(tab.id); setSelectedRunId(null); setSelectedRunEvents([]); setRunsPage(0); setStepsExpanded(false); }}
+              className={`relative flex items-center gap-3 px-4 py-3 rounded-xl border transition-all text-left ${
+                isActive_
+                  ? `${tab.activeBg} ${tab.activeBorder} border`
+                  : 'bg-surface border-borderLight hover:bg-surface2 hover:border-borderMid'
+              }`}
+            >
+              {/* Icon */}
+              <span className={`text-lg leading-none shrink-0 ${isActive_ ? tab.color : 'text-textDim'}`}>{tab.icon}</span>
+              {/* Labels */}
+              <div className="flex-1 min-w-0">
+                <p className={`text-xs font-semibold leading-tight ${isActive_ ? tab.color : 'text-textMuted'}`}>{tab.label}</p>
+                <p className="text-[10px] text-textDim mt-0.5 truncate">{tab.sublabel}</p>
+              </div>
+              {/* Run count badge */}
+              {tabRunCount > 0 && (
+                <span className={`shrink-0 text-[9px] font-bold px-1.5 py-0.5 rounded-full border ${isActive_ ? `${tab.activeBg} ${tab.activeBorder} ${tab.color}` : 'bg-surface3 border-borderLight text-textDim'}`}>
+                  {tabRunCount}
+                </span>
+              )}
+              {/* Running indicator */}
+              {isThisTabRunning && (
+                <span className={`shrink-0 h-2 w-2 rounded-full ${tab.dot} animate-pulse`} />
+              )}
+              {/* Active underline */}
+              {isActive_ && (
+                <span className={`absolute bottom-0 left-4 right-4 h-0.5 rounded-full ${tab.dot} opacity-60`} />
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* ── Schedule row for active tab ───────────────────────────────────────── */}
+      <div className="flex items-center gap-2 px-1">
+        {(() => {
+          const tab = TAB_CONFIG.find(t => t.id === activeTab)!;
+          return (
+            <>
+              <span className={`text-[10px] font-medium ${tab.color}`}>{tab.label}</span>
+              <span className="text-[10px] text-textDim">auto-runs every</span>
+              <div className="flex gap-1">
+                {SCHEDULE_OPTIONS.map(m => (
+                  <button
+                    key={m}
+                    onClick={() => onScheduleUpdate(activeTab, m)}
+                    className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors font-mono ${
+                      tabSchedule === m
+                        ? `${tab.activeBg} ${tab.activeBorder} ${tab.color} border`
+                        : 'bg-surface2 border-borderLight text-textDim hover:text-textMuted hover:border-borderMid'
+                    }`}
+                  >
+                    {m < 60 ? `${m}m` : `${m / 60}h`}
+                  </button>
+                ))}
+              </div>
+            </>
+          );
+        })()}
+      </div>
+
       {/* ── Control bar ─────────────────────────────────────────────────────── */}
       <div className="rounded-xl border border-borderLight bg-surface overflow-hidden">
-        {/* Row 1: Investment focus + Run button */}
+
+        {/* Readiness banners — shown before run button when preconditions not met */}
+        {!tradeRunning && activeTab === 'trade' && !pipelineReadiness.has_research_data && (
+          <div className="flex items-center gap-2.5 px-4 py-2.5 bg-amber-500/8 border-b border-amber-500/20">
+            <span className="text-amber-400 text-sm shrink-0">◎</span>
+            <p className="text-xs text-amber-300 flex-1">No research data yet — run <strong>Data Collection</strong> first before generating trades.</p>
+          </div>
+        )}
+        {!tradeRunning && activeTab === 'trade' && pipelineReadiness.has_research_data && pipelineReadiness.last_research_at && (() => {
+          const age = (Date.now() - new Date(pipelineReadiness.last_research_at!).getTime()) / 1000 / 60;
+          return age > 120;
+        })() && (
+          <div className="flex items-center gap-2.5 px-4 py-2.5 bg-surface2 border-b border-borderLight">
+            <span className="text-textDim text-sm shrink-0">◷</span>
+            <p className="text-xs text-textDim flex-1">
+              Research data is {Math.round((Date.now() - new Date(pipelineReadiness.last_research_at!).getTime()) / 1000 / 60 / 60 * 10) / 10}h old — consider collecting fresh data first.
+            </p>
+          </div>
+        )}
+        {!evalRunning && activeTab === 'eval' && pipelineReadiness.active_positions === 0 && (
+          <div className="flex items-center gap-2.5 px-4 py-2.5 bg-surface2 border-b border-borderLight">
+            <span className="text-textDim text-sm shrink-0">◉</span>
+            <p className="text-xs text-textDim flex-1">No active positions to evaluate — agent scoring requires at least one ACTIVE or PENDING strategy.</p>
+          </div>
+        )}
+
+        {/* Row 1: Focus prompt (research + trade tabs) + Run button */}
         <div className="flex items-center gap-3 px-4 py-3 border-b border-borderLight">
-          <span className="text-[10px] font-semibold text-textDim uppercase tracking-widest shrink-0">Focus</span>
-          <input
-            type="text"
-            value={investmentFocus}
-            onChange={e => setInvestmentFocus(e.target.value)}
-            onKeyDown={e => { if (e.key === 'Enter') saveInvestmentFocus(investmentFocus); }}
-            placeholder="e.g. AI semiconductors, Indian IT, Bitcoin momentum… (leave empty for broad coverage)"
-            className="flex-1 bg-transparent text-xs text-textMain placeholder-textDim focus:outline-none min-w-0"
-          />
-          {investmentFocus && (
-            <button
-              onClick={() => saveInvestmentFocus(investmentFocus)}
-              className={`shrink-0 px-2.5 py-1 rounded text-[10px] font-semibold border transition-all ${investmentFocusSaved ? 'bg-up-bg text-up border-up/30' : 'bg-surface2 border-borderMid text-textMuted hover:border-brand-500 hover:text-brand-400'}`}
-            >{investmentFocusSaved ? '✓ Saved' : 'Save'}</button>
+          {(activeTab === 'research' || activeTab === 'trade') && (
+            <>
+              <span className="text-[10px] font-semibold text-textDim uppercase tracking-widest shrink-0">Focus</span>
+              <input
+                type="text"
+                value={investmentFocus}
+                onChange={e => setInvestmentFocus(e.target.value)}
+                onKeyDown={e => { if (e.key === 'Enter') saveInvestmentFocus(investmentFocus); }}
+                placeholder="e.g. AI semiconductors, Indian IT, Bitcoin momentum…"
+                className="flex-1 bg-transparent text-xs text-textMain placeholder-textDim focus:outline-none min-w-0"
+              />
+              {investmentFocus && (
+                <button
+                  onClick={() => saveInvestmentFocus(investmentFocus)}
+                  className={`shrink-0 px-2.5 py-1 rounded text-[10px] font-semibold border transition-all ${investmentFocusSaved ? 'bg-up-bg text-up border-up/30' : 'bg-surface2 border-borderMid text-textMuted hover:border-brand-500 hover:text-brand-400'}`}
+                >{investmentFocusSaved ? '✓ Saved' : 'Save'}</button>
+              )}
+              <div className="h-4 w-px bg-borderLight shrink-0" />
+            </>
           )}
-          <div className="h-4 w-px bg-borderLight shrink-0" />
-          {isActive ? (
-            <button onClick={handleStopPipeline} className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-down/40 bg-down-bg text-down-text hover:opacity-80 transition-opacity">
+          {activeTab === 'eval' && (
+            <p className="flex-1 text-xs text-textDim">Score active strategies, run post-mortem analysis, and evolve underperforming agents.</p>
+          )}
+          {tabIsActive(activeTab) ? (
+            <button onClick={() => handleStopPipeline(activeTab)} className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-down/40 bg-down-bg text-down-text hover:opacity-80 transition-opacity">
               ■ Stop
             </button>
           ) : (
             <>
-              <button
-                onClick={handleEvalTrigger}
-                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-purple-700/50 bg-purple-900/20 text-purple-400 hover:bg-purple-800/30 transition-colors"
-                title="Score active strategies, run post-mortem analysis, and evolve underperforming agents"
-              >
-                🧬 Evaluate
-              </button>
-              <button
-                onClick={() => handleManualTrigger(focusTickers.length > 0 ? focusTickers : undefined)}
-                className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-brand-600 border-brand-500 text-white hover:bg-brand-500 transition-colors"
-              >
-                ▶ {focusTickers.length > 0 ? `Run ${focusTickers.length} ticker${focusTickers.length !== 1 ? 's' : ''}` : 'Run Pipeline'}
-              </button>
+              {activeTab === 'research' && (
+                <button
+                  onClick={handleResearchTrigger}
+                  className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border bg-cyan-700 border-cyan-600 text-white hover:bg-cyan-600 transition-colors"
+                >
+                  ◎ {focusTickers.length > 0 ? `Collect · ${focusTickers.length} ticker${focusTickers.length !== 1 ? 's' : ''}` : 'Collect Data'}
+                </button>
+              )}
+              {activeTab === 'trade' && (
+                <button
+                  onClick={handleTradeTrigger}
+                  disabled={!pipelineReadiness.has_research_data}
+                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                    pipelineReadiness.has_research_data
+                      ? 'bg-brand-600 border-brand-500 text-white hover:bg-brand-500'
+                      : 'bg-surface2 border-borderLight text-textDim cursor-not-allowed opacity-50'
+                  }`}
+                  title={pipelineReadiness.has_research_data ? 'Generate trades using last research context' : 'Run Data Collection first'}
+                >
+                  ◈ {focusTickers.length > 0 ? `Generate · ${focusTickers.length} ticker${focusTickers.length !== 1 ? 's' : ''}` : 'Generate Trades'}
+                </button>
+              )}
+              {activeTab === 'eval' && (
+                <button
+                  onClick={handleEvalTrigger}
+                  disabled={pipelineReadiness.active_positions === 0}
+                  className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                    pipelineReadiness.active_positions > 0
+                      ? 'border-purple-700/50 bg-purple-900/20 text-purple-400 hover:bg-purple-800/30'
+                      : 'bg-surface2 border-borderLight text-textDim cursor-not-allowed opacity-50'
+                  }`}
+                  title={pipelineReadiness.active_positions === 0 ? 'No active positions to evaluate' : `Evaluate ${pipelineReadiness.active_positions} active position${pipelineReadiness.active_positions !== 1 ? 's' : ''}`}
+                >
+                  ◉ Evaluate Agents{pipelineReadiness.active_positions > 0 ? ` · ${pipelineReadiness.active_positions}` : ''}
+                </button>
+              )}
             </>
           )}
         </div>
 
-        {/* Row 2: Sector pills + ticker search */}
-        <div className="px-4 py-2.5 flex items-center gap-3 flex-wrap">
+        {/* Row 2: Sector pills + ticker search (research + trade tabs) */}
+        {(activeTab === 'research' || activeTab === 'trade') && <div className="px-4 py-2.5 flex items-center gap-3 flex-wrap">
           <div className="flex items-center gap-1.5 flex-wrap flex-1 min-w-0">
             {Object.entries(MARKET_SECTORS)
               .filter(([market]) => enabledMarketNames.length === 0 || enabledMarketNames.includes(market))
@@ -1050,7 +1294,7 @@ export function PipelinePage({
                           setFocusTickers(prev => [...new Set([...prev, ...st])]);
                         }
                       }}
-                      className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${isActiveFilter ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface2 border-borderLight text-textMuted hover:border-brand-400 hover:text-brand-400'}`}
+                      className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${isActiveFilter ? 'bg-cyan-700 border-cyan-600 text-white' : 'bg-surface2 border-borderLight text-textMuted hover:border-cyan-500 hover:text-cyan-400'}`}
                     >
                       <span className="mr-1 opacity-60">{MARKET_ICONS[market]}</span>{sector}
                     </button>
@@ -1060,7 +1304,7 @@ export function PipelinePage({
           </div>
           {/* Ticker search */}
           <div className="relative shrink-0 w-56">
-            <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border bg-surface2 transition-colors ${focusSearchOpen ? 'border-brand-500' : 'border-borderLight'}`}>
+            <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border bg-surface2 transition-colors ${focusSearchOpen ? 'border-cyan-500' : 'border-borderLight'}`}>
               <span className="text-textDim text-[10px] shrink-0">{tickerSearchLoading ? <span className="animate-spin inline-block">↻</span> : '⌕'}</span>
               <input type="text" value={focusSearch}
                 onChange={e => {
@@ -1099,15 +1343,15 @@ export function PipelinePage({
           {(focusTickers.length > 0 || focusSectorFilter) && (
             <button onClick={() => { setFocusTickers(() => []); setFocusSectorFilter(null); }} className="text-[10px] text-textDim hover:text-textMuted transition-colors shrink-0">✕ Clear</button>
           )}
-        </div>
+        </div>}
 
-        {/* Row 3: Selected tickers */}
-        {focusTickers.length > 0 && (
+        {/* Row 3: Selected tickers (research + trade tabs) */}
+        {(activeTab === 'research' || activeTab === 'trade') && focusTickers.length > 0 && (
           <div className="px-4 py-2 border-t border-borderLight flex flex-wrap gap-1.5 bg-surface2/40">
             {focusTickers.map(t => (
-              <span key={t} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono bg-brand-900/40 border border-brand-700/40 text-brand-300">
+              <span key={t} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-mono bg-cyan-900/40 border border-cyan-700/40 text-cyan-300">
                 {t}
-                <button onClick={() => setFocusTickers(p => p.filter(x => x !== t))} className="hover:text-brand-200 text-[9px] leading-none ml-0.5 opacity-60 hover:opacity-100">✕</button>
+                <button onClick={() => setFocusTickers(p => p.filter(x => x !== t))} className="hover:text-cyan-200 text-[9px] leading-none ml-0.5 opacity-60 hover:opacity-100">✕</button>
               </span>
             ))}
           </div>
@@ -1118,16 +1362,18 @@ export function PipelinePage({
       <div className="flex gap-0 border border-borderLight rounded-xl overflow-hidden" style={{ minHeight: '560px' }}>
 
         {/* Left: run list */}
-        <div className="w-52 shrink-0 border-r border-borderLight bg-surface2 flex flex-col overflow-hidden">
-          <div className="px-4 py-3 border-b border-borderLight">
-            <p className="text-[10px] font-semibold text-textDim uppercase tracking-widest">Runs</p>
+        <div className="w-72 shrink-0 border-r border-borderLight bg-surface2 flex flex-col overflow-hidden">
+          <div className="px-4 py-3 border-b border-borderLight flex items-center gap-2">
+            <p className="text-[10px] font-semibold text-textDim uppercase tracking-widest">
+              {TAB_CONFIG.find(t => t.id === activeTab)?.icon} {TAB_CONFIG.find(t => t.id === activeTab)?.label} Runs
+            </p>
           </div>
           <div className="flex-1 overflow-y-auto">
-            {/* Live / current tab — only shown while a pipeline is actively running */}
-            {isActive && (
+            {/* Live / current tab — only shown while this tab's pipeline is running */}
+            {tabIsActive(activeTab) && (
               <button
                 onClick={() => { setSelectedRunId(null); setSelectedRunEvents([]); setStepsExpanded(false); }}
-                className={`w-full text-left px-4 py-3 border-b border-borderLight transition-colors ${viewingLive ? 'bg-surface border-l-2 border-l-brand-500' : 'hover:bg-surface3'}`}
+                className={`w-full text-left px-4 py-3 border-b border-borderLight transition-colors ${viewingLive ? `bg-surface border-l-2 ${TAB_CONFIG.find(t => t.id === activeTab)?.borderColor}` : 'hover:bg-surface3'}`}
               >
                 <div className="flex items-center gap-2 mb-0.5">
                   <span className="h-2 w-2 rounded-full bg-amber-400 animate-ping shrink-0" />
@@ -1137,36 +1383,36 @@ export function PipelinePage({
               </button>
             )}
 
-            {/* Past runs — paginated */}
+            {/* Past runs — filtered by tab, paginated */}
             {(() => {
-              const pastRuns = pipelineRuns.filter(r => r.status !== 'running');
-              const totalPages = Math.ceil(pastRuns.length / RUNS_PER_PAGE);
-              const pageRuns = pastRuns.slice(runsPage * RUNS_PER_PAGE, (runsPage + 1) * RUNS_PER_PAGE);
+              const tabRuns = pipelineRuns.filter(r => {
+                if (r.status === 'running') return false;
+                return runTypeToTab(r.run_type) === activeTab;
+              });
+              const totalPages = Math.ceil(tabRuns.length / RUNS_PER_PAGE);
+              const pageRuns = tabRuns.slice(runsPage * RUNS_PER_PAGE, (runsPage + 1) * RUNS_PER_PAGE);
+              const tabCfg = TAB_CONFIG.find(t => t.id === activeTab)!;
               return (
                 <>
                   {pageRuns.map(run => {
                     const isSelected = selectedRunId === run.run_id;
                     const dur = Math.round((new Date(run.ended_at).getTime() - new Date(run.started_at).getTime()) / 1000);
                     const params = run.run_params;
-                    const isEval = run.run_type === 'eval';
                     return (
                       <button key={run.run_id}
                         onClick={() => { loadRunEvents(run.run_id); setStepsExpanded(false); }}
-                        className={`w-full text-left px-4 py-3 border-b border-borderLight transition-colors ${isSelected ? `bg-surface border-l-2 ${isEval ? 'border-l-purple-500' : 'border-l-brand-500'}` : 'hover:bg-surface3'}`}
+                        className={`w-full text-left px-4 py-3 border-b border-borderLight transition-colors ${isSelected ? `bg-surface border-l-2 ${tabCfg.borderColor}` : 'hover:bg-surface3'}`}
                       >
                         <div className="flex items-center gap-2 mb-0.5">
                           <span className={`text-xs shrink-0 ${run.status === 'done' ? 'text-up' : run.status === 'error' ? 'text-down' : 'text-yellow-500'}`}>
                             {run.status === 'done' ? '✓' : run.status === 'error' ? '✕' : '⏹'}
                           </span>
                           <span className="text-[11px] font-mono text-textMuted truncate">{run.run_id.substring(0, 8)}</span>
-                          {isEval && (
-                            <span className="text-[8px] font-bold px-1 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-400 uppercase tracking-wider shrink-0">eval</span>
-                          )}
                         </div>
                         <p className="text-[10px] text-textDim pl-4">
                           {new Date(run.started_at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })} · {dur}s
                         </p>
-                        {!isEval && params && (params.focus || (params.tickers && params.tickers.length > 0)) && (
+                        {activeTab !== 'eval' && params && (params.focus || (params.tickers && params.tickers.length > 0)) && (
                           <div className="pl-4 mt-0.5 flex flex-wrap gap-1">
                             {params.focus && (
                               <span className="text-[9px] text-brand-400 bg-brand-900/30 px-1 py-0.5 rounded truncate max-w-[110px]">{params.focus}</span>
@@ -1208,8 +1454,8 @@ export function PipelinePage({
                 ))}
               </div>
             )}
-            {pipelineRunsLoaded && pipelineRuns.length === 0 && (
-              <p className="px-4 py-4 text-[11px] text-textDim">No past runs yet.</p>
+            {pipelineRunsLoaded && !pipelineRuns.some(r => runTypeToTab(r.run_type) === activeTab && r.status !== 'running') && (
+              <p className="px-4 py-4 text-[11px] text-textDim">No {activeTab} runs yet.</p>
             )}
           </div>
         </div>
@@ -1220,7 +1466,7 @@ export function PipelinePage({
           <div className="px-5 py-3 border-b border-borderLight bg-surface2 flex items-center justify-between shrink-0">
             <div className="flex items-center gap-2">
               {viewingLive ? (
-                isActive ? (
+                tabIsActive(activeTab) ? (
                   <span className="flex items-center gap-1.5 text-xs text-amber-400 font-medium">
                     <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-ping" /> Running
                   </span>
@@ -1239,13 +1485,13 @@ export function PipelinePage({
                   </div>
                 );
               })()}
-              {viewingLive && isActive && pipelineRunId && (
+              {viewingLive && tabIsActive(activeTab) && (currentRunIdResearch || currentRunIdTrade || currentRunIdEval) && (
                 <span className="text-[10px] text-textDim font-mono bg-surface3 px-2 py-0.5 rounded">
-                  run/{pipelineRunId.substring(0, 8)}…
+                  run/{(activeTab === 'research' ? currentRunIdResearch : activeTab === 'eval' ? currentRunIdEval : currentRunIdTrade)?.substring(0, 8)}…
                 </span>
               )}
             </div>
-            {focusTickers.length > 0 && viewingLive && !isActive && (
+            {focusTickers.length > 0 && viewingLive && !tabIsActive(activeTab) && (
               <span className="text-[10px] text-brand-400 bg-brand-900/40 border border-brand-700/30 px-2 py-0.5 rounded-full font-mono">
                 focused · {focusTickers.join(', ')}
               </span>

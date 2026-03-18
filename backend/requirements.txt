@@ -17,3 +17,4 @@ python-dotenv
 # FRED_API_KEY      → https://fred.stlouisfed.org/docs/api/api_key.html (free)
 # FINNHUB_API_KEY   → https://finnhub.io/ (free tier available)
 # ALPHA_VANTAGE_API_KEY → https://www.alphavantage.co/ (free tier available)
+alembic>=1.13.0

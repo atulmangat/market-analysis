@@ -48,7 +48,9 @@ export interface PipelineEvent { id: number; step: string; agent_name: string | 
 export interface PipelinePosition { ticker: string; action: string; horizon?: string; size?: string; target?: string; stop?: string; reasoning: string; strategy_id: number | null; }
 export interface PipelineRunOutput { positions: PipelinePosition[]; proposals: { agent_name: string; ticker: string; action: string; reasoning: string }[]; debate_id: number | null; ticker: string; action: string; votes: string; judge_reasoning: string; strategy_id: number | null; }
 export interface PipelineRunParams { focus?: string; tickers?: string[]; markets?: string[]; }
-export interface PipelineRun { run_id: string; run_type: 'debate' | 'eval'; started_at: string; ended_at: string; event_count: number; status: 'running' | 'done' | 'error'; deploy_detail: string | null; run_params: PipelineRunParams | null; output: PipelineRunOutput | null; }
+export interface PipelineRun { run_id: string; run_type: 'debate' | 'eval' | 'research' | 'trade'; started_at: string; ended_at: string; event_count: number; status: 'running' | 'done' | 'error'; deploy_detail: string | null; run_params: PipelineRunParams | null; output: PipelineRunOutput | null; }
+export interface PipelineSchedule { pipeline: string; interval_minutes: number; }
+export interface PipelineReadiness { has_research_data: boolean; last_research_at: string | null; active_positions: number; }
 export interface LiveQuote { market: string; symbol: string; name: string; price: number | null; prev_close: number | null; change_pct: number | null; volume: number | null; week_closes?: number[]; week_change_pct?: number | null; error?: string; }
 export interface MarketEvent { market: string; symbol: string; name: string; event_type: string; date: string; detail: string | null; url?: string | null; title?: string | null; }
 

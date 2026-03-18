@@ -22,12 +22,82 @@ VERCEL = os.getenv("VERCEL", "") == "1"
 
 scheduler = None
 
-def get_initial_interval():
+def _get_schedule_minutes(pipeline: str) -> int:
+    from core.database import SessionLocal
+    key_map = {
+        "research": "schedule_research_minutes",
+        "trade":    "schedule_trade_minutes",
+        "eval":     "schedule_eval_minutes",
+        "debate":   "schedule_interval_minutes",  # legacy
+    }
+    db = SessionLocal()
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key_map.get(pipeline, "schedule_interval_minutes")).first()
+    db.close()
+    default = 120 if pipeline == "eval" else 60
+    return int(conf.value) if conf else default
+
+
+def _run_research_scheduled():
+    """APScheduler-called wrapper for the research pipeline."""
+    import uuid as _uuid
     from core.database import SessionLocal
     db = SessionLocal()
-    conf = db.query(models.AppConfig).filter(models.AppConfig.key == "schedule_interval_minutes").first()
-    db.close()
-    return int(conf.value) if conf else 60
+    try:
+        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+        if lock and lock.value == "1":
+            db.close()
+            return
+        if not lock:
+            db.add(models.AppConfig(key="debate_running", value="1"))
+        else:
+            lock.value = "1"
+        run_id = str(_uuid.uuid4())
+        run = models.PipelineRun(run_id=run_id, run_type="research", step="pending")
+        db.add(run)
+        run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
+        if run_id_conf:
+            run_id_conf.value = run_id
+        else:
+            db.add(models.AppConfig(key="current_run_id", value=run_id))
+        db.commit()
+        db.close()
+    except Exception:
+        db.close()
+        return
+    from pipeline.runner import run_research_pipeline
+    run_research_pipeline(run_id)
+
+
+def _run_trade_scheduled():
+    """APScheduler-called wrapper for the trade pipeline."""
+    import uuid as _uuid
+    from core.database import SessionLocal
+    db = SessionLocal()
+    try:
+        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
+        if lock and lock.value == "1":
+            db.close()
+            return
+        if not lock:
+            db.add(models.AppConfig(key="debate_running", value="1"))
+        else:
+            lock.value = "1"
+        run_id = str(_uuid.uuid4())
+        run = models.PipelineRun(run_id=run_id, run_type="trade", step="pending")
+        db.add(run)
+        run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
+        if run_id_conf:
+            run_id_conf.value = run_id
+        else:
+            db.add(models.AppConfig(key="current_run_id", value=run_id))
+        db.commit()
+        db.close()
+    except Exception:
+        db.close()
+        return
+    from pipeline.runner import run_trade_pipeline
+    run_trade_pipeline(run_id)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -35,14 +105,16 @@ async def lifespan(app: FastAPI):
     if not VERCEL:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.interval import IntervalTrigger
-        from pipeline.orchestrator import run_debate
         from pipeline.validator import evaluate_predictions
 
-        interval = get_initial_interval()
-        print(f"[Scheduler] Starting jobs with an interval of {interval} minutes.")
+        r_mins = _get_schedule_minutes("research")
+        t_mins = _get_schedule_minutes("trade")
+        e_mins = _get_schedule_minutes("eval")
+        print(f"[Scheduler] research={r_mins}m, trade={t_mins}m, eval={e_mins}m")
         scheduler = BackgroundScheduler()
-        scheduler.add_job(run_debate, 'interval', minutes=interval, id='debate_job')
-        scheduler.add_job(evaluate_predictions, 'interval', minutes=interval, id='eval_job')
+        scheduler.add_job(_run_research_scheduled, 'interval', minutes=r_mins, id='research_job')
+        scheduler.add_job(_run_trade_scheduled,    'interval', minutes=t_mins, id='trade_job')
+        scheduler.add_job(evaluate_predictions,    'interval', minutes=e_mins, id='eval_job')
         scheduler.start()
     else:
         print("[Scheduler] Vercel mode — APScheduler disabled. Using cron endpoints.")

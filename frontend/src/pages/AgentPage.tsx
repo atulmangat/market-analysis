@@ -46,6 +46,10 @@ export function AgentPage({
   const [aiEditAgent, setAiEditAgent] = useState<AgentPrompt | null>(null);
   const [evolutionHistory, setEvolutionHistory] = useState<Record<string, AgentEvolution[]>>({});
   const [expandedEvolution, setExpandedEvolution] = useState<string[]>([]);
+  const [tradesModal, setTradesModal] = useState<{ agentName: string; total: number } | null>(null);
+  const [agentTrades, setAgentTrades] = useState<Record<string, { id: number; symbol: string; prediction: string; confidence: number; reasoning: string; actual_outcome: string | null; score: number | null; timestamp: string | null }[]>>({});
+  const [tradesLoading, setTradesLoading] = useState<string | null>(null);
+  const [expandedTradeId, setExpandedTradeId] = useState<number | null>(null);
 
   const toggleExpandedAgent = (agentName: string) => {
     const willExpand = !expandedAgents.includes(agentName);
@@ -64,6 +68,16 @@ export function AgentPage({
 
   const coreAgents = allAgentNames.filter(n => (AGENT_META[n]?.type ?? 'core') === 'core');
   const specialistAgents = allAgentNames.filter(n => AGENT_META[n]?.type === 'specialist');
+
+  const openTradesModal = async (agentName: string, total: number) => {
+    setTradesModal({ agentName, total });
+    if (agentTrades[agentName]) return;
+    setTradesLoading(agentName);
+    try {
+      const res = await apiFetch(`/agents/predictions/${encodeURIComponent(agentName)}`);
+      if (res.ok) { const data = await res.json(); setAgentTrades(prev => ({ ...prev, [agentName]: data })); }
+    } catch { /* network */ } finally { setTradesLoading(null); }
+  };
 
   const loadEvolutionHistory = async (agentName: string) => {
     if (evolutionHistory[agentName]) return; // already loaded
@@ -331,8 +345,115 @@ export function AgentPage({
     );
   };
 
+  // ── Trades modal ─────────────────────────────────────────────────────────
+  const tradesModalContent = tradesModal && (() => {
+    const { agentName } = tradesModal;
+    const trades = agentTrades[agentName] ?? [];
+    const loading = tradesLoading === agentName;
+    return (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+        onClick={() => setTradesModal(null)}
+      >
+        <div
+          className="relative bg-surface border border-borderMid rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col mx-4"
+          onClick={e => e.stopPropagation()}
+        >
+          {/* Header */}
+          <div className="flex items-center justify-between px-5 py-4 border-b border-borderLight shrink-0">
+            <div>
+              <p className="text-sm font-semibold text-textMain">{agentName}</p>
+              <p className="text-[11px] text-textDim mt-0.5">Trade history · {tradesModal.total} recorded</p>
+            </div>
+            <button
+              onClick={() => setTradesModal(null)}
+              className="h-7 w-7 flex items-center justify-center rounded-lg text-textDim hover:text-textMain hover:bg-surface2 transition-colors text-sm"
+            >✕</button>
+          </div>
+
+          {/* Body */}
+          <div className="flex-1 overflow-y-auto">
+            {loading ? (
+              <div className="flex items-center justify-center py-12">
+                <span className="text-xs text-textDim animate-pulse">Loading trades…</span>
+              </div>
+            ) : trades.length === 0 ? (
+              <div className="flex items-center justify-center py-12">
+                <span className="text-xs text-textDim italic">No trades recorded yet.</span>
+              </div>
+            ) : (
+              <table className="w-full text-[11px]">
+                <thead className="sticky top-0 bg-surface2 border-b border-borderLight z-10">
+                  <tr>
+                    <th className="text-left px-5 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Symbol</th>
+                    <th className="text-left px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Call</th>
+                    <th className="text-left px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Outcome</th>
+                    <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Score</th>
+                    <th className="text-right px-5 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Date</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {trades.map(t => {
+                    const isExpanded = expandedTradeId === t.id;
+                    return (
+                      <>
+                        <tr
+                          key={t.id}
+                          onClick={() => setExpandedTradeId(isExpanded ? null : t.id)}
+                          className="border-t border-borderLight hover:bg-surface2/50 transition-colors cursor-pointer"
+                        >
+                          <td className="px-5 py-3 font-mono font-semibold text-textMain">{t.symbol}</td>
+                          <td className="px-4 py-3">
+                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                              t.prediction === 'BULLISH' ? 'bg-up/10 text-up' : 'bg-down/10 text-down'
+                            }`}>{t.prediction}</span>
+                          </td>
+                          <td className="px-4 py-3">
+                            {t.actual_outcome ? (
+                              <span className={`font-semibold ${
+                                t.actual_outcome === 'PROFIT' ? 'text-up' : t.actual_outcome === 'LOSS' ? 'text-down' : 'text-textDim'
+                              }`}>
+                                {t.actual_outcome === 'PROFIT' ? '↑ Profit' : t.actual_outcome === 'LOSS' ? '↓ Loss' : t.actual_outcome}
+                              </span>
+                            ) : <span className="text-textDim">Pending</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right font-mono">
+                            {t.score !== null
+                              ? <span className={t.score >= 50 ? 'text-up' : 'text-down'}>{t.score.toFixed(1)}</span>
+                              : <span className="text-textDim">—</span>}
+                          </td>
+                          <td className="px-5 py-3 text-right text-textDim font-mono">
+                            {t.timestamp ? new Date(t.timestamp).toLocaleDateString([], { month: 'short', day: 'numeric' }) : '—'}
+                          </td>
+                        </tr>
+                        {isExpanded && t.reasoning && (
+                          <tr key={`${t.id}-reasoning`} className="border-t border-borderLight bg-surface2/40">
+                            <td colSpan={5} className="px-5 py-3">
+                              <p className="text-[11px] text-textMuted leading-relaxed">{t.reasoning}</p>
+                            </td>
+                          </tr>
+                        )}
+                      </>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {!loading && trades.length > 0 && (
+            <div className="px-5 py-2.5 border-t border-borderLight bg-surface2/40 shrink-0">
+              <p className="text-[10px] text-textDim">Click a row to expand reasoning</p>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  })();
+
   return (
     <div className="space-y-8">
+      {tradesModalContent}
       {/* Header */}
       <div className="flex items-start justify-between">
         <div>
@@ -371,98 +492,66 @@ export function AgentPage({
               <span className={`text-[10px] text-textDim group-hover:text-textMuted transition-all ${leaderboardExpanded ? '' : 'rotate-180'}`}>▲</span>
             </button>
             {leaderboardExpanded && (
-              <Card className="overflow-hidden p-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {sorted.map((af, rank) => {
-                    const fitness = af.fitness_score;
-                    const hasData = fitness !== null && af.total_scored >= 1;
-                    const barWidth = hasData ? `${(fitness! / 100) * 100}%` : '0%';
-                    const barColor = !hasData ? 'bg-surface3'
-                      : fitness! >= 65 ? 'bg-up'
-                      : fitness! >= 45 ? 'bg-amber-500'
-                      : 'bg-down';
-                    const rankEmoji = rank === 0 ? '🥇' : rank === 1 ? '🥈' : rank === 2 ? '🥉' : `#${rank + 1}`;
-                    return (
-                      <div key={af.agent_name} className="px-4 py-3 bg-surface2/30 rounded-xl border border-borderLight hover:bg-surface2/60 transition-colors flex flex-col gap-2">
-                        <div className="flex items-center gap-3">
-                          <span className="text-sm w-5 text-center">{rankEmoji}</span>
-                          <div className="w-6 h-6 rounded bg-brand-600/20 text-brand-400 font-bold text-[10px] flex items-center justify-center shrink-0">
-                            {af.agent_name.split(' ').map(w => w[0]).join('')}
-                          </div>
-                          <div className="flex-1 min-w-0">
-                            <div className="flex items-center justify-between gap-2">
-                              <div className="flex items-center gap-2 flex-wrap min-w-0">
-                                <span className="truncate text-[11px] font-semibold text-textMain">{af.agent_name}</span>
-                                {af.generation > 1 && (
-                                  <span className="text-[8px] font-bold px-1 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-400 shrink-0">gen {af.generation}</span>
-                                )}
-                              </div>
-                              <div className="text-right shrink-0">
-                                {hasData ? (
-                                  <span className={`text-[11px] font-medium tabular-nums ${fitness! >= 65 ? 'text-up' : fitness! >= 45 ? 'text-amber-400' : 'text-down'}`}>
-                                    {fitness!.toFixed(1)} <span className="text-[9px] text-textDim font-normal">/100</span>
-                                  </span>
-                                ) : (
-                                  <span className="text-[9px] text-textDim">N/A</span>
-                                )}
-                              </div>
+              <Card className="overflow-hidden">
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr className="border-b border-borderLight bg-surface2/60">
+                      <th className="text-left px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider w-6">#</th>
+                      <th className="text-left px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Agent</th>
+                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Trades</th>
+                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Profit</th>
+                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Loss</th>
+                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Score</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-borderLight">
+                    {sorted.map((af, rank) => {
+                      const fitness = af.fitness_score;
+                      const hasData = af.total_scored >= 1;
+                      const profitable = Math.round((af.win_rate ?? 0) * af.total_scored);
+                      const loss = af.total_scored - profitable;
+                      const rankLabel = rank === 0 ? '🥇' : rank === 1 ? '🥈' : rank === 2 ? '🥉' : `${rank + 1}`;
+                      return (
+                        <tr key={af.agent_name} className="hover:bg-surface2/40 transition-colors">
+                          <td className="px-4 py-3 text-center text-xs">{rankLabel}</td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center gap-2">
+                              <span className="font-semibold text-textMain">{af.agent_name}</span>
+                              {af.generation > 1 && (
+                                <span className="text-[8px] font-bold px-1 py-0.5 rounded bg-purple-900/40 border border-purple-700/40 text-purple-400">gen {af.generation}</span>
+                              )}
                             </div>
-                            <div className="flex items-center gap-3 mt-1.5">
-                              <div className="flex-1 flex items-center">
-                                {hasData ? (
-                                  <div className="h-1 w-full bg-surface3 rounded-full overflow-hidden">
-                                    <div className={`h-full rounded-full transition-all duration-700 ${barColor}`} style={{ width: barWidth }} />
-                                  </div>
-                                ) : (
-                                  <div className="h-1 w-full bg-surface2 rounded-full" />
-                                )}
-                              </div>
-                            </div>
-                            {/* Stats row */}
-                            {hasData && (
-                              <div className="flex items-center gap-3 mt-1.5 flex-wrap">
-                                <span className="text-[9px] text-textDim">
-                                  W/L <span className="text-textMuted font-mono">
-                                    {Math.round((af.win_rate ?? 0) * af.total_scored)}/{af.total_scored - Math.round((af.win_rate ?? 0) * af.total_scored)}
-                                  </span>
-                                </span>
-                                {af.avg_return !== null && (
-                                  <span className={`text-[9px] font-mono ${(af.avg_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
-                                    avg {(af.avg_return ?? 0) >= 0 ? '+' : ''}{af.avg_return?.toFixed(1)}
-                                  </span>
-                                )}
-                                {af.streak !== undefined && af.streak !== 0 && (
-                                  <span className={`text-[9px] font-mono font-bold ${af.streak > 0 ? 'text-up' : 'text-down'}`}>
-                                    {af.streak > 0 ? `+${af.streak}🔥` : `${af.streak}❄`} streak
-                                  </span>
-                                )}
-                                {af.last_evolution && (
-                                  <span className="text-[9px] text-purple-400 bg-purple-900/20 border border-purple-700/30 px-1 py-0.5 rounded" title={af.last_evolution.replaced_at ?? ''}>
-                                    {af.last_evolution.reason?.replace('AGGRESSIVE_', '') ?? 'evolved'}
-                                  </span>
-                                )}
-                              </div>
+                          </td>
+                          <td className="px-4 py-3 text-right font-mono">
+                            {hasData ? (
+                              <button
+                                onClick={() => openTradesModal(af.agent_name, af.total_scored)}
+                                className="tabular-nums font-mono text-brand-400 hover:text-brand-300 underline decoration-dotted underline-offset-2 transition-colors"
+                              >
+                                {af.total_scored}
+                              </button>
+                            ) : <span className="text-textDim">—</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right font-mono">
+                            {hasData ? <span className="text-up">{profitable}</span> : <span className="text-textDim">—</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right font-mono">
+                            {hasData ? <span className="text-down">{loss}</span> : <span className="text-textDim">—</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            {fitness !== null ? (
+                              <span className={`font-semibold tabular-nums ${fitness >= 65 ? 'text-up' : fitness >= 45 ? 'text-amber-400' : 'text-down'}`}>
+                                {fitness.toFixed(1)}
+                              </span>
+                            ) : (
+                              <span className="text-textDim">—</span>
                             )}
-                            {/* Recent predictions */}
-                            {af.recent_predictions && af.recent_predictions.length > 0 && (
-                              <div className="flex flex-wrap gap-1 mt-1.5">
-                                {af.recent_predictions.slice(0, 5).map((p, pi) => (
-                                  <span key={pi} className={`text-[8px] font-mono px-1 py-0.5 rounded border ${
-                                    p.actual_outcome === 'PROFIT' ? 'text-up bg-up/10 border-up/20' :
-                                    p.actual_outcome === 'LOSS'   ? 'text-down bg-down/10 border-down/20' :
-                                                                     'text-textDim bg-surface3 border-borderLight'
-                                  }`} title={p.prediction}>
-                                    {p.symbol} {p.actual_outcome === 'PROFIT' ? '↑' : p.actual_outcome === 'LOSS' ? '↓' : '?'}
-                                  </span>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </Card>
             )}
 

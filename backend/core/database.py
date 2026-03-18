@@ -1,7 +1,6 @@
 import os
 from sqlalchemy import create_engine
-from sqlalchemy.orm import declarative_base
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./market_analysis.db")
 
@@ -18,6 +17,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
+
 def get_db():
     db = SessionLocal()
     try:
@@ -27,56 +27,59 @@ def get_db():
 
 
 def ensure_tables(engine):
-    """Create all tables if they don't exist. Safe to call multiple times."""
-    from core.models import Base
-    Base.metadata.create_all(bind=engine)
-    run_migrations(engine)
+    """
+    Run all pending Alembic migrations, then seed baseline data.
+
+    On a brand-new DB (e.g. fresh SQLite or new Postgres schema) this creates
+    every table and runs all migrations in order.  On an existing DB it only
+    applies migrations that haven't been applied yet — fully idempotent.
+    """
+    _run_alembic_migrations()
+    _seed_builtin_rss_feeds()
+    _seed_schedule_keys()
 
 
-def run_migrations(engine):
-    """Run idempotent schema migrations not handled by create_all."""
-    from sqlalchemy import text
-    is_pg = not str(engine.url).startswith("sqlite")
-    ine = "IF NOT EXISTS " if is_pg else ""
-    migrations = [
-        # deployed_strategies — added over time
-        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}debate_round_id INTEGER",
-        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}position_size FLOAT",
-        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}exit_price FLOAT",
-        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}realized_pnl FLOAT",
-        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}close_reason VARCHAR",
-        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}closed_at DATETIME",
-        f"ALTER TABLE deployed_strategies ADD COLUMN {ine}notes TEXT",
-        # debate_rounds
-        f"ALTER TABLE debate_rounds ADD COLUMN {ine}report_json TEXT",
-        f"ALTER TABLE debate_rounds ADD COLUMN {ine}research_context TEXT",
-        f"ALTER TABLE debate_rounds ADD COLUMN {ine}judge_reasoning TEXT",
-        # pipeline_runs
-        f"ALTER TABLE pipeline_runs ADD COLUMN {ine}investment_focus VARCHAR",
-        f"ALTER TABLE pipeline_runs ADD COLUMN {ine}focus_tickers TEXT",
-        f"ALTER TABLE pipeline_runs ADD COLUMN {ine}run_type VARCHAR DEFAULT 'debate'",
-        # pipeline_events
-        f"ALTER TABLE pipeline_events ADD COLUMN {ine}run_type VARCHAR DEFAULT 'debate'",
-        # agent_memory — tiered memory system
-        f"ALTER TABLE agent_memory ADD COLUMN {ine}importance_score FLOAT DEFAULT 0.5",
-        f"ALTER TABLE agent_memory ADD COLUMN {ine}ticker_refs VARCHAR",
-        f"ALTER TABLE agent_memory ADD COLUMN {ine}memory_layer VARCHAR DEFAULT 'SHORT_TERM'",
-        # agent_prompts
-        f"ALTER TABLE agent_prompts ADD COLUMN {ine}description TEXT",
-    ]
-    with engine.connect() as conn:
-        for sql in migrations:
-            try:
-                conn.execute(text(sql))
-                conn.commit()
-            except Exception:
-                pass  # column already exists (SQLite) or other benign error
-    _seed_builtin_rss_feeds(engine)
+def _run_alembic_migrations():
+    """Apply all pending Alembic migrations programmatically."""
+    import os
+    from alembic.config import Config
+    from alembic import command
+
+    # Locate alembic.ini relative to this file (backend/core/ → backend/)
+    backend_dir = os.path.dirname(os.path.dirname(__file__))
+    ini_path = os.path.join(backend_dir, "alembic.ini")
+
+    alembic_cfg = Config(ini_path)
+    # Override the sqlalchemy.url so we always use the runtime DATABASE_URL,
+    # not whatever is in alembic.ini
+    alembic_cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
+
+    command.upgrade(alembic_cfg, "head")
 
 
-def _seed_builtin_rss_feeds(engine):
+def _seed_schedule_keys():
+    """Upsert per-pipeline schedule keys with sensible defaults (idempotent)."""
+    db = SessionLocal()
+    try:
+        from core.models import AppConfig
+        defaults = {
+            "schedule_research_minutes": "60",
+            "schedule_trade_minutes":    "60",
+            "schedule_eval_minutes":     "120",
+        }
+        for key, val in defaults.items():
+            if not db.query(AppConfig).filter(AppConfig.key == key).first():
+                db.add(AppConfig(key=key, value=val))
+        db.commit()
+    except Exception:
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _seed_builtin_rss_feeds():
     """Upsert the hardcoded RSS feeds into rss_feeds as built-in rows (idempotent)."""
-    from core.models import RssFeed  # local import avoids circular
+    from core.models import RssFeed
     BUILTIN = [
         # Global
         ("https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines", "MarketWatch Real-Time", "US"),
@@ -102,8 +105,7 @@ def _seed_builtin_rss_feeds(engine):
     db = SessionLocal()
     try:
         for url, label, market in BUILTIN:
-            existing = db.query(RssFeed).filter(RssFeed.url == url).first()
-            if not existing:
+            if not db.query(RssFeed).filter(RssFeed.url == url).first():
                 db.add(RssFeed(url=url, label=label, market=market, is_enabled=1, is_builtin=1))
         db.commit()
     except Exception:

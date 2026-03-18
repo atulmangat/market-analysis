@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import type { Strategy, LiveQuote, MarketEvent } from '../types';
 import { MARKET_ICONS, TICKER_DB, TICKER_META } from '../constants';
 import { apiFetch } from '../utils';
@@ -32,6 +32,161 @@ interface MarketsPageProps {
   onTrigger: (tickers?: string[]) => void;
   onApprove: (id: number, action: string) => void;
 }
+
+// ── Market hours config ───────────────────────────────────────────────────
+// All times in local hours of the exchange timezone
+
+interface MarketSession { open: number; close: number; label: string; tz: string; }
+
+const MARKET_SESSIONS: Record<string, MarketSession | null> = {
+  US:     { open: 9.5,  close: 16,   label: 'NYSE / NASDAQ',   tz: 'America/New_York' },
+  India:  { open: 9.25, close: 15.5, label: 'NSE / BSE',       tz: 'Asia/Kolkata'     },
+  MCX:    { open: 9,    close: 23.5, label: 'MCX',             tz: 'Asia/Kolkata'     },
+  Crypto: null, // 24/7
+};
+
+// Days: 0=Sun, 6=Sat. US and India are Mon–Fri only. MCX Mon–Fri + Sat till 14:00.
+const MCX_SAT_CLOSE = 14;
+
+function getMarketStatus(market: string, now: Date): {
+  isOpen: boolean; label: string; statusText: string; countdown: string;
+  openPct: number; localTime: string;
+} {
+  if (market === 'Crypto') {
+    const localTime = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: 'UTC', hour12: false });
+    return { isOpen: true, label: 'Crypto', statusText: 'Open 24/7', countdown: '', openPct: 100, localTime: `${localTime} UTC` };
+  }
+
+  const session = MARKET_SESSIONS[market];
+  if (!session) return { isOpen: false, label: market, statusText: 'Unknown', countdown: '', openPct: 0, localTime: '' };
+
+  // Get current time in exchange timezone
+  const localStr = now.toLocaleString('en-US', { timeZone: session.tz, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false, weekday: 'short' });
+  const parts = localStr.split(', ');
+  const weekday = parts[0]; // e.g. "Mon"
+  const timeParts = (parts[1] ?? '').split(':').map(Number);
+  const localHour = (timeParts[0] ?? 0) + (timeParts[1] ?? 0) / 60 + (timeParts[2] ?? 0) / 3600;
+  const dayIdx = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(weekday);
+
+  const localTimeDisplay = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: session.tz, hour12: false });
+  const tzShort = session.tz === 'America/New_York' ? 'ET' : 'IST';
+
+  // Determine if weekday trading day
+  const isWeekday = dayIdx >= 1 && dayIdx <= 5;
+  const isSat = dayIdx === 6;
+
+  let isOpen = false;
+  let effectiveClose = session.close;
+
+  if (market === 'MCX') {
+    if (isSat) effectiveClose = MCX_SAT_CLOSE;
+    isOpen = (isWeekday || isSat) && localHour >= session.open && localHour < effectiveClose;
+  } else {
+    isOpen = isWeekday && localHour >= session.open && localHour < session.close;
+  }
+
+  // Time until open or close (in minutes)
+  const toMinutes = (h: number) => Math.round(h * 60);
+  const nowMin = Math.round(localHour * 60);
+
+  let countdown = '';
+  let openPct = 0;
+
+  if (isOpen) {
+    const closeMin = toMinutes(effectiveClose);
+    const openMin = toMinutes(session.open);
+    const totalMin = closeMin - openMin;
+    const elapsedMin = nowMin - openMin;
+    openPct = Math.min(100, Math.max(0, Math.round((elapsedMin / totalMin) * 100)));
+    const remaining = closeMin - nowMin;
+    const h = Math.floor(remaining / 60);
+    const m = remaining % 60;
+    countdown = h > 0 ? `${h}h ${m}m until close` : `${m}m until close`;
+  } else {
+    openPct = 0;
+    // Find next open: today if before open, else next trading day
+    let minsToOpen: number;
+    const openMin = toMinutes(session.open);
+    if ((isWeekday || (market === 'MCX' && isSat)) && nowMin < openMin) {
+      minsToOpen = openMin - nowMin;
+    } else {
+      // Find next weekday
+      let daysAhead = 1;
+      while (daysAhead <= 7) {
+        const nextDay = (dayIdx + daysAhead) % 7;
+        const nextIsWeekday = nextDay >= 1 && nextDay <= 5;
+        const nextIsSat = nextDay === 6;
+        if (nextIsWeekday || (market === 'MCX' && nextIsSat)) break;
+        daysAhead++;
+      }
+      minsToOpen = daysAhead * 24 * 60 - nowMin + openMin;
+    }
+    const h = Math.floor(minsToOpen / 60);
+    const m = minsToOpen % 60;
+    const days = Math.floor(h / 24);
+    const rh = h % 24;
+    if (days > 0) countdown = `Opens in ${days}d ${rh}h`;
+    else if (rh > 0) countdown = `Opens in ${rh}h ${m}m`;
+    else countdown = `Opens in ${m}m`;
+  }
+
+  return {
+    isOpen,
+    label: session.label,
+    statusText: isOpen ? 'Open' : 'Closed',
+    countdown,
+    openPct,
+    localTime: `${localTimeDisplay} ${tzShort}`,
+  };
+}
+
+function MarketClock({ market }: { market: string }) {
+  const [now, setNow] = useState(() => new Date());
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    timerRef.current = setInterval(() => setNow(new Date()), 30000);
+    return () => { if (timerRef.current) clearInterval(timerRef.current); };
+  }, []);
+
+  const status = getMarketStatus(market, now);
+  const isCrypto = market === 'Crypto';
+
+  return (
+    <div className={`flex items-center gap-3 px-4 py-2.5 rounded-xl border ${status.isOpen ? 'bg-up/[0.04] border-up/20' : 'bg-surface2 border-borderLight'}`}>
+      {/* Status dot */}
+      <div className="shrink-0 flex items-center gap-1.5">
+        <span className={`h-2 w-2 rounded-full shrink-0 ${status.isOpen ? 'bg-up animate-pulse' : 'bg-textDim'}`} />
+        <span className={`text-xs font-semibold ${status.isOpen ? 'text-up' : 'text-textDim'}`}>{status.statusText}</span>
+      </div>
+
+      <div className="h-3 w-px bg-borderLight shrink-0" />
+
+      {/* Exchange label + local time */}
+      <div className="flex items-center gap-1.5 min-w-0">
+        <span className="text-[11px] text-textMuted font-medium truncate">{status.label}</span>
+        <span className="text-[10px] text-textDim font-mono">{status.localTime}</span>
+      </div>
+
+      {!isCrypto && (
+        <>
+          <div className="h-3 w-px bg-borderLight shrink-0" />
+          {/* Progress bar */}
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <div className="flex-1 h-1 bg-surface3 rounded-full overflow-hidden min-w-[60px]">
+              <div
+                className={`h-full rounded-full transition-all duration-1000 ${status.isOpen ? 'bg-up' : 'bg-borderMid'}`}
+                style={{ width: `${status.openPct}%` }}
+              />
+            </div>
+            <span className="text-[10px] text-textDim whitespace-nowrap shrink-0">{status.countdown}</span>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 
 export function MarketsPage({
   enabledMarketNames, activeStrategies, pendingStrategies, liveQuotes, marketEvents,
@@ -335,6 +490,9 @@ export function MarketsPage({
           </button>
         ))}
       </div>
+
+      {/* Market clock */}
+      {activeMarketTab && <MarketClock market={activeMarketTab} />}
 
       {/* Cards + inline detail */}
       <div className="space-y-4">

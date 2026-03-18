@@ -47,11 +47,13 @@ const CATEGORY_ICON: Record<string, string> = {
 
 const FEED_MARKETS = ['US', 'Crypto', 'India', 'MCX', 'All'];
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function SettingsPage({
   darkMode, toggleDarkMode,
   approvalMode, setMode,
   markets, toggleMarket,
-  scheduleInterval, handleScheduleUpdate, handleManualTrigger, isTriggering,
+  scheduleInterval: _scheduleInterval, handleScheduleUpdate: _handleScheduleUpdate,
+  handleManualTrigger: _handleManualTrigger, isTriggering: _isTriggering,
 }: SettingsPageProps) {
   const [sources, setSources] = useState<DataSource[]>([]);
   const [feeds, setFeeds] = useState<RssFeed[]>([]);
@@ -163,32 +165,6 @@ export function SettingsPage({
             </div>
           </Card>
         </div>
-      </section>
-
-      {/* Pipeline Run */}
-      <section className="space-y-3">
-        <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Pipeline Run</h2>
-        <Card>
-          <SectionHeader title="Schedule" />
-          <div className="p-5 space-y-4">
-            <p className="text-xs text-textMuted">Automatically run a new pipeline cycle every:</p>
-            <div className="grid grid-cols-4 gap-2">
-              {[15, 30, 60, 120].map(mins => (
-                <button key={mins} onClick={() => handleScheduleUpdate(mins)}
-                  className={`py-2.5 text-xs font-semibold rounded-lg border transition-colors ${scheduleInterval === mins ? 'bg-brand-600 border-brand-500 text-white' : 'bg-surface2 border-borderLight text-textMuted hover:bg-surface3 hover:text-textMain'}`}>
-                  {mins >= 60 ? `${mins / 60}h` : `${mins}m`}
-                </button>
-              ))}
-            </div>
-            <div className="flex items-center gap-3 pt-1">
-              <button onClick={() => handleManualTrigger()} disabled={isTriggering}
-                className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium border transition-colors ${isTriggering ? 'bg-surface3 border-borderLight text-textDim cursor-not-allowed' : 'bg-brand-600 border-brand-500 text-white hover:bg-brand-500'}`}>
-                {isTriggering ? <><span className="animate-spin inline-block">↻</span> Pipeline running…</> : <><span>▶</span> Run Pipeline Now</>}
-              </button>
-              <span className="text-[11px] text-textDim whitespace-nowrap">Next in ~{scheduleInterval}m</span>
-            </div>
-          </div>
-        </Card>
       </section>
 
       {/* Markets */}

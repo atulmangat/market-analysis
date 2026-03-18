@@ -43,12 +43,112 @@ def _get_base_url() -> str:
 STEP_ORDER = ["research", "agents", "consensus", "deploy", "done"]
 
 
+def _tag_run_events(run_id: str, run_type: str):
+    """Backfill run_type on all PipelineEvents and the PipelineRun row itself."""
+    db = SessionLocal()
+    try:
+        db.query(models.PipelineEvent).filter(
+            models.PipelineEvent.run_id == run_id
+        ).update({"run_type": run_type})
+        db.query(models.PipelineRun).filter(
+            models.PipelineRun.run_id == run_id
+        ).update({"run_type": run_type})
+        db.commit()
+    finally:
+        db.close()
+
+
 def run_full_pipeline(run_id: str):
-    """Run all pipeline steps sequentially in a single call."""
+    """Run all pipeline steps sequentially (debate/legacy full pipeline)."""
     pipeline_research(run_id)
     pipeline_agents(run_id)
     pipeline_consensus(run_id)
     pipeline_deploy(run_id)
+    _tag_run_events(run_id, "debate")
+
+
+def run_research_pipeline(run_id: str):
+    """
+    Research-only pipeline: fetch news, build knowledge graph, save context.
+    Does NOT query agents or deploy. Saves context to AppConfig for the trade pipeline.
+    """
+    db = SessionLocal()
+    try:
+        run = _get_run(db, run_id)
+        if not run:
+            return
+    finally:
+        db.close()
+
+    pipeline_research(run_id)
+
+    # Save research context to AppConfig so trade pipeline can use it independently
+    db = SessionLocal()
+    try:
+        run = _get_run(db, run_id)
+        if run and run.shared_context:
+            for key, val in [
+                ("last_research_context", run.shared_context),
+                ("last_research_markets", run.enabled_markets_json or "{}"),
+                ("last_research_run_id",  run_id),
+            ]:
+                conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+                if conf:
+                    conf.value = val
+                else:
+                    db.add(models.AppConfig(key=key, value=val))
+            # Mark research run done
+            run.step = "done"
+            _release_lock(db, "research_running")
+            db.commit()
+            _log(db, run_id, "MEMORY_WRITE", "DONE",
+                 "Research pipeline complete — context saved for trade pipeline")
+        else:
+            # pipeline_research already set error state, just make sure lock is released
+            _release_lock(db, "research_running")
+            db.commit()
+    finally:
+        db.close()
+
+    _tag_run_events(run_id, "research")
+    from core.cache import cache_invalidate
+    cache_invalidate("pipeline_runs")
+
+
+def run_trade_pipeline(run_id: str):
+    """
+    Trade-only pipeline: query agents, judge, deploy. Reads research context from AppConfig.
+    """
+    db = SessionLocal()
+    try:
+        run = _get_run(db, run_id)
+        if not run:
+            return
+
+        # Load last research context saved by run_research_pipeline
+        ctx_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "last_research_context").first()
+        markets_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "last_research_markets").first()
+
+        if not ctx_conf or not ctx_conf.value:
+            _log(db, run_id, "AGENT_QUERY", "ERROR",
+                 "No research context available — run the Research pipeline first to fetch news and build the knowledge graph.")
+            run.step = "error"
+            _release_lock(db, "trade_running")
+            db.commit()
+            _tag_run_events(run_id, "trade")
+            return
+
+        # Inject research context into this run's row so pipeline_agents can read it
+        run.shared_context = ctx_conf.value
+        run.enabled_markets_json = markets_conf.value if markets_conf else "{}"
+        db.commit()
+    finally:
+        db.close()
+
+    pipeline_agents(run_id)
+    pipeline_consensus(run_id)
+    pipeline_deploy(run_id)
+    _tag_run_events(run_id, "trade")
 
 
 def resume_pipeline(run_id: str):
@@ -63,28 +163,44 @@ def resume_pipeline(run_id: str):
             print(f"[resume_pipeline] run_id {run_id} not found")
             return
         step = run.step
+        run_type = getattr(run, "run_type", "debate") or "debate"
     finally:
         db.close()
 
-    print(f"[resume_pipeline] Resuming run {run_id} from step={step!r}")
+    print(f"[resume_pipeline] Resuming run {run_id} (type={run_type}) from step={step!r}")
 
-    if step in ("pending", "research", "error"):
-        # error on research step = restart from research
-        pipeline_research(run_id)
-        pipeline_agents(run_id)
-        pipeline_consensus(run_id)
-        pipeline_deploy(run_id)
-    elif step == "agents":
-        pipeline_agents(run_id)
-        pipeline_consensus(run_id)
-        pipeline_deploy(run_id)
-    elif step == "consensus":
-        pipeline_consensus(run_id)
-        pipeline_deploy(run_id)
-    elif step == "deploy":
-        pipeline_deploy(run_id)
+    if run_type == "research":
+        run_research_pipeline(run_id)
+    elif run_type == "trade":
+        if step in ("pending", "error"):
+            run_trade_pipeline(run_id)
+        elif step == "consensus":
+            pipeline_consensus(run_id)
+            pipeline_deploy(run_id)
+            _tag_run_events(run_id, "trade")
+        elif step == "deploy":
+            pipeline_deploy(run_id)
+            _tag_run_events(run_id, "trade")
+        else:
+            print(f"[resume_pipeline] run {run_id} already in terminal state {step!r} — nothing to do")
     else:
-        print(f"[resume_pipeline] run {run_id} already in terminal state {step!r} — nothing to do")
+        # Legacy debate / full pipeline
+        if step in ("pending", "research", "error"):
+            pipeline_research(run_id)
+            pipeline_agents(run_id)
+            pipeline_consensus(run_id)
+            pipeline_deploy(run_id)
+        elif step == "agents":
+            pipeline_agents(run_id)
+            pipeline_consensus(run_id)
+            pipeline_deploy(run_id)
+        elif step == "consensus":
+            pipeline_consensus(run_id)
+            pipeline_deploy(run_id)
+        elif step == "deploy":
+            pipeline_deploy(run_id)
+        else:
+            print(f"[resume_pipeline] run {run_id} already in terminal state {step!r} — nothing to do")
 
 
 def _get_run(db, run_id: str) -> models.PipelineRun | None:
@@ -96,14 +212,24 @@ def _set_step(db, run: models.PipelineRun, step: str):
     db.commit()
 
 
+def _lock_key_for_run(run: models.PipelineRun | None) -> str:
+    """Return the AppConfig lock key for the given run's pipeline type."""
+    run_type = getattr(run, "run_type", None) or "debate"
+    return {"research": "research_running", "trade": "trade_running", "eval": "eval_running"}.get(run_type, "trade_running")
+
+
+def _release_lock(db, lock_key: str):
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == lock_key).first()
+    if conf:
+        conf.value = "0"
+
+
 def _fail_run(db, run_id: str):
-    """Mark run as error and release the concurrency lock in a single commit."""
+    """Mark run as error and release the per-pipeline concurrency lock."""
     run = _get_run(db, run_id)
-    lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
     if run:
         run.step = "error"
-    if lock:
-        lock.value = "0"
+    _release_lock(db, _lock_key_for_run(run))
     db.commit()
 
 
@@ -498,10 +624,10 @@ def pipeline_deploy(run_id: str):
         except Exception as re_err:
             print(f"[pipeline_deploy] Report generation failed (non-fatal): {re_err}")
 
-        # Release concurrency lock and mark done atomically in one commit
-        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-        if lock:
-            lock.value = "0"
+        # Release per-pipeline lock and mark done atomically in one commit
+        run_type = getattr(run, "run_type", None) or "debate"
+        lock_key = {"trade": "trade_running", "debate": "trade_running"}.get(run_type, "trade_running")
+        _release_lock(db, lock_key)
         run.step = "done"
         db.commit()
         _log(db, run_id, "MEMORY_WRITE", "DONE", "Pipeline complete")
@@ -513,11 +639,9 @@ def pipeline_deploy(run_id: str):
     except Exception as e:
         _log(db, run_id, "DEPLOY", "ERROR", str(e)[:300])
         run = _get_run(db, run_id)
-        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
         if run:
             run.step = "error"
-        if lock:
-            lock.value = "0"
+        _release_lock(db, _lock_key_for_run(run))
         db.commit()
         from core.cache import cache_invalidate
         cache_invalidate("pipeline_runs")

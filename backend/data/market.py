@@ -3,16 +3,23 @@ from sqlalchemy.orm import Session
 from core.database import SessionLocal
 import core.models as models
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
+_executor = ThreadPoolExecutor(max_workers=4)
 
 
-def fetch_market_data(symbol: str = "AAPL"):
+def _fetch_history(symbol: str):
+    return yf.Ticker(symbol).history(period="1d")
+
+
+def fetch_market_data(symbol: str = "AAPL", timeout: int = 15):
     """
     Fetches the latest market data for a given symbol and stores it in the database.
+    Times out after `timeout` seconds to avoid hanging on bad symbols.
     """
-    ticker = yf.Ticker(symbol)
     try:
-        # Get the history for the last day
-        hist = ticker.history(period="1d")
+        future = _executor.submit(_fetch_history, symbol)
+        hist = future.result(timeout=timeout)
         if hist.empty:
             print(f"No data found for {symbol}")
             return None
@@ -37,6 +44,9 @@ def fetch_market_data(symbol: str = "AAPL"):
         print(f"Successfully saved market signal for {symbol}: ${signal.price}")
         return signal
 
+    except FuturesTimeoutError:
+        print(f"Timeout fetching data for {symbol} (>{timeout}s) — skipping")
+        return None
     except Exception as e:
         print(f"Error fetching data for {symbol}: {e}")
         return None

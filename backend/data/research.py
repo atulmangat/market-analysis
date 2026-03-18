@@ -365,7 +365,7 @@ def _filter_stale(items: list[dict], max_age_hours: int = NEWS_MAX_AGE_HOURS) ->
 
 def fetch_web_research(
     topics: list[str] = None,
-    use_cache: bool = True,
+    use_cache: bool = False,
     enabled_tickers: dict = None,
 ) -> list[dict]:
     """
