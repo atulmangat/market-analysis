@@ -224,29 +224,38 @@ export function PipelinePage({
       apiFetch(`/pipeline/runs?type=${tab}`)
         .then(r => r.ok ? r.json() : null)
         .then((incoming: PipelineRun[] | null) => {
-          if (!incoming) return;
-          // Merge: keep runs from other tabs already loaded, add/replace for this tab
-          setPipelineRuns(prev => {
-            const map = new Map(prev.map(r => [r.run_id, r]));
-            incoming.forEach(r => map.set(r.run_id, r));
-            return Array.from(map.values()).sort(
-              (a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime()
-            );
-          });
-          setPipelineRunsLoaded(true);
+          if (incoming) {
+            setPipelineRuns(prev => {
+              const map = new Map(prev.map(r => [r.run_id, r]));
+              incoming.forEach(r => map.set(r.run_id, r));
+              return Array.from(map.values()).sort(
+                (a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime()
+              );
+            });
+            setPipelineRunsLoaded(true);
+          }
+          tabsLoadedRef.current.add(tab);
+          setTabRunsLoading(false);
         })
-        .catch(() => { setPipelineRunsLoaded(true); });
+        .catch(() => {
+          tabsLoadedRef.current.add(tab);
+          setTabRunsLoading(false);
+          setPipelineRunsLoaded(true);
+        });
     if (delay > 0) setTimeout(doFetch, delay);
     else doFetch();
   };
 
-  // Re-fetch runs for the newly active tab on switch.
-  // Reset loaded flag so the skeleton shows instead of "No runs yet" while fetching.
+  // Per-tab fetch tracking — which tabs have been loaded at least once.
+  const tabsLoadedRef = useRef<Set<PipelineTab>>(new Set());
+  const [tabRunsLoading, setTabRunsLoading] = useState(true);
+
+  // Fetch runs for active tab on switch; show skeleton until resolved.
   const prevActiveTabRef = useRef<PipelineTab | null>(null);
   useEffect(() => {
     if (prevActiveTabRef.current !== activeTab) {
       prevActiveTabRef.current = activeTab;
-      setPipelineRunsLoaded(false);
+      setTabRunsLoading(true);
       fetchRuns(activeTab, 0);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1595,7 +1604,7 @@ export function PipelinePage({
               );
             })()}
 
-            {!pipelineRunsLoaded && (
+            {tabRunsLoading && (
               <div className="px-4 py-5 space-y-2">
                 {[1, 2, 3].map(i => (
                   <div key={i} className="animate-pulse space-y-1.5">
@@ -1605,7 +1614,7 @@ export function PipelinePage({
                 ))}
               </div>
             )}
-            {pipelineRunsLoaded && !pipelineRuns.some(r => runTypeToTab(r.run_type) === activeTab && r.status !== 'running') && (
+            {!tabRunsLoading && !pipelineRuns.some(r => runTypeToTab(r.run_type) === activeTab && r.status !== 'running') && (
               <p className="px-4 py-4 text-[11px] text-textDim">No {activeTab} runs yet.</p>
             )}
           </div>
