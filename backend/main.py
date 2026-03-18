@@ -123,9 +123,8 @@ async def lifespan(app: FastAPI):
         scheduler.shutdown()
 
 # Create database tables + run migrations
-Base.metadata.create_all(bind=engine)
-from core.database import run_migrations
-run_migrations(engine)
+from core.database import ensure_tables
+ensure_tables(engine)
 
 # Seed all agent prompts (core + specialists) — safe to run on every cold start
 from pipeline.orchestrator import setup_agent_prompts
