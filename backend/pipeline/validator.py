@@ -735,7 +735,10 @@ def evaluate_predictions(run_id: str = None):
             if not current_price:
                 continue
 
-            entry_price = strategy.entry_price
+            entry_price = strategy.entry_price or 0.0
+            if not entry_price:
+                score_lines.append(f"{strategy.symbol}: skipped — entry price is 0")
+                continue
             if strategy.strategy_type == "LONG":
                 pct_return = ((current_price - entry_price) / entry_price) * 100
             else:
