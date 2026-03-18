@@ -787,6 +787,8 @@ export function PipelinePage({
               {stepsArray.map(s => {
                 const ran = events.some(e => e.step === s);
                 const failed = events.some(e => e.step === s && e.status === 'ERROR');
+                const warned = !failed && events.some(e => e.step === s && e.status === 'WARN');
+                const skipped = ran && !failed && !warned && !events.some(e => e.step === s && (e.status === 'DONE' || e.status === 'IN_PROGRESS'));
                 const c = STEP_COLORS[s] ?? STEP_COLORS.START;
                 const m = STEP_META[s];
                 if (!ran) return (
@@ -796,11 +798,17 @@ export function PipelinePage({
                 );
                 return (
                   <span key={s} className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ${
-                    failed ? 'border-down/40 text-down-text bg-down-bg' : `${c.ring} ${c.text} ${c.bg}`
+                    failed  ? 'border-down/40 text-down-text bg-down-bg' :
+                    warned  ? 'border-warning/40 text-warning bg-warning-bg' :
+                    skipped ? 'border-borderMid text-textDim bg-surface3' :
+                              `${c.ring} ${c.text} ${c.bg}`
                   }`}>
                     <span>{m?.icon}</span>
                     <span>{STEP_LABELS[s]}</span>
-                    {failed ? <span className="text-down-text">✕</span> : <span className="opacity-60">✓</span>}
+                    {failed  ? <span className="text-down-text">✕</span> :
+                     warned  ? <span className="opacity-80">⚠</span> :
+                     skipped ? <span className="opacity-60">—</span> :
+                               <span className="opacity-60">✓</span>}
                   </span>
                 );
               })}

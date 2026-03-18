@@ -294,14 +294,12 @@ def pipeline_research(run_id: str):
              f"Research fetched — {len(research_items)} articles ready for KG ingest")
 
         # ── Step 2: Build Knowledge Graph from those articles ─────────────────
-        # Hard timeout: KG ingest involves multiple LLM calls; cap at 45s so it
-        # never stalls the pipeline on Vercel's serverless timeout boundary.
+        import traceback as _tb
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
+        _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
+             f"Extracting structured events from {len(research_items)} articles → updating knowledge graph…")
         try:
-            import traceback as _tb
-            from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FutureTimeout
             upsert_asset_nodes(db, all_tickers)
-            _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
-                 f"Extracting structured events from {len(research_items)} articles (title + content) → updating graph with net-new facts…")
             with ThreadPoolExecutor(max_workers=1) as _kg_pool:
                 _kg_future = _kg_pool.submit(ingest_retrieval_to_graph, db, research_items, run_id)
                 try:
@@ -322,7 +320,7 @@ def pipeline_research(run_id: str):
                          "KG ingest timed out after 150s — pipeline continuing without full graph update")
         except Exception as kg_err:
             _log(db, run_id, "KG_INGEST", "ERROR",
-                 f"KG ingest failed: {str(kg_err)[:300]} | {_tb.format_exc()[-300:]}")
+                 f"KG ingest failed: {str(kg_err)[:300]} | {_tb.format_exc()[-400:]}")
 
         # ── Step 3: Build shared context (now uses fresh graph data) ──────────
         shared_context, research_log, _ = build_shared_retrieval_context(
