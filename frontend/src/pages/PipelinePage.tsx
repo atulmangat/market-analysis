@@ -1158,6 +1158,27 @@ export function PipelinePage({
     );
   };
 
+  // ── Stale events re-fetch ─────────────────────────────────────────────────
+  // When we auto-selected a run immediately after completion, we may have fetched
+  // events before the backend finished committing them all. If the loaded count is
+  // less than run.event_count, silently re-fetch once to get the full set.
+  const staleRefetchedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (viewingLive || selectedRunLoading || !selectedRunId) return;
+    const run = pipelineRuns.find(r => r.run_id === selectedRunId);
+    if (!run || !run.event_count) return;
+    if (panelEvents.length >= run.event_count) return;
+    if (staleRefetchedRef.current === selectedRunId) return; // already retried
+    staleRefetchedRef.current = selectedRunId;
+    setSelectedRunLoading(true);
+    apiFetch(`/pipeline/runs/${selectedRunId}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => { if (d) setSelectedRunEvents(d.events ?? []); })
+      .catch(() => {})
+      .finally(() => setSelectedRunLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedRunId, panelEvents.length, selectedRunLoading]);
+
   // ── Decide what to render in main panel ──────────────────────────────────
   const renderPanel = () => {
     // Show skeleton while fetching a selected run's events
