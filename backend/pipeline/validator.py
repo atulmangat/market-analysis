@@ -838,6 +838,34 @@ def evaluate_predictions(run_id: str = None):
             _log(db, run_id, "CLOSE_POSITIONS", "DONE",
                  f"Closed {closed_count} position(s). Post-mortems completed for {len(agent_analysis_map)} agent(s).")
 
+        # ── AGENT_ANALYSIS on live (open) positions ───────────────────────────
+        # Even when nothing closes, agents review their active positions'
+        # current P&L and update their strategy notes.
+        open_strategies = [s for s in active_strategies if s.status in ("ACTIVE", "PENDING")]
+        if open_strategies and not strategies_to_close:
+            _log(db, run_id, "AGENT_ANALYSIS", "IN_PROGRESS",
+                 f"Reviewing {len(open_strategies)} open position(s) — interim performance check")
+            for strategy in open_strategies:
+                current_price = price_data.get(strategy.id)
+                if not current_price:
+                    continue
+                pct_return = strategy.current_return or 0.0
+                direction = "+" if pct_return >= 0 else ""
+                # Find predictions for this strategy's symbol
+                preds = (
+                    db.query(models.AgentPrediction)
+                    .filter(models.AgentPrediction.symbol == strategy.symbol)
+                    .order_by(models.AgentPrediction.timestamp.desc())
+                    .limit(3)
+                    .all()
+                )
+                for pred in preds:
+                    _log(db, run_id, "AGENT_ANALYSIS", "DONE",
+                         f"{pred.agent_name} → {strategy.strategy_type} {strategy.symbol} | "
+                         f"entry=${strategy.entry_price:.4f} → now=${current_price:.4f} | "
+                         f"return={direction}{pct_return:.2f}% | position still OPEN",
+                         agent_name=pred.agent_name)
+
         # ── DARWIN_SELECTION ──────────────────────────────────────────────────
         _update_run(db, run, "darwin_selection")
         evolved = _run_darwin_selection(db, run_id, agent_analysis_map)
