@@ -614,42 +614,16 @@ function AppInner() {
   const [expandedStratMarket, setExpandedStratMarket] = useState<string>('US');
   const [expandedStratTicker, setExpandedStratTicker] = useState<string | null>(null);
 
-  // Track run transitions: new run started → go to Live; run finished → show completed run
+  // Clear live events when a new pipeline starts so the live view doesn't show stale data.
   const prevIsTriggering = useRef(false);
-  const prevPipelineRunId = useRef<string | null>(null);
   useEffect(() => {
     const wasRunning = prevIsTriggering.current;
     const isNowRunning = isTriggering;
     if (!wasRunning && isNowRunning) {
-      // A new pipeline just started — always clear any past run selection and show live view.
-      // Reset the guard so the "finished" branch can auto-select when it completes.
-      userSelectedRunRef.current = false;
-      setSelectedRunId(null);
-      setSelectedRunEvents([]);
-    } else if (wasRunning && !isNowRunning && pipelineRunId) {
-      // A pipeline just finished — delay auto-select so the backend has time to
-      // commit step="done" and the PipelinePage runs-list fetch (also 1.5s delayed)
-      // arrives around the same time. Without the delay the run panel vanishes
-      // because selectedRunId points at a run not yet in pipelineRuns.
-      if (!userSelectedRunRef.current) {
-        const finishedRunId = pipelineRunId;
-        setPipelineEvents([]);
-        setTimeout(() => {
-          if (userSelectedRunRef.current) return; // user picked something else
-          setSelectedRunId(finishedRunId);
-          setSelectedRunEvents([]);
-          setSelectedRunLoading(true);
-          apiFetch(`/pipeline/runs/${finishedRunId}`)
-            .then(r => r.ok ? r.json() : null)
-            .then(eventsData => { if (eventsData) setSelectedRunEvents(eventsData.events ?? []); })
-            .catch(() => {})
-            .finally(() => setSelectedRunLoading(false));
-        }, 1500);
-      }
+      setPipelineEvents([]);
     }
     prevIsTriggering.current = isNowRunning;
-    prevPipelineRunId.current = pipelineRunId;
-  }, [isTriggering, pipelineRunId]);
+  }, [isTriggering]);
 
   const visibleStrategies = strategies.filter(s =>
     enabledMarketNames.length === 0 || enabledMarketNames.includes(getMarketForTicker(s.symbol))
@@ -788,6 +762,7 @@ function AppInner() {
             selectedRunEvents={selectedRunEvents}
             setSelectedRunEvents={setSelectedRunEvents}
             selectedRunLoading={selectedRunLoading}
+            setSelectedRunLoading={setSelectedRunLoading}
             loadRunEvents={loadRunEvents}
             setPipelineRuns={setPipelineRuns}
             setPipelineRunsLoaded={setPipelineRunsLoaded}

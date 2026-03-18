@@ -57,6 +57,7 @@ interface PipelinePagesProps {
   handleResearchTrigger: () => void;
   handleTradeTrigger: () => void;
   onScheduleUpdate: (pipeline: 'research' | 'trade' | 'eval', minutes: number) => void;
+  setSelectedRunLoading: (v: boolean) => void;
   loadRunEvents: (runId: string) => void;
   openReport: (id: number) => void;
 }
@@ -196,7 +197,7 @@ export function PipelinePage({
   setFocusSectorFilter, setTickerSearchResults, setTickerSearchLoading,
   saveInvestmentFocus, handleManualTrigger: _handleManualTrigger, handleStopPipeline, handleEvalTrigger,
   handleResearchTrigger, handleTradeTrigger, onScheduleUpdate,
-  loadRunEvents, openReport, setPipelineRuns, setPipelineRunsLoaded,
+  setSelectedRunLoading, loadRunEvents, openReport, setPipelineRuns, setPipelineRunsLoaded,
 }: PipelinePagesProps) {
   // Per-tab active state
   const tabIsActive = (tab: PipelineTab) =>
@@ -215,12 +216,6 @@ export function PipelinePage({
   selectedRunIdRef.current = selectedRunId;
 
   // ── Lazy-load pipeline runs per tab ─────────────────────────────────────────
-  // Fetch /pipeline/runs on tab switch or when a pipeline just finished.
-  // When just finished, delay 1.5s so the backend has time to commit the final
-  // step="done" before we query — otherwise the run appears as "running" or
-  // is missing from the list and the panel seems to vanish.
-  const prevTabActiveRef = useRef(false);
-  const tabActive = tabIsActive(activeTab);
   const fetchRuns = (delay = 0) => {
     const doFetch = () =>
       apiFetch('/pipeline/runs')
@@ -235,14 +230,57 @@ export function PipelinePage({
     if (delay > 0) setTimeout(doFetch, delay);
     else doFetch();
   };
+
+  // Re-fetch runs on tab switch
+  const prevActiveTabRef = useRef(activeTab);
   useEffect(() => {
-    const wasActive = prevTabActiveRef.current;
-    prevTabActiveRef.current = tabActive;
-    const justFinished = wasActive && !tabActive;
-    // Delay re-fetch when pipeline just finished so backend has time to commit
-    fetchRuns(justFinished ? 1500 : 0);
+    if (prevActiveTabRef.current !== activeTab) {
+      prevActiveTabRef.current = activeTab;
+      fetchRuns(0);
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTab, tabActive]);
+  }, [activeTab]);
+
+  // ── Per-pipeline finish detection ────────────────────────────────────────────
+  // When a specific pipeline finishes, switch to its tab and auto-select the run.
+  const prevResearchRunning = useRef(researchRunning);
+  const prevTradeRunning    = useRef(tradeRunning);
+  const prevEvalRunning     = useRef(evalRunning);
+  useEffect(() => {
+    const rFinished = prevResearchRunning.current && !researchRunning;
+    const tFinished = prevTradeRunning.current    && !tradeRunning;
+    const eFinished = prevEvalRunning.current     && !evalRunning;
+    prevResearchRunning.current = researchRunning;
+    prevTradeRunning.current    = tradeRunning;
+    prevEvalRunning.current     = evalRunning;
+
+    const finishedTab: PipelineTab | null = eFinished ? 'eval' : tFinished ? 'trade' : rFinished ? 'research' : null;
+    const finishedRunId = eFinished ? currentRunIdEval : tFinished ? currentRunIdTrade : rFinished ? currentRunIdResearch : null;
+
+    // Don't auto-select if user already has a run open
+    if (!finishedTab || !finishedRunId || selectedRunIdRef.current) return;
+
+    // Switch to the tab that just finished
+    setActiveTab(finishedTab);
+    setRunsPage(0);
+    setStepsExpanded(false);
+
+    // Delay auto-select so backend has time to commit step="done" before the
+    // runs-list re-fetch arrives (also delayed 1.5s).
+    fetchRuns(1500);
+    setTimeout(() => {
+      if (selectedRunIdRef.current) return; // user picked something else during delay
+      setSelectedRunId(finishedRunId);
+      setSelectedRunEvents([]);
+      setSelectedRunLoading(true);
+      apiFetch(`/pipeline/runs/${finishedRunId}`)
+        .then(r => r.ok ? r.json() : null)
+        .then(eventsData => { if (eventsData) setSelectedRunEvents(eventsData.events ?? []); })
+        .catch(() => {})
+        .finally(() => setSelectedRunLoading(false));
+    }, 1500);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [researchRunning, tradeRunning, evalRunning]);
 
   const viewingLive = selectedRunId === null;
   // Live events per tab — use tab-specific events, fall back to shared pipelineEvents
