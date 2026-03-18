@@ -480,15 +480,35 @@ def get_pipeline_events(db: Session = Depends(get_db)):
 
 
 @protected.get("/pipeline/runs")
-def get_pipeline_runs(db: Session = Depends(get_db)):
-    """Returns a summary list of all past pipeline runs, newest first."""
-    cached = cache_get("pipeline_runs")
+def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
+    """Returns a summary list of past pipeline runs, newest first.
+    Optional ?type=research|trade|eval filters to a specific pipeline type.
+    """
+    cache_key = f"pipeline_runs_{type or 'all'}"
+    cached = cache_get(cache_key)
     if cached:
         return cached
     from sqlalchemy import func, or_, case
 
+    # ── Resolve run_ids for the requested type ────────────────────────────────
+    # Map frontend tab names to DB run_type values
+    _TYPE_MAP = {
+        "research": ["research"],
+        "trade":    ["trade", "debate"],
+        "eval":     ["eval"],
+    }
+    if type and type in _TYPE_MAP:
+        typed_run_ids = {
+            r.run_id for r in db.query(models.PipelineRun.run_id)
+            .filter(models.PipelineRun.run_type.in_(_TYPE_MAP[type])).all()
+        }
+        if not typed_run_ids:
+            return []
+    else:
+        typed_run_ids = None  # fetch all
+
     # ── 1 query: run summaries (started, ended, event count) ─────────────────
-    rows = (
+    q = (
         db.query(
             models.PipelineEvent.run_id,
             func.min(models.PipelineEvent.created_at).label("started_at"),
@@ -497,9 +517,10 @@ def get_pipeline_runs(db: Session = Depends(get_db)):
         )
         .group_by(models.PipelineEvent.run_id)
         .order_by(func.min(models.PipelineEvent.created_at).desc())
-        .limit(50)
-        .all()
     )
+    if typed_run_ids is not None:
+        q = q.filter(models.PipelineEvent.run_id.in_(typed_run_ids))
+    rows = q.limit(20).all()
     if not rows:
         return []
 
@@ -1373,7 +1394,7 @@ def exit_market_positions(market_name: str, db: Session = Depends(get_db)):
 
     db.commit()
     cache_invalidate("debates")
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     return {"closed": closed, "count": len(closed)}
 
 # --- Approval Mode Config ---
@@ -1421,7 +1442,7 @@ def approve_strategy(action: ApprovalAction, db: Session = Depends(get_db)):
         return {"error": "Invalid action. Use 'approve' or 'reject'."}
     db.commit()
     cache_invalidate("debates")
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     return {"status": strategy.status, "id": strategy.id}
 
 # --- Manual Trigger & Scheduling ---
@@ -1465,7 +1486,7 @@ def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depend
     t.start()
 
     # Invalidate all caches that are affected by a pipeline run completing
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     cache_invalidate("debates")
     cache_invalidate("research")
     cache_invalidate("memory_all")
@@ -1493,7 +1514,7 @@ def trigger_research(db: Session = Depends(get_db)):
     t = threading.Thread(target=run_research_pipeline, args=(run_id,), daemon=True)
     t.start()
 
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     cache_invalidate("research")
     cache_invalidate("kg_full")
     cache_invalidate_prefix("kg_ticker:")
@@ -1521,7 +1542,7 @@ def trigger_trade(db: Session = Depends(get_db)):
     t = threading.Thread(target=run_trade_pipeline, args=(run_id,), daemon=True)
     t.start()
 
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     cache_invalidate("debates")
     cache_invalidate("memory_all")
     cache_invalidate("agents_fitness")
@@ -1554,7 +1575,7 @@ def trigger_eval(db: Session = Depends(get_db)):
                 pass
             finally:
                 _db.close()
-            cache_invalidate("pipeline_runs")
+            cache_invalidate_prefix("pipeline_runs_")
             cache_invalidate("agents_fitness")
             cache_invalidate("memory_all")
             cache_invalidate_prefix("agent_evolution:")
@@ -1562,7 +1583,7 @@ def trigger_eval(db: Session = Depends(get_db)):
     t = threading.Thread(target=_run_eval_and_release, daemon=True)
     t.start()
 
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     return {"status": "success", "message": "Evaluation pipeline started.", "run_id": run_id}
 
 
@@ -1650,7 +1671,7 @@ def stop_pipeline(body: StopRequest = StopRequest(), db: Session = Depends(get_d
         if conf:
             conf.value = "0"
     db.commit()
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     cache_invalidate_prefix("pipeline_events")
     return {"status": "stopped"}
 
@@ -1687,7 +1708,7 @@ def resume_pipeline_run(run_id: str, db: Session = Depends(get_db)):
     from pipeline.runner import resume_pipeline
     t = threading.Thread(target=resume_pipeline, args=(run_id,), daemon=True)
     t.start()
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     return {"status": "resuming", "run_id": run_id, "from_step": run.step}
 
 def _get_schedule_interval(db: Session) -> int:
@@ -1799,7 +1820,7 @@ def undeploy_strategy(strategy_id: int, db: Session = Depends(get_db)):
     s.closed_at = dt.utcnow()
     db.commit()
     cache_invalidate("debates")
-    cache_invalidate("pipeline_runs")
+    cache_invalidate_prefix("pipeline_runs_")
     return _strategy_to_dict(s)
 
 

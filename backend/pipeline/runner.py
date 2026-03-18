@@ -111,8 +111,8 @@ def run_research_pipeline(run_id: str):
         db.close()
 
     _tag_run_events(run_id, "research")
-    from core.cache import cache_invalidate
-    cache_invalidate("pipeline_runs")
+    from core.cache import cache_invalidate, cache_invalidate_prefix
+    cache_invalidate_prefix("pipeline_runs_")
 
 
 def run_trade_pipeline(run_id: str):
@@ -645,8 +645,8 @@ def pipeline_deploy(run_id: str):
         _log(db, run_id, "MEMORY_WRITE", "DONE", "Pipeline complete")
 
         # Invalidate runs list cache so frontend sees new run immediately
-        from core.cache import cache_invalidate
-        cache_invalidate("pipeline_runs")
+        from core.cache import cache_invalidate, cache_invalidate_prefix
+        cache_invalidate_prefix("pipeline_runs_")
 
     except Exception as e:
         _log(db, run_id, "DEPLOY", "ERROR", str(e)[:300])
@@ -655,7 +655,7 @@ def pipeline_deploy(run_id: str):
             run.step = "error"
         _release_lock(db, _lock_key_for_run(run))
         db.commit()
-        from core.cache import cache_invalidate
-        cache_invalidate("pipeline_runs")
+        from core.cache import cache_invalidate, cache_invalidate_prefix
+        cache_invalidate_prefix("pipeline_runs_")
     finally:
         db.close()

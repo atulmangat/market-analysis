@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react';
 import type { PipelineEvent, PipelineRun, WebResearch, PipelineReadiness } from '../types';
 import { STEP_META, MARKET_SECTORS, MARKET_ICONS, TICKER_DB } from '../constants';
 import { apiFetch, getMarketForTicker } from '../utils';
@@ -39,7 +39,7 @@ interface PipelinePagesProps {
   scheduleEval: number;
   pipelineReadiness: PipelineReadiness;
   setResearchStepOpen: (v: boolean | ((prev: boolean) => boolean)) => void;
-  setPipelineRuns: (runs: PipelineRun[]) => void;
+  setPipelineRuns: Dispatch<SetStateAction<PipelineRun[]>>;
   setPipelineRunsLoaded: (v: boolean) => void;
   setSelectedRunId: (id: string | null) => void;
   setSelectedRunEvents: (evts: PipelineEvent[]) => void;
@@ -216,27 +216,35 @@ export function PipelinePage({
   selectedRunIdRef.current = selectedRunId;
 
   // ── Lazy-load pipeline runs per tab ─────────────────────────────────────────
-  const fetchRuns = (delay = 0) => {
+  // Fetch runs for a specific tab type and merge into the shared pipelineRuns list.
+  // This avoids loading all 50 runs up-front — each tab loads its own 20 on first open.
+  const fetchRuns = (tab: PipelineTab, delay = 0) => {
     const doFetch = () =>
-      apiFetch('/pipeline/runs')
+      apiFetch(`/pipeline/runs?type=${tab}`)
         .then(r => r.ok ? r.json() : null)
-        .then(runs => {
-          if (runs) {
-            setPipelineRuns(runs);
-            setPipelineRunsLoaded(true);
-          }
+        .then((incoming: PipelineRun[] | null) => {
+          if (!incoming) return;
+          // Merge: keep runs from other tabs already loaded, add/replace for this tab
+          setPipelineRuns(prev => {
+            const map = new Map(prev.map(r => [r.run_id, r]));
+            incoming.forEach(r => map.set(r.run_id, r));
+            return Array.from(map.values()).sort(
+              (a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime()
+            );
+          });
+          setPipelineRunsLoaded(true);
         })
         .catch(() => { setPipelineRunsLoaded(true); });
     if (delay > 0) setTimeout(doFetch, delay);
     else doFetch();
   };
 
-  // Re-fetch runs on tab switch
-  const prevActiveTabRef = useRef(activeTab);
+  // Re-fetch runs for the newly active tab on switch
+  const prevActiveTabRef = useRef<PipelineTab | null>(null);
   useEffect(() => {
     if (prevActiveTabRef.current !== activeTab) {
       prevActiveTabRef.current = activeTab;
-      fetchRuns(0);
+      fetchRuns(activeTab, 0);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
@@ -267,7 +275,7 @@ export function PipelinePage({
 
     // Delay auto-select so backend has time to commit step="done" before the
     // runs-list re-fetch arrives (also delayed 1.5s).
-    fetchRuns(1500);
+    fetchRuns(finishedTab, 1500);
     setTimeout(() => {
       if (selectedRunIdRef.current) return; // user picked something else during delay
       setSelectedRunId(finishedRunId);
