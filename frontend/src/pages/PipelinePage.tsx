@@ -239,11 +239,13 @@ export function PipelinePage({
     else doFetch();
   };
 
-  // Re-fetch runs for the newly active tab on switch
+  // Re-fetch runs for the newly active tab on switch.
+  // Reset loaded flag so the skeleton shows instead of "No runs yet" while fetching.
   const prevActiveTabRef = useRef<PipelineTab | null>(null);
   useEffect(() => {
     if (prevActiveTabRef.current !== activeTab) {
       prevActiveTabRef.current = activeTab;
+      setPipelineRunsLoaded(false);
       fetchRuns(activeTab, 0);
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
