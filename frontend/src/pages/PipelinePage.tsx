@@ -75,15 +75,15 @@ const TRADE_ORDERED_STEPS = [
 
 // Evaluation pipeline steps
 const EVAL_ORDERED_STEPS = [
-  'START', 'PRICE_FETCH', 'SCORE_STRATEGIES', 'CLOSE_POSITIONS', 'AGENT_ANALYSIS', 'DARWIN_SELECTION', 'MEMORY_WRITE',
+  'START', 'PRICE_FETCH', 'SCORE_STRATEGIES', 'POSITION_REVIEW', 'AGENT_ANALYSIS', 'DARWIN_SELECTION', 'MEMORY_WRITE',
 ];
 
 const EVAL_STEP_LABELS: Record<string, string> = {
   START:             'Initialising',
   PRICE_FETCH:       'Fetching Live Prices',
   SCORE_STRATEGIES:  'Scoring Strategies',
-  CLOSE_POSITIONS:   'Closing Positions',
-  AGENT_ANALYSIS:    'Post-Mortem Analysis',
+  POSITION_REVIEW:   'Reviewing Positions',
+  AGENT_ANALYSIS:    'Agent Analysis',
   DARWIN_SELECTION:  'Evolving Agents',
   MEMORY_WRITE:      'Writing Lessons',
 };
@@ -448,7 +448,7 @@ export function PipelinePage({
                 }`}>
                   {isDone ? <span className="text-up text-[9px] font-bold">✓</span>
                     : <span className={isCurrent ? 'text-purple-400' : 'text-textDim'}>
-                        {s === 'PRICE_FETCH' ? '₿' : s === 'SCORE_STRATEGIES' ? '⚖' : s === 'CLOSE_POSITIONS' ? '✕' :
+                        {s === 'PRICE_FETCH' ? '₿' : s === 'SCORE_STRATEGIES' ? '⚖' : s === 'POSITION_REVIEW' ? '🔍' :
                          s === 'AGENT_ANALYSIS' ? '🔬' : s === 'DARWIN_SELECTION' ? '🧬' : '·'}
                       </span>
                   }
@@ -499,7 +499,7 @@ export function PipelinePage({
     // Extract key data from events
     const priceFetchEvent = events.find(e => e.step === 'PRICE_FETCH' && e.status === 'DONE');
     const scoringEvent = events.find(e => e.step === 'SCORE_STRATEGIES' && e.status === 'DONE');
-    const closingEvent = events.find(e => e.step === 'CLOSE_POSITIONS' && e.status === 'DONE');
+    const reviewEvent = events.find(e => e.step === 'POSITION_REVIEW' && e.status === 'DONE');
     const darwinEvent = events.find(e => e.step === 'DARWIN_SELECTION' && e.status === 'DONE');
     const memoryEvent = events.find(e => e.step === 'MEMORY_WRITE' && e.status === 'DONE');
 
@@ -617,14 +617,14 @@ export function PipelinePage({
             </div>
           )}
 
-          {/* Closed positions */}
-          {closingEvent && (
+          {/* Position review summary */}
+          {reviewEvent && (
             <div className="rounded-xl border border-borderLight bg-surface2 overflow-hidden">
               <div className="px-4 py-2.5 border-b border-borderLight bg-surface3">
-                <span className="text-[10px] font-bold uppercase tracking-widest text-textDim">Positions Closed</span>
+                <span className="text-[10px] font-bold uppercase tracking-widest text-textDim">Position Review</span>
               </div>
               <div className="px-4 py-3">
-                <p className="text-[11px] text-textMuted">{closingEvent.detail}</p>
+                <p className="text-[11px] text-textMuted">{reviewEvent.detail}</p>
               </div>
             </div>
           )}
@@ -1028,8 +1028,8 @@ export function PipelinePage({
       { step: 'START',            label: 'Initialise',           desc: 'Acquire lock and load active strategies' },
       { step: 'PRICE_FETCH',      label: 'Fetch Live Prices',    desc: 'Pull current market prices for all open positions' },
       { step: 'SCORE_STRATEGIES', label: 'Score Strategies',     desc: 'Compute P&L, win rate, and fitness for each agent\'s predictions' },
-      { step: 'CLOSE_POSITIONS',  label: 'Close Positions',      desc: 'Apply stop-loss (−10%) and take-profit (+15%) rules automatically' },
-      { step: 'AGENT_ANALYSIS',   label: 'Post-Mortem Analysis', desc: 'LLM analyses what each agent saw, what went wrong, and root causes' },
+      { step: 'POSITION_REVIEW',  label: 'Review Positions',     desc: 'LLM reviews each open position\'s live thesis and interim P&L' },
+      { step: 'AGENT_ANALYSIS',   label: 'Agent Analysis',       desc: 'Per-agent LLM insight on what is working, what needs adjusting' },
       { step: 'DARWIN_SELECTION', label: 'Evolve Agents',        desc: 'Underperforming agents get their prompts mutated via Darwin selection' },
       { step: 'MEMORY_WRITE',     label: 'Write Lessons',        desc: 'Store LESSON and STRATEGY_RESULT notes to agent memory' },
     ],
@@ -1127,7 +1127,7 @@ export function PipelinePage({
       // Determine pipeline type: use run.run_type if loaded, otherwise sniff events
       // (eval events contain PRICE_FETCH/SCORE_STRATEGIES/DARWIN_SELECTION which never
       // appear in trade/research — avoids misclassification during lazy-load race).
-      const EVAL_STEPS = new Set(['PRICE_FETCH', 'SCORE_STRATEGIES', 'CLOSE_POSITIONS', 'DARWIN_SELECTION', 'AGENT_ANALYSIS']);
+      const EVAL_STEPS = new Set(['PRICE_FETCH', 'SCORE_STRATEGIES', 'POSITION_REVIEW', 'DARWIN_SELECTION', 'AGENT_ANALYSIS']);
       const RESEARCH_STEPS = new Set(['WEB_RESEARCH', 'KG_INGEST']);
       const eventsHaveEvalSteps = panelEvents.some(e => EVAL_STEPS.has(e.step));
       const eventsHaveResearchSteps = !eventsHaveEvalSteps && panelEvents.some(e => RESEARCH_STEPS.has(e.step)) && !panelEvents.some(e => e.step === 'DEBATE_PANEL');

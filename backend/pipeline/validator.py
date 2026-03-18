@@ -667,11 +667,12 @@ def evaluate_predictions(run_id: str = None):
     """
     Exhaustive evaluation pipeline:
     1. Create a PipelineRun of type "eval"
-    2. PRICE_FETCH — score active deployed strategies against live prices
-    3. SCORE_STRATEGIES — update prediction scores
-    4. CLOSE_POSITIONS — close at stop-loss / take-profit with exhaustive post-mortem analysis
-    5. DARWIN_SELECTION — evolve underperforming agents using post-mortem insights
-    6. MEMORY_WRITE — write final lessons and prune old memory
+    2. PRICE_FETCH — fetch live prices for all open positions
+    3. SCORE_STRATEGIES — update current_return on every open position
+    4. POSITION_REVIEW — LLM analyses each open position's live thesis (no closing)
+    5. AGENT_ANALYSIS — per-agent LLM review emitted per position
+    6. DARWIN_SELECTION — evolve underperforming agents using live-review insights
+    7. MEMORY_WRITE — write lessons and prune old memory
     """
     db = SessionLocal()
     if not run_id:
@@ -729,7 +730,6 @@ def evaluate_predictions(run_id: str = None):
         _update_run(db, run, "score_strategies")
 
         score_lines = []
-        strategies_to_close = []
         for strategy in active_strategies:
             current_price = price_data.get(strategy.id)
             if not current_price:
@@ -757,39 +757,28 @@ def evaluate_predictions(run_id: str = None):
                 except Exception:
                     pass
 
-            # Auto-close disabled — positions are closed manually only
-            # if pct_return <= STOP_LOSS_PCT:
-            #     strategies_to_close.append((strategy, current_price, pct_return, "STOP_LOSS"))
-            # elif pct_return >= TAKE_PROFIT_PCT:
-            #     strategies_to_close.append((strategy, current_price, pct_return, "TAKE_PROFIT"))
 
         db.commit()
 
         _log(db, run_id, "SCORE_STRATEGIES", "DONE",
              "\n".join(score_lines) if score_lines else "No positions to score")
 
-        # ── CLOSE_POSITIONS + EXHAUSTIVE ANALYSIS ────────────────────────────
-        _log(db, run_id, "CLOSE_POSITIONS", "IN_PROGRESS",
-             f"{len(strategies_to_close)} position(s) hit threshold — running exhaustive post-mortem analysis")
-        _update_run(db, run, "close_positions")
+        # ── POSITION_REVIEW — LLM analysis of every open position ────────────
+        # Positions are never closed here; we learn from live P&L instead.
+        _log(db, run_id, "POSITION_REVIEW", "IN_PROGRESS",
+             f"Analysing {len(active_strategies)} open position(s) — agents review their live thesis")
+        _update_run(db, run, "position_review")
 
         # {agent_name: [analysis_dict, ...]} accumulated for Darwin selection
         agent_analysis_map: dict[str, list] = {}
 
-        for strategy, current_price, pct_return, close_reason in strategies_to_close:
-            strategy.status = "CLOSED"
-            strategy.exit_price = current_price
-            strategy.close_reason = close_reason
-            strategy.closed_at = datetime.utcnow()
-            if strategy.position_size:
-                strategy.realized_pnl = round(strategy.position_size * pct_return / 100, 2)
-            db.commit()
+        for strategy in active_strategies:
+            current_price = price_data.get(strategy.id)
+            if not current_price:
+                continue
+            pct_return = strategy.current_return or 0.0
 
-            outcome = "WIN" if close_reason == "TAKE_PROFIT" else "LOSS"
-            _log(db, run_id, "CLOSE_POSITIONS", "IN_PROGRESS",
-                 f"Closed {strategy.symbol} ({strategy.strategy_type}): {close_reason} at {pct_return:+.2f}%")
-
-            # Find all agents that predicted this symbol — run exhaustive analysis per agent
+            # Find the most recent agent prediction for this symbol
             agent_preds = (
                 db.query(models.AgentPrediction)
                 .filter(models.AgentPrediction.symbol == strategy.symbol)
@@ -799,72 +788,33 @@ def evaluate_predictions(run_id: str = None):
             )
 
             for pred in agent_preds:
+                # Outcome label: still open but we can characterise direction
+                interim_outcome = "WINNING" if pct_return >= 0 else "LOSING"
                 analysis = _exhaustive_agent_analysis(
-                    db, run_id, pred.agent_name, pred, strategy, pct_return, outcome
+                    db, run_id, pred.agent_name, pred, strategy, pct_return, interim_outcome
                 )
                 if analysis:
                     analysis["symbol"] = strategy.symbol
-                    analysis["outcome"] = outcome
+                    analysis["outcome"] = interim_outcome
                     if pred.agent_name not in agent_analysis_map:
                         agent_analysis_map[pred.agent_name] = []
                     agent_analysis_map[pred.agent_name].append(analysis)
 
-                    # Write improvement rules as memory
-                    if analysis.get("improvement_rules"):
+                    # Write lessons as memory so agents learn even without closing
+                    if analysis.get("IMPROVEMENT_RULES") or analysis.get("improvement_rules"):
+                        rules = analysis.get("IMPROVEMENT_RULES") or analysis.get("improvement_rules", "")
                         write_agent_memory(
                             db, pred.agent_name, "LESSON",
-                            f"[Post-mortem {strategy.symbol} {outcome}] {analysis['improvement_rules'][:400]}",
-                            importance_score=0.85,
+                            f"[Live review {strategy.symbol} {interim_outcome} {pct_return:+.2f}%] {rules[:400]}",
+                            importance_score=0.75,
                             ticker_refs=strategy.symbol,
                         )
-                    if analysis.get("what_went_wrong") or analysis.get("WHAT_WENT_WRONG"):
-                        wrong = analysis.get("WHAT_WENT_WRONG") or analysis.get("what_went_wrong", "")
-                        if wrong:
-                            write_agent_memory(
-                                db, pred.agent_name, "OBSERVATION",
-                                f"[Post-mortem {strategy.symbol}] What went {'right' if outcome=='WIN' else 'wrong'}: {wrong[:300]}",
-                                importance_score=0.75,
-                                ticker_refs=strategy.symbol,
-                            )
                     db.commit()
 
-            # Write closure lessons via existing helper
-            _write_closure_feedback(db, strategy, pct_return, close_reason)
-
-        closed_count = len(strategies_to_close)
-        if closed_count == 0:
-            _log(db, run_id, "CLOSE_POSITIONS", "DONE", "No positions closed this run")
-        else:
-            _log(db, run_id, "CLOSE_POSITIONS", "DONE",
-                 f"Closed {closed_count} position(s). Post-mortems completed for {len(agent_analysis_map)} agent(s).")
-
-        # ── AGENT_ANALYSIS on live (open) positions ───────────────────────────
-        # Even when nothing closes, agents review their active positions'
-        # current P&L and update their strategy notes.
-        open_strategies = [s for s in active_strategies if s.status in ("ACTIVE", "PENDING")]
-        if open_strategies and not strategies_to_close:
-            _log(db, run_id, "AGENT_ANALYSIS", "IN_PROGRESS",
-                 f"Reviewing {len(open_strategies)} open position(s) — interim performance check")
-            for strategy in open_strategies:
-                current_price = price_data.get(strategy.id)
-                if not current_price:
-                    continue
-                pct_return = strategy.current_return or 0.0
-                direction = "+" if pct_return >= 0 else ""
-                # Find predictions for this strategy's symbol
-                preds = (
-                    db.query(models.AgentPrediction)
-                    .filter(models.AgentPrediction.symbol == strategy.symbol)
-                    .order_by(models.AgentPrediction.timestamp.desc())
-                    .limit(3)
-                    .all()
-                )
-                for pred in preds:
-                    _log(db, run_id, "AGENT_ANALYSIS", "DONE",
-                         f"{pred.agent_name} → {strategy.strategy_type} {strategy.symbol} | "
-                         f"entry=${strategy.entry_price:.4f} → now=${current_price:.4f} | "
-                         f"return={direction}{pct_return:.2f}% | position still OPEN",
-                         agent_name=pred.agent_name)
+        reviewed_count = len(active_strategies)
+        _log(db, run_id, "POSITION_REVIEW", "DONE",
+             f"Reviewed {reviewed_count} open position(s). "
+             f"LLM analysis complete for {len(agent_analysis_map)} agent(s).")
 
         # ── DARWIN_SELECTION ──────────────────────────────────────────────────
         _update_run(db, run, "darwin_selection")
@@ -887,8 +837,8 @@ def evaluate_predictions(run_id: str = None):
             evolved_summary = f" Evolved: {', '.join(a['agent'] for a in evolved)}."
 
         _log(db, run_id, "START", "DONE",
-             f"Evaluation complete. {len(active_strategies)} positions scored, "
-             f"{closed_count} closed.{evolved_summary}")
+             f"Evaluation complete. {len(active_strategies)} position(s) reviewed, "
+             f"{len(agent_analysis_map)} agent(s) analysed.{evolved_summary}")
         _update_run(db, run, "done")
 
     except Exception as e:
