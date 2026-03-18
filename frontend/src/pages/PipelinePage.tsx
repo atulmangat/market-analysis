@@ -186,7 +186,7 @@ export function PipelinePage({
   isTriggering: _isTriggering, researchRunning, tradeRunning, evalRunning,
   currentRunIdResearch, currentRunIdTrade, currentRunIdEval,
   researchEvents, tradeEvents, evalEvents,
-  pipelineEvents, pipelineRunId: _pipelineRunId, pipelineRuns, pipelineRunsLoaded,
+  pipelineEvents, pipelineRunId: _pipelineRunId, pipelineRuns, pipelineRunsLoaded: _pipelineRunsLoaded,
   selectedRunId, selectedRunEvents, selectedRunLoading, research, researchStepOpen,
   enabledMarketNames, investmentFocus, investmentFocusSaved,
   focusTickers, focusSearch, focusSearchOpen, focusSectorFilter,
