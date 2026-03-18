@@ -428,20 +428,26 @@ def pipeline_consensus(run_id: str):
         ctx_data = json.loads(run.shared_context)
         shared_context = ctx_data["context"]
 
-        # Budget context for judge
+        # Budget context for judge — include both ACTIVE and PENDING positions
         budget_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "trading_budget").first()
         total_budget = float(budget_conf.value) if budget_conf else 10000.0
-        active_strats = db.query(models.DeployedStrategy).filter(models.DeployedStrategy.status == "ACTIVE").all()
-        allocated = sum(s.position_size or 0.0 for s in active_strats)
+        open_strats = db.query(models.DeployedStrategy).filter(
+            models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"])
+        ).all()
+        allocated = sum(s.position_size or 0.0 for s in open_strats)
         available = total_budget - allocated
-        open_positions = ", ".join(f"{s.strategy_type} {s.symbol}" for s in active_strats) or "none"
+        open_positions_lines = "\n".join(
+            f"  • {s.strategy_type} {s.symbol} @ ${s.entry_price:.4f} | status: {s.status}"
+            for s in open_strats
+        ) if open_strats else "  (none)"
         budget_context = (
             f"## Portfolio Budget Context\n"
             f"- Total budget: ${total_budget:,.2f}\n"
             f"- Allocated to open positions: ${allocated:,.2f}\n"
             f"- Available capital: ${available:,.2f}\n"
-            f"- Open positions: {open_positions}\n"
-            f"Only recommend a new trade if sufficient capital is available."
+            f"- Open positions (ACTIVE + PENDING — do NOT open a new trade for these tickers; use UPDATE_LONG/UPDATE_SHORT instead):\n"
+            f"{open_positions_lines}\n"
+            f"Only recommend a new trade if sufficient capital is available and the ticker has no existing open position."
         )
 
         market_constraint = build_market_constraint(json.loads(run.enabled_markets_json))
@@ -501,23 +507,21 @@ def pipeline_deploy(run_id: str):
         deployed_strategies = []
         for verdict in verdicts:
             best_ticker = verdict["ticker"]
-            best_action = verdict["action"]
+            raw_action  = verdict["action"].upper()
+            # Normalise UPDATE_LONG/UPDATE_SHORT → LONG/SHORT for strategy_type storage
+            is_update   = raw_action.startswith("UPDATE_")
+            best_action = raw_action.replace("UPDATE_", "")   # "LONG" or "SHORT"
             judge_reasoning = verdict["reasoning"]
 
             signal = fetch_market_data(best_ticker)
-            entry_price = signal.price if signal else 0.0
+            current_price = signal.price if signal else 0.0
 
             agreeing = sum(1 for p in proposals_log
-                           if p["ticker"] == best_ticker and p["action"] == best_action)
+                           if p["ticker"] == best_ticker
+                           and p["action"].replace("UPDATE_", "") == best_action)
             votes_str = f"{agreeing}/{len(proposals_log)}"
 
-            summary_text = (
-                f"Judge selected {best_action} {best_ticker} at ${entry_price:.4f}. "
-                f"{agreeing}/{len(proposals_log)} agents agreed. "
-                f"Rationale: {judge_reasoning[:200]}"
-            )
-
-            # Enforce 1 strategy per ticker
+            # Enforce 1 strategy per ticker — always update if one exists
             existing = (
                 db.query(models.DeployedStrategy)
                 .filter(
@@ -529,19 +533,33 @@ def pipeline_deploy(run_id: str):
             )
             if existing:
                 action_changed = existing.strategy_type != best_action
+                # For UPDATE actions keep entry price; for direction change reset it
+                entry_price = existing.entry_price if not action_changed else current_price
+                summary_text = (
+                    f"{'Direction reversed to ' + best_action if action_changed else 'Updated'} "
+                    f"{best_ticker} @ ${entry_price:.4f} (current: ${current_price:.4f}). "
+                    f"{votes_str} agents agreed. Rationale: {judge_reasoning[:200]}"
+                )
                 existing.strategy_type     = best_action
-                existing.entry_price       = entry_price
                 existing.reasoning_summary = summary_text
                 existing.status            = initial_status
                 existing.notes = (
-                    f"{'Direction reversed to ' + best_action + ' — ' if action_changed else 'Reaffirmed '}"
-                    f"{votes_str} agents agreed."
+                    f"{'Direction reversed to ' + best_action + ' — ' if action_changed else 'Reaffirmed — '}"
+                    f"{votes_str} agents agreed. Thesis updated by judge."
                 )
-                existing.exit_price   = None
-                existing.close_reason = None
-                existing.closed_at    = None
+                if action_changed:
+                    existing.entry_price   = current_price
+                    existing.exit_price    = None
+                    existing.close_reason  = None
+                    existing.closed_at     = None
                 strategy = existing
             else:
+                entry_price  = current_price
+                summary_text = (
+                    f"Judge selected {best_action} {best_ticker} at ${entry_price:.4f}. "
+                    f"{votes_str} agents agreed. "
+                    f"Rationale: {judge_reasoning[:200]}"
+                )
                 strategy = models.DeployedStrategy(
                     symbol=best_ticker,
                     strategy_type=best_action,

@@ -1329,6 +1329,11 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
 
     # Determine enabled tickers for validation
     proposed_tickers = {p["ticker"] for p in proposals_log}
+    # Open-position tickers are always valid (judge may issue UPDATE actions for them)
+    open_position_tickers = {
+        s.symbol for s in db.query(models.DeployedStrategy)
+        .filter(models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"])).all()
+    }
     all_enabled_tickers: set[str] = set()
     if market_constraint:
         for tickers in MARKET_TICKERS.values():
@@ -1336,10 +1341,14 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
                 if t in market_constraint:
                     all_enabled_tickers.add(t)
 
-    def _validate_ticker(ticker: str | None) -> str | None:
+    def _validate_ticker(ticker: str | None, action: str | None = None) -> str | None:
         if not ticker or ticker == "HOLD":
             return None
         ticker = ticker.upper().strip()
+        is_update = action and action.upper().startswith("UPDATE_")
+        # UPDATE actions are valid for any existing open-position ticker
+        if is_update and ticker in open_position_tickers:
+            return ticker
         if ticker not in proposed_tickers:
             return None
         if all_enabled_tickers and ticker not in all_enabled_tickers:
@@ -1359,8 +1368,8 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
         reason_m  = re.search(rf"POSITION_{n}_REASONING:\s*(.+?)(?=POSITION_\d|$)", response, re.IGNORECASE | re.DOTALL)
         if not ticker_m:
             break
-        ticker = _validate_ticker(ticker_m.group(1) if ticker_m else None)
         action = action_m.group(1).upper() if action_m else None
+        ticker = _validate_ticker(ticker_m.group(1) if ticker_m else None, action)
         if ticker and action and ticker not in seen_tickers:
             verdicts.append({
                 "ticker":    ticker,
