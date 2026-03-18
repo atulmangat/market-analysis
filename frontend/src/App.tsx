@@ -125,7 +125,6 @@ function AppInner() {
 
   // Dashboard inline timeline
   const [expandedDebateId, setExpandedDebateId]   = useState<number | null>(null);
-  const [timelineTicker, setTimelineTicker]       = useState<string | null>(null);
 
 
 
@@ -664,8 +663,6 @@ function AppInner() {
             setExpandedStratTicker={setExpandedStratTicker}
             expandedDebateId={expandedDebateId}
             setExpandedDebateId={setExpandedDebateId}
-            timelineTicker={timelineTicker}
-            setTimelineTicker={setTimelineTicker}
             editStratId={editStratId}
             setEditStratId={setEditStratId}
             editStratForm={editStratForm}

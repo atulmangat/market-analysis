@@ -19,14 +19,12 @@ interface DashboardPageProps {
   activeStratMarket: string;
   expandedStratTicker: string | null;
   expandedDebateId: number | null;
-  timelineTicker: string | null;
   statFocus: 'active' | 'pending' | 'debates' | 'memories' | null;
   editStratId: number | null;
   editStratForm: { position_size: string; notes: string };
   setExpandedStratMarket: (m: string) => void;
   setExpandedStratTicker: (t: string | null) => void;
   setExpandedDebateId: (id: number | null) => void;
-  setTimelineTicker: (t: string | null) => void;
   setStatFocus: (f: 'active' | 'pending' | 'debates' | 'memories' | null) => void;
   setEditStratId: (id: number | null) => void;
   setEditStratForm: (f: { position_size: string; notes: string }) => void;
@@ -41,9 +39,9 @@ export function DashboardPage({
   activeStrategies, pendingStrategies, debates, memories, groupedMemories,
   debatesByMarketAndTicker, strategiesByMarketAndTicker, marketsWithStrategies,
   activeStratMarket, expandedStratTicker,
-  expandedDebateId, timelineTicker, statFocus, editStratId, editStratForm,
+  expandedDebateId, statFocus, editStratId, editStratForm,
   setExpandedStratMarket, setExpandedStratTicker, setExpandedDebateId,
-  setTimelineTicker, setStatFocus, setEditStratId, setEditStratForm,
+  setStatFocus, setEditStratId, setEditStratForm,
   handleApproval, handleUndeploy, handleStrategyUpdate, openReport,
 }: DashboardPageProps) {
 
@@ -151,7 +149,7 @@ export function DashboardPage({
                       return (
                         <div key={ticker}>
                           <button className="w-full flex items-center justify-between px-5 py-4 hover:bg-surface2 transition-colors text-left group"
-                            onClick={() => { setExpandedStratTicker(isOpen ? null : ticker); if (!isOpen) setTimelineTicker(ticker); else setTimelineTicker(null); }}>
+                            onClick={() => setExpandedStratTicker(isOpen ? null : ticker)}>
                             <div className="flex items-center gap-3">
                               <div className={`h-1.5 w-1.5 rounded-full ${latestStrat.strategy_type === 'LONG' ? 'bg-up' : 'bg-down'}`} />
                               <div className="h-9 w-9 rounded-lg bg-surface3 border border-borderMid flex items-center justify-center text-xs font-bold text-textMain">
@@ -227,6 +225,95 @@ export function DashboardPage({
                                   </div>
                                 </div>
                               ))}
+                              {/* ── Debate History inline (below Rationale) ── */}
+                              {(() => {
+                                const tickerDebates = Object.values(debatesByMarketAndTicker).flatMap(byTicker => byTicker[ticker] ?? []).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+                                if (tickerDebates.length === 0) return null;
+                                return (
+                                  <div className="border-t border-borderLight px-5 py-4 space-y-3 bg-surface2/30">
+                                    <p className="text-[10px] font-semibold text-textDim uppercase tracking-widest">Debate History</p>
+                                    <div className="relative border-l border-borderMid ml-2 space-y-3 pl-6 pb-1">
+                                      {tickerDebates.map(debate => {
+                                        const isExpanded = expandedDebateId === debate.id;
+                                        const proposals = parseProposals(debate.proposals_json);
+                                        const debIsLong = debate.consensus_action === 'LONG';
+                                        return (
+                                          <div key={debate.id} className="relative">
+                                            <div className={`absolute -left-[25px] top-3 h-3 w-3 rounded-full border-2 border-background ${debIsLong ? 'bg-up' : 'bg-down'}`} />
+                                            <div className={`border rounded-lg overflow-hidden transition-all ${isExpanded ? 'border-brand-500/40 bg-surface' : 'border-borderLight bg-surface hover:border-borderMid'}`}>
+                                              <button
+                                                className="w-full flex items-center justify-between px-4 py-3 text-left"
+                                                onClick={() => setExpandedDebateId(isExpanded ? null : debate.id)}
+                                              >
+                                                <div className="flex items-center gap-3">
+                                                  <Badge type={debate.consensus_action} />
+                                                  <span className="text-[11px] text-textMuted bg-surface3 px-2 py-0.5 rounded font-mono">{debate.consensus_votes} agreed</span>
+                                                  {debate.judge_reasoning && (
+                                                    <span className="text-[10px] text-amber-400 bg-amber-950/50 border border-amber-700/30 px-2 py-0.5 rounded">⚖ Judge</span>
+                                                  )}
+                                                  <span className="text-[11px] text-textDim">{new Date(debate.timestamp).toLocaleString()}</span>
+                                                </div>
+                                                <span className="text-textDim text-xs">{isExpanded ? '▲' : '▼'}</span>
+                                              </button>
+                                              {isExpanded && (
+                                                <div className="border-t border-borderLight p-4 space-y-4 bg-background/40">
+                                                  {debate.judge_reasoning && (
+                                                    <div className="bg-amber-950/30 border border-amber-700/30 rounded-lg p-4">
+                                                      <p className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider mb-2">⚖ Judge Verdict</p>
+                                                      <p className="text-[11px] text-textMuted leading-relaxed">{debate.judge_reasoning}</p>
+                                                    </div>
+                                                  )}
+                                                  <div>
+                                                    <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Agent Proposals</p>
+                                                    <div className="space-y-3">
+                                                      {proposals.map((p, i) => {
+                                                        const isWinner = p.ticker === debate.consensus_ticker && p.action === debate.consensus_action;
+                                                        return (
+                                                          <div key={i} className={`bg-surface border rounded-lg p-3 ${isWinner ? 'border-amber-500/30' : 'border-borderLight'}`}>
+                                                            <div className="flex items-center justify-between mb-2">
+                                                              <div className="flex items-center gap-2">
+                                                                <span className="text-xs font-semibold text-brand-400">{p.agent_name}</span>
+                                                                {isWinner && <span className="text-[9px] text-amber-400 bg-amber-950/50 px-1.5 py-0.5 rounded">✓ matched</span>}
+                                                              </div>
+                                                              <span className="flex items-center gap-1.5">
+                                                                <Badge type={p.action} />
+                                                                <span className="text-[10px] text-textDim font-mono">{p.ticker}</span>
+                                                              </span>
+                                                            </div>
+                                                            <p className="text-[11px] text-textMuted leading-relaxed">{p.reasoning}</p>
+                                                          </div>
+                                                        );
+                                                      })}
+                                                    </div>
+                                                  </div>
+                                                  {debate.research_context && parseProposals(debate.research_context).length > 0 && (
+                                                    <div>
+                                                      <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2">Sources Used</p>
+                                                      <ul className="space-y-1.5">
+                                                        {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
+                                                        {parseProposals(debate.research_context).map((src: any, i: number) => (
+                                                          <li key={i} className="flex items-start gap-2 text-[11px]">
+                                                            <span className="text-textDim mt-0.5 shrink-0">›</span>
+                                                            {src.url && src.url !== 'N/A' ? (
+                                                              <a href={src.url} target="_blank" rel="noreferrer" className="text-brand-400 hover:text-brand-300 hover:underline line-clamp-1">{src.title}</a>
+                                                            ) : (
+                                                              <span className="text-textMuted line-clamp-1">{src.title}</span>
+                                                            )}
+                                                          </li>
+                                                        ))}
+                                                      </ul>
+                                                    </div>
+                                                  )}
+                                                </div>
+                                              )}
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                );
+                              })()}
                             </div>
                           )}
                         </div>
@@ -301,107 +388,6 @@ export function DashboardPage({
         </div>
       </div>
 
-      {/* Inline timeline panel — shown when a ticker row is clicked */}
-      {timelineTicker && (() => {
-        const tickerDebates = Object.values(debatesByMarketAndTicker).flatMap(byTicker => byTicker[timelineTicker] ?? []).sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-        return (
-          <div className="space-y-3">
-            <div className="flex items-center justify-between">
-              <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">
-                Debate History — <span className="text-brand-400 font-mono">{timelineTicker}</span>
-              </h2>
-              <button onClick={() => { setTimelineTicker(null); setExpandedDebateId(null); }} className="text-[11px] text-textDim hover:text-textMuted px-2 py-1 rounded hover:bg-surface2 transition-colors">✕ Close</button>
-            </div>
-            {tickerDebates.length === 0 ? (
-              <Card className="p-6 text-center text-sm text-textMuted">No debate history for {timelineTicker} yet.</Card>
-            ) : (
-              <Card className="overflow-hidden">
-                <div className="px-6 py-5">
-                  <div className="relative border-l border-borderMid ml-2 space-y-4 pl-6 pb-1">
-                    {tickerDebates.map(debate => {
-                      const isExpanded = expandedDebateId === debate.id;
-                      const proposals = parseProposals(debate.proposals_json);
-                      const debIsLong = debate.consensus_action === 'LONG';
-                      return (
-                        <div key={debate.id} className="relative">
-                          <div className={`absolute -left-[25px] top-3 h-3 w-3 rounded-full border-2 border-background ${debIsLong ? 'bg-up' : 'bg-down'}`} />
-                          <div className={`border rounded-lg overflow-hidden transition-all ${isExpanded ? 'border-brand-500/40 bg-surface' : 'border-borderLight bg-surface hover:border-borderMid'}`}>
-                            <button
-                              className="w-full flex items-center justify-between px-4 py-3 text-left"
-                              onClick={() => setExpandedDebateId(isExpanded ? null : debate.id)}
-                            >
-                              <div className="flex items-center gap-3">
-                                <Badge type={debate.consensus_action} />
-                                <span className="text-[11px] text-textMuted bg-surface3 px-2 py-0.5 rounded font-mono">{debate.consensus_votes} agreed</span>
-                                {debate.judge_reasoning && (
-                                  <span className="text-[10px] text-amber-400 bg-amber-950/50 border border-amber-700/30 px-2 py-0.5 rounded">⚖ Judge</span>
-                                )}
-                                <span className="text-[11px] text-textDim">{new Date(debate.timestamp).toLocaleString()}</span>
-                              </div>
-                              <span className="text-textDim text-xs">{isExpanded ? '▲' : '▼'}</span>
-                            </button>
-                            {isExpanded && (
-                              <div className="border-t border-borderLight p-4 space-y-4 bg-background/40">
-                                {debate.judge_reasoning && (
-                                  <div className="bg-amber-950/30 border border-amber-700/30 rounded-lg p-4">
-                                    <p className="text-[10px] font-semibold text-amber-400 uppercase tracking-wider mb-2">⚖ Judge Verdict</p>
-                                    <p className="text-[11px] text-textMuted leading-relaxed">{debate.judge_reasoning}</p>
-                                  </div>
-                                )}
-                                <div>
-                                  <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-3">Agent Proposals</p>
-                                  <div className="space-y-3">
-                                    {proposals.map((p, i) => {
-                                      const isWinner = p.ticker === debate.consensus_ticker && p.action === debate.consensus_action;
-                                      return (
-                                        <div key={i} className={`bg-surface border rounded-lg p-3 ${isWinner ? 'border-amber-500/30' : 'border-borderLight'}`}>
-                                          <div className="flex items-center justify-between mb-2">
-                                            <div className="flex items-center gap-2">
-                                              <span className="text-xs font-semibold text-brand-400">{p.agent_name}</span>
-                                              {isWinner && <span className="text-[9px] text-amber-400 bg-amber-950/50 px-1.5 py-0.5 rounded">✓ matched</span>}
-                                            </div>
-                                            <span className="flex items-center gap-1.5">
-                                              <Badge type={p.action} />
-                                              <span className="text-[10px] text-textDim font-mono">{p.ticker}</span>
-                                            </span>
-                                          </div>
-                                          <p className="text-[11px] text-textMuted leading-relaxed">{p.reasoning}</p>
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                                {debate.research_context && parseProposals(debate.research_context).length > 0 && (
-                                  <div>
-                                    <p className="text-[10px] font-semibold text-textDim uppercase tracking-wider mb-2">Sources Used</p>
-                                    <ul className="space-y-1.5">
-                                      {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
-                                      {parseProposals(debate.research_context).map((src: any, i: number) => (
-                                        <li key={i} className="flex items-start gap-2 text-[11px]">
-                                          <span className="text-textDim mt-0.5 shrink-0">›</span>
-                                          {src.url && src.url !== 'N/A' ? (
-                                            <a href={src.url} target="_blank" rel="noreferrer" className="text-brand-400 hover:text-brand-300 hover:underline line-clamp-1">{src.title}</a>
-                                          ) : (
-                                            <span className="text-textMuted line-clamp-1">{src.title}</span>
-                                          )}
-                                        </li>
-                                      ))}
-                                    </ul>
-                                  </div>
-                                )}
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              </Card>
-            )}
-          </div>
-        );
-      })()}
     </div>
   );
 }
