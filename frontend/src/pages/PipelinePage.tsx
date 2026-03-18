@@ -1083,10 +1083,18 @@ export function PipelinePage({
     if (!viewingLive) {
       const run = pipelineRuns.find(r => r.run_id === selectedRunId);
       if (panelEvents.length === 0) return <p className="flex-1 flex items-center justify-center text-sm text-textMuted">No events recorded for this run.</p>;
-      // Use activeTab as primary source of truth — the run is in this tab's sidebar,
-      // so it belongs to this tab's pipeline type. Fall back to run_type only if
-      // the run object is available (avoids misclassification during lazy-load race).
-      const effectiveTab = run ? runTypeToTab(run.run_type) : activeTab;
+      // Determine pipeline type: use run.run_type if loaded, otherwise sniff events
+      // (eval events contain PRICE_FETCH/SCORE_STRATEGIES/DARWIN_SELECTION which never
+      // appear in trade/research — avoids misclassification during lazy-load race).
+      const EVAL_STEPS = new Set(['PRICE_FETCH', 'SCORE_STRATEGIES', 'CLOSE_POSITIONS', 'DARWIN_SELECTION', 'AGENT_ANALYSIS']);
+      const RESEARCH_STEPS = new Set(['WEB_RESEARCH', 'KG_INGEST']);
+      const eventsHaveEvalSteps = panelEvents.some(e => EVAL_STEPS.has(e.step));
+      const eventsHaveResearchSteps = !eventsHaveEvalSteps && panelEvents.some(e => RESEARCH_STEPS.has(e.step)) && !panelEvents.some(e => e.step === 'DEBATE_PANEL');
+      const effectiveTab = run
+        ? runTypeToTab(run.run_type)
+        : eventsHaveEvalSteps ? 'eval'
+        : eventsHaveResearchSteps ? 'research'
+        : activeTab;
       if (effectiveTab === 'eval') return renderEvalCompletedView(panelEvents, run);
       if (effectiveTab === 'research') return renderCompletedView(panelEvents, run, RESEARCH_ORDERED_STEPS);
       return renderCompletedView(panelEvents, run, TRADE_ORDERED_STEPS);
