@@ -1,6 +1,5 @@
 import os
 import json
-import threading
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -43,14 +42,19 @@ def _run_research_scheduled():
     from core.database import SessionLocal
     db = SessionLocal()
     try:
-        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-        if lock and lock.value == "1":
+        # Skip if any pipeline is already running (debate_running = legacy key; research_running = manual trigger key)
+        any_running = db.query(models.AppConfig).filter(
+            models.AppConfig.key.in_(["debate_running", "research_running", "trade_running"]),
+            models.AppConfig.value == "1",
+        ).first()
+        if any_running:
             db.close()
             return
-        if not lock:
-            db.add(models.AppConfig(key="debate_running", value="1"))
+        research_lock = db.query(models.AppConfig).filter(models.AppConfig.key == "research_running").first()
+        if not research_lock:
+            db.add(models.AppConfig(key="research_running", value="1"))
         else:
-            lock.value = "1"
+            research_lock.value = "1"
         run_id = str(_uuid.uuid4())
         run = models.PipelineRun(run_id=run_id, run_type="research", step="pending")
         db.add(run)
@@ -74,14 +78,19 @@ def _run_trade_scheduled():
     from core.database import SessionLocal
     db = SessionLocal()
     try:
-        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-        if lock and lock.value == "1":
+        # Skip if any pipeline is already running (debate_running = legacy key; trade_running = manual trigger key)
+        any_running = db.query(models.AppConfig).filter(
+            models.AppConfig.key.in_(["debate_running", "research_running", "trade_running"]),
+            models.AppConfig.value == "1",
+        ).first()
+        if any_running:
             db.close()
             return
-        if not lock:
-            db.add(models.AppConfig(key="debate_running", value="1"))
+        trade_lock = db.query(models.AppConfig).filter(models.AppConfig.key == "trade_running").first()
+        if not trade_lock:
+            db.add(models.AppConfig(key="trade_running", value="1"))
         else:
-            lock.value = "1"
+            trade_lock.value = "1"
         run_id = str(_uuid.uuid4())
         run = models.PipelineRun(run_id=run_id, run_type="trade", step="pending")
         db.add(run)
@@ -176,14 +185,20 @@ def cron_debate(focus_tickers: list[str] | None = None):
     db = SessionLocal()
     try:
         # Concurrency lock
-        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-        if lock and lock.value == "1":
+        any_running = db.query(models.AppConfig).filter(
+            models.AppConfig.key.in_(["research_running", "trade_running", "eval_running"]),
+            models.AppConfig.value == "1"
+        ).first()
+
+        if any_running:
             db.close()
             return {"status": "already_running"}
-        if not lock:
-            db.add(models.AppConfig(key="debate_running", value="1"))
+            
+        trade_lock = db.query(models.AppConfig).filter(models.AppConfig.key == "trade_running").first()
+        if not trade_lock:
+            db.add(models.AppConfig(key="trade_running", value="1"))
         else:
-            lock.value = "1"
+            trade_lock.value = "1"
 
         run_id = str(_uuid.uuid4())
         # Load investment focus
@@ -218,10 +233,8 @@ def cron_debate(focus_tickers: list[str] | None = None):
 @app.post("/api/cron/evaluate", dependencies=[Depends(_verify_cron)])
 def cron_evaluate():
     """Vercel Cron endpoint: runs the prediction evaluator."""
-    import threading
     from pipeline.validator import evaluate_predictions
-    t = threading.Thread(target=evaluate_predictions, daemon=True)
-    t.start()
+    evaluate_predictions()
     return {"status": "triggered"}
 
 

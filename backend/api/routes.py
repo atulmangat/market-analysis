@@ -425,11 +425,10 @@ def get_pipeline_events(db: Session = Depends(get_db)):
     run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
     run_id = run_id_conf.value if run_id_conf else None
 
-    is_running_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    is_running = bool(is_running_conf and is_running_conf.value == "1")
+    is_running = _is_pipeline_running(db)
 
-    # Stale-lock guard: if debate_running=1 but the run's step is done/error,
-    # or the last event is >90s old (thread died on reload), auto-clear the lock.
+    # Stale-lock guard: if is_running=true but the run's step is done/error,
+    # or the last event is >90s old (thread died on reload), auto-clear the locks.
     run_step = None
     events = []
     if run_id:
@@ -438,9 +437,13 @@ def get_pipeline_events(db: Session = Depends(get_db)):
 
         if is_running and run_step in ("done", "error"):
             is_running = False
-            if is_running_conf:
-                is_running_conf.value = "0"
-                db.commit()
+            # Clear all active locks
+            locks = db.query(models.AppConfig).filter(
+                models.AppConfig.key.in_(list(_PIPELINE_LOCK_KEYS.values()))
+            ).all()
+            for l in locks:
+                l.value = "0"
+            db.commit()
 
         rows = (
             db.query(models.PipelineEvent)
@@ -472,9 +475,12 @@ def get_pipeline_events(db: Session = Depends(get_db)):
                 age = 0
             if age > 90:
                 is_running = False
-                if is_running_conf:
-                    is_running_conf.value = "0"
-                    db.commit()
+                locks = db.query(models.AppConfig).filter(
+                    models.AppConfig.key.in_(list(_PIPELINE_LOCK_KEYS.values()))
+                ).all()
+                for l in locks:
+                    l.value = "0"
+                db.commit()
 
     return {"run_id": run_id, "is_running": is_running, "run_step": run_step, "events": events}
 
@@ -547,11 +553,18 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
 
     # ── 1 query: current run id + is_running ─────────────────────────────────
     configs = db.query(models.AppConfig).filter(
-        models.AppConfig.key.in_(["current_run_id", "debate_running"])
+        models.AppConfig.key.in_([
+            "current_run_id", "current_run_id_research", "current_run_id_trade", "current_run_id_eval"
+        ] + list(_PIPELINE_LOCK_KEYS.values()))
     ).all()
     cfg = {c.key: c.value for c in configs}
-    current_run_id = cfg.get("current_run_id")
-    is_running = cfg.get("debate_running") == "1"
+    current_run_ids = {
+        cfg.get("current_run_id"),
+        cfg.get("current_run_id_research"),
+        cfg.get("current_run_id_trade"),
+        cfg.get("current_run_id_eval"),
+    }
+    is_running = any(cfg.get(k) == "1" for k in _PIPELINE_LOCK_KEYS.values())
 
     # ── 1 query: pipeline run rows (step + params) ───────────────────────────
     pipeline_run_rows = {
@@ -593,7 +606,7 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
         step = run_steps.get(row.run_id)
         pr_row = pipeline_run_rows.get(row.run_id)
         is_eval = pr_row and getattr(pr_row, "run_type", "debate") == "eval"
-        is_current_run = row.run_id == current_run_id
+        is_current_run = row.run_id in current_run_ids
         # MEMORY_WRITE DONE is the most authoritative "complete" signal.
         # Even if there are intermediate ERROR events (e.g. KG_INGEST failed but
         # pipeline recovered), the run is "done" if MEMORY_WRITE completed.
@@ -1183,7 +1196,7 @@ Format your entire output as JSON:
         user_input += f"\nCURRENT PROMPT TO REFINE:\n{current_prompt}"
 
     try:
-        response_raw = query_agent(builder_system, user_input)
+        response_raw = query_agent(builder_system, user_input, caller="agent_builder")
         # Attempt to parse JSON from response
         import json
         import re
@@ -1340,6 +1353,7 @@ def get_research(db: Session = Depends(get_db)):
 
 @protected.get("/config/markets")
 def get_market_config(db: Session = Depends(get_db)):
+    from pipeline.orchestrator import MARKET_TICKERS
     defaults = ["Crypto", "India", "US", "MCX"]
     configs = db.query(models.MarketConfig).all()
     if not configs:
@@ -1347,7 +1361,20 @@ def get_market_config(db: Session = Depends(get_db)):
             db.add(models.MarketConfig(market_name=market, is_enabled=1))
         db.commit()
         configs = db.query(models.MarketConfig).all()
-    return [{"id": c.id, "market_name": c.market_name, "is_enabled": c.is_enabled} for c in configs]
+    result = []
+    for c in configs:
+        custom = []
+        if c.custom_tickers:
+            try: custom = json.loads(c.custom_tickers)
+            except Exception: pass
+        result.append({
+            "id": c.id,
+            "market_name": c.market_name,
+            "is_enabled": c.is_enabled,
+            "base_tickers": MARKET_TICKERS.get(c.market_name, []),
+            "custom_tickers": custom,
+        })
+    return result
 
 @protected.post("/config/markets")
 def update_market_config(updates: List[MarketUpdate], db: Session = Depends(get_db)):
@@ -1358,6 +1385,41 @@ def update_market_config(updates: List[MarketUpdate], db: Session = Depends(get_
     db.commit()
     return {"status": "success"}
 
+
+class TickerAction(BaseModel):
+    symbol: str
+
+@protected.post("/config/markets/{market_name}/tickers")
+def add_market_ticker(market_name: str, body: TickerAction, db: Session = Depends(get_db)):
+    """Add a custom ticker to a market's tradeable universe."""
+    conf = db.query(models.MarketConfig).filter(models.MarketConfig.market_name == market_name).first()
+    if not conf:
+        raise HTTPException(status_code=404, detail=f"Market {market_name} not found")
+    symbol = body.symbol.strip().upper()
+    custom = []
+    if conf.custom_tickers:
+        try: custom = json.loads(conf.custom_tickers)
+        except Exception: pass
+    if symbol not in custom:
+        custom.append(symbol)
+        conf.custom_tickers = json.dumps(custom)
+        db.commit()
+    return {"market": market_name, "custom_tickers": custom}
+
+@protected.delete("/config/markets/{market_name}/tickers/{symbol}")
+def remove_market_ticker(market_name: str, symbol: str, db: Session = Depends(get_db)):
+    """Remove a custom ticker from a market's tradeable universe."""
+    conf = db.query(models.MarketConfig).filter(models.MarketConfig.market_name == market_name).first()
+    if not conf:
+        raise HTTPException(status_code=404, detail=f"Market {market_name} not found")
+    custom = []
+    if conf.custom_tickers:
+        try: custom = json.loads(conf.custom_tickers)
+        except Exception: pass
+    custom = [t for t in custom if t != symbol.upper()]
+    conf.custom_tickers = json.dumps(custom) if custom else None
+    db.commit()
+    return {"market": market_name, "custom_tickers": custom}
 
 @protected.post("/config/markets/{market_name}/exit-positions")
 def exit_market_positions(market_name: str, db: Session = Depends(get_db)):
@@ -1445,9 +1507,32 @@ def approve_strategy(action: ApprovalAction, db: Session = Depends(get_db)):
     cache_invalidate_prefix("pipeline_runs_")
     return {"status": strategy.status, "id": strategy.id}
 
+@protected.post("/strategies/cleanup-duplicates")
+def cleanup_duplicate_strategies(db: Session = Depends(get_db)):
+    """Close all but the most-recent ACTIVE/PENDING strategy per ticker. Returns count closed."""
+    from datetime import datetime as _dt
+    from sqlalchemy import func
+    open_strategies = (
+        db.query(models.DeployedStrategy)
+        .filter(models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"]))
+        .order_by(models.DeployedStrategy.symbol, models.DeployedStrategy.id.desc())
+        .all()
+    )
+    seen: dict[str, int] = {}
+    closed = 0
+    for s in open_strategies:
+        if s.symbol not in seen:
+            seen[s.symbol] = s.id
+        else:
+            s.status = "CLOSED"
+            s.close_reason = "Superseded by newer strategy for same ticker"
+            s.closed_at = _dt.utcnow()
+            closed += 1
+    db.commit()
+    return {"closed": closed, "active_tickers": list(seen.keys())}
+
 # --- Manual Trigger & Scheduling ---
 
-import threading
 import json as _json
 import uuid as _uuid
 
@@ -1479,12 +1564,6 @@ def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depend
     _upsert_config(db, "current_run_id_trade", run_id)
     db.commit()
 
-    from pipeline.runner import run_full_pipeline
-    # Run in a daemon thread so the HTTP response returns immediately and
-    # uvicorn --reload can restart without waiting for the pipeline to finish.
-    t = threading.Thread(target=run_full_pipeline, args=(run_id,), daemon=True)
-    t.start()
-
     # Invalidate all caches that are affected by a pipeline run completing
     cache_invalidate_prefix("pipeline_runs_")
     cache_invalidate("debates")
@@ -1494,35 +1573,73 @@ def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depend
     cache_invalidate("kg_full")
     cache_invalidate_prefix("kg_ticker:")
 
+    from pipeline.runner import run_full_pipeline
+    run_full_pipeline(run_id)
+
     msg = f"Focused pipeline run on: {', '.join(focus)}" if focus else "Full pipeline started."
     return {"status": "success", "message": msg, "run_id": run_id}
 
+class ResearchTriggerBody(BaseModel):
+    investment_focus: str = ""
+    tickers: list = []
+
+
 @protected.post("/research/trigger")
-def trigger_research(db: Session = Depends(get_db)):
-    """Manually trigger a research pipeline run (web scraping + KG ingest only)."""
+def trigger_research(body: ResearchTriggerBody = ResearchTriggerBody(), db: Session = Depends(get_db)):
+    """Manually trigger a research pipeline run (web scraping + KG ingest only).
+
+    If investment_focus is provided, an LLM resolves it into specific ticker symbols
+    which are stored on the run and used to scope all data collection.
+    """
     if _is_type_running(db, "research"):
         return {"status": "error", "message": "Research pipeline is already running."}
 
     _acquire_lock(db, "research")
     run_id = str(_uuid.uuid4())
-    run = models.PipelineRun(run_id=run_id, step="pending", run_type="research")
+
+    # Resolve focus text → tickers via LLM (before pipeline starts so frontend gets them immediately)
+    resolved_tickers: list[str] = []
+    investment_focus = body.investment_focus.strip()
+
+    if body.tickers:
+        # Explicit tickers passed directly (from the chip UI)
+        resolved_tickers = [t.strip().upper() for t in body.tickers if t.strip()]
+    elif investment_focus:
+        from pipeline.orchestrator import resolve_focus_to_tickers
+        resolved_tickers = resolve_focus_to_tickers(investment_focus, run_id=run_id)
+
+    focus_tickers_json = json.dumps(resolved_tickers) if resolved_tickers else None
+
+    run = models.PipelineRun(
+        run_id=run_id,
+        step="pending",
+        run_type="research",
+        investment_focus=investment_focus or None,
+        focus_tickers=focus_tickers_json,
+    )
     db.add(run)
     _upsert_config(db, "current_run_id_research", run_id)
     db.commit()
-
-    from pipeline.runner import run_research_pipeline
-    t = threading.Thread(target=run_research_pipeline, args=(run_id,), daemon=True)
-    t.start()
 
     cache_invalidate_prefix("pipeline_runs_")
     cache_invalidate("research")
     cache_invalidate("kg_full")
     cache_invalidate_prefix("kg_ticker:")
-    return {"status": "success", "message": "Research pipeline started.", "run_id": run_id}
+
+    from pipeline.runner import run_research_pipeline
+    run_research_pipeline(run_id)
+
+    msg = f"Research scoped to: {', '.join(resolved_tickers)}" if resolved_tickers else "Research pipeline started."
+    return {"status": "success", "message": msg, "run_id": run_id, "resolved_tickers": resolved_tickers}
+
+
+class TradeTriggerBody(BaseModel):
+    investment_focus: str = ""
+    tickers: list = []
 
 
 @protected.post("/trade/trigger")
-def trigger_trade(db: Session = Depends(get_db)):
+def trigger_trade(body: TradeTriggerBody = TradeTriggerBody(), db: Session = Depends(get_db)):
     """Manually trigger a trade pipeline run (agents + judge + deploy). Requires prior research run."""
     if _is_type_running(db, "trade"):
         return {"status": "error", "message": "Trade pipeline is already running."}
@@ -1531,22 +1648,42 @@ def trigger_trade(db: Session = Depends(get_db)):
     if not research_ctx or not research_ctx.value:
         return {"status": "error", "message": "No research context available. Run the research pipeline first."}
 
+    # Resolve focus → tickers
+    resolved_tickers: list[str] = []
+    investment_focus = body.investment_focus.strip()
+
+    if body.tickers:
+        resolved_tickers = [t.strip().upper() for t in body.tickers if t.strip()]
+    elif investment_focus:
+        from pipeline.orchestrator import resolve_focus_to_tickers
+        import uuid as _uuid2
+        resolved_tickers = resolve_focus_to_tickers(investment_focus, run_id=None)
+
+    focus_tickers_json = json.dumps(resolved_tickers) if resolved_tickers else None
+
     _acquire_lock(db, "trade")
     run_id = str(_uuid.uuid4())
-    run = models.PipelineRun(run_id=run_id, step="pending", run_type="trade")
+    run = models.PipelineRun(
+        run_id=run_id,
+        step="pending",
+        run_type="trade",
+        investment_focus=investment_focus or None,
+        focus_tickers=focus_tickers_json,
+    )
     db.add(run)
     _upsert_config(db, "current_run_id_trade", run_id)
     db.commit()
-
-    from pipeline.runner import run_trade_pipeline
-    t = threading.Thread(target=run_trade_pipeline, args=(run_id,), daemon=True)
-    t.start()
 
     cache_invalidate_prefix("pipeline_runs_")
     cache_invalidate("debates")
     cache_invalidate("memory_all")
     cache_invalidate("agents_fitness")
-    return {"status": "success", "message": "Trade pipeline started.", "run_id": run_id}
+
+    from pipeline.runner import run_trade_pipeline
+    run_trade_pipeline(run_id)
+
+    msg = f"Trade generation scoped to: {', '.join(resolved_tickers)}" if resolved_tickers else "Trade pipeline started."
+    return {"status": "success", "message": msg, "run_id": run_id, "resolved_tickers": resolved_tickers}
 
 
 @protected.post("/eval/trigger")
@@ -1563,27 +1700,17 @@ def trigger_eval(db: Session = Depends(get_db)):
 
     from pipeline.validator import evaluate_predictions
 
-    def _run_eval_and_release():
-        try:
-            evaluate_predictions(run_id=run_id)
-        finally:
-            _db = SessionLocal()
-            try:
-                _release_lock(_db, "eval")
-                _db.commit()
-            except Exception:
-                pass
-            finally:
-                _db.close()
-            cache_invalidate_prefix("pipeline_runs_")
-            cache_invalidate("agents_fitness")
-            cache_invalidate("memory_all")
-            cache_invalidate_prefix("agent_evolution:")
-
-    t = threading.Thread(target=_run_eval_and_release, daemon=True)
-    t.start()
-
     cache_invalidate_prefix("pipeline_runs_")
+    try:
+        evaluate_predictions(run_id=run_id)
+    finally:
+        _release_lock(db, "eval")
+        db.commit()
+        cache_invalidate_prefix("pipeline_runs_")
+        cache_invalidate("agents_fitness")
+        cache_invalidate("memory_all")
+        cache_invalidate_prefix("agent_evolution:")
+
     return {"status": "success", "message": "Evaluation pipeline started.", "run_id": run_id}
 
 
@@ -1603,21 +1730,50 @@ def get_system_status(db: Session = Depends(get_db)):
     eval_running     = cfg.get("eval_running") == "1"
 
     # Stale-lock guard per pipeline
+    # Releases the lock if:
+    #   (a) the run's step is already done/error, OR
+    #   (b) no new pipeline event has appeared for >8 minutes (thread died silently)
+    from datetime import timedelta
+    _stale_threshold = datetime.utcnow() - timedelta(minutes=8)
     for flag, run_id_key in [
         ("research_running", "current_run_id_research"),
         ("trade_running",    "current_run_id_trade"),
+        ("eval_running",     "current_run_id_eval"),
     ]:
         if cfg.get(flag) == "1":
             rid = cfg.get(run_id_key)
+            stale = False
             if rid:
                 r = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == rid).first()
                 if r and r.step in ("done", "error"):
-                    conf = db.query(models.AppConfig).filter(models.AppConfig.key == flag).first()
-                    if conf:
-                        conf.value = "0"
-                    db.commit()
-                    if flag == "research_running": research_running = False
-                    if flag == "trade_running":    trade_running = False
+                    stale = True
+                elif r:
+                    # Check last event timestamp
+                    last_evt = (
+                        db.query(models.PipelineEvent)
+                        .filter(models.PipelineEvent.run_id == rid)
+                        .order_by(models.PipelineEvent.created_at.desc())
+                        .first()
+                    )
+                    if last_evt and last_evt.created_at < _stale_threshold:
+                        # Mark run as error so UI shows it correctly
+                        r.step = "error"
+                        db.add(models.PipelineEvent(
+                            run_id=rid, run_type=r.run_type,
+                            step="ERROR", status="ERROR",
+                            detail="Pipeline timed out — no activity for 8+ minutes. Lock auto-released.",
+                        ))
+                        stale = True
+            else:
+                stale = True  # lock set but no run_id — always stale
+            if stale:
+                conf = db.query(models.AppConfig).filter(models.AppConfig.key == flag).first()
+                if conf:
+                    conf.value = "0"
+                db.commit()
+                if flag == "research_running": research_running = False
+                if flag == "trade_running":    trade_running = False
+                if flag == "eval_running":     eval_running = False
 
     # Current run IDs per tab
     current_run_id_research = cfg.get("current_run_id_research")
@@ -1676,10 +1832,80 @@ def stop_pipeline(body: StopRequest = StopRequest(), db: Session = Depends(get_d
     return {"status": "stopped"}
 
 
+@protected.get("/llm/usage")
+def get_llm_usage(days: int = 30, db: Session = Depends(get_db)):
+    """
+    Return per-day and per-model token usage aggregates for the last N days.
+    Response shape:
+    {
+      "daily": [{ "date": "2026-03-18", "prompt_tokens": x, "completion_tokens": x, "total_tokens": x, "calls": x }],
+      "by_model": [{ "model": "...", "prompt_tokens": x, "completion_tokens": x, "total_tokens": x, "calls": x }],
+      "by_caller": [{ "caller": "...", "total_tokens": x, "calls": x }],
+      "totals": { "prompt_tokens": x, "completion_tokens": x, "total_tokens": x, "calls": x },
+    }
+    """
+    from datetime import timedelta
+    from sqlalchemy import func, cast, Date as SADate
+    cutoff = datetime.utcnow() - timedelta(days=days)
+
+    rows = (
+        db.query(models.LLMUsage)
+        .filter(models.LLMUsage.timestamp >= cutoff)
+        .all()
+    )
+
+    # Daily aggregates
+    daily_map: dict[str, dict] = {}
+    model_map: dict[str, dict] = {}
+    caller_map: dict[str, dict] = {}
+    totals = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
+              "total_tokens": 0, "cost": 0.0, "calls": 0}
+
+    def _empty_bucket():
+        return {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
+                "total_tokens": 0, "cost": 0.0, "calls": 0}
+
+    for r in rows:
+        date_key   = r.timestamp.strftime("%Y-%m-%d")
+        model_key  = r.model or "unknown"
+        caller_key = (r.caller or "unknown").split(":")[0]
+
+        for d, key in [(daily_map, date_key), (model_map, model_key), (caller_map, caller_key)]:
+            if key not in d:
+                d[key] = _empty_bucket()
+            d[key]["prompt_tokens"]     += r.prompt_tokens or 0
+            d[key]["completion_tokens"] += r.completion_tokens or 0
+            d[key]["reasoning_tokens"]  += r.reasoning_tokens or 0
+            d[key]["total_tokens"]      += r.total_tokens or 0
+            d[key]["cost"]              += r.cost or 0.0
+            d[key]["calls"]             += 1
+
+        totals["prompt_tokens"]     += r.prompt_tokens or 0
+        totals["completion_tokens"] += r.completion_tokens or 0
+        totals["reasoning_tokens"]  += r.reasoning_tokens or 0
+        totals["total_tokens"]      += r.total_tokens or 0
+        totals["cost"]              += r.cost or 0.0
+        totals["calls"]             += 1
+
+    daily = sorted(
+        [{"date": k, **v} for k, v in daily_map.items()],
+        key=lambda x: x["date"]
+    )
+    by_model = sorted(
+        [{"model": k, **v} for k, v in model_map.items()],
+        key=lambda x: x["total_tokens"], reverse=True
+    )
+    by_caller = sorted(
+        [{"caller": k, **v} for k, v in caller_map.items()],
+        key=lambda x: x["total_tokens"], reverse=True
+    )
+
+    return {"daily": daily, "by_model": by_model, "by_caller": by_caller, "totals": totals}
+
+
 @protected.post("/pipeline/resume/{run_id}")
 def resume_pipeline_run(run_id: str, db: Session = Depends(get_db)):
     """Resume a stalled or errored pipeline run from its last saved checkpoint."""
-    import threading
     run = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
     if not run:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -1705,10 +1931,9 @@ def resume_pipeline_run(run_id: str, db: Session = Depends(get_db)):
             run.step = "pending"
     db.commit()
 
-    from pipeline.runner import resume_pipeline
-    t = threading.Thread(target=resume_pipeline, args=(run_id,), daemon=True)
-    t.start()
     cache_invalidate_prefix("pipeline_runs_")
+    from pipeline.runner import resume_pipeline
+    resume_pipeline(run_id)
     return {"status": "resuming", "run_id": run_id, "from_step": run.step}
 
 def _get_schedule_interval(db: Session) -> int:
@@ -1858,6 +2083,18 @@ def set_investment_focus(body: dict, db: Session = Depends(get_db)):
         db.add(models.AppConfig(key="investment_focus", value=text))
     db.commit()
     return {"investment_focus": text}
+
+
+class ResolveFocusBody(BaseModel):
+    focus: str
+
+
+@protected.post("/focus/resolve")
+def resolve_focus(body: ResolveFocusBody):
+    """Resolve a free-text focus description into specific ticker symbols via LLM."""
+    from pipeline.orchestrator import resolve_focus_to_tickers
+    tickers = resolve_focus_to_tickers(body.focus.strip())
+    return {"tickers": tickers}
 
 
 # --- Budget Config ---
