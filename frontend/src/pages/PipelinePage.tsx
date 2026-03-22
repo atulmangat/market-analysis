@@ -124,10 +124,10 @@ function getCurrentStep(events: PipelineEvent[]): string | null {
 function getCompletedSteps(events: PipelineEvent[], stepsArray: string[] = ORDERED_STEPS): Set<string> {
   const done = new Set<string>();
   for (const e of events) {
-    if (e.status === 'DONE') done.add(e.step);
+    if (e.status === 'DONE' || e.status === 'WARN') done.add(e.step);
     if (e.status === 'IN_PROGRESS') {
-      // If there's a later event for the same step that is DONE, mark done
-      const later = events.slice(events.indexOf(e) + 1).find(x => x.step === e.step && x.status === 'DONE');
+      // If there's a later event for the same step that is DONE or WARN, mark done
+      const later = events.slice(events.indexOf(e) + 1).find(x => x.step === e.step && (x.status === 'DONE' || x.status === 'WARN'));
       if (later) done.add(e.step);
     }
   }
@@ -207,6 +207,8 @@ export function PipelinePage({
   const focusSearchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [stepsExpanded, setStepsExpanded] = useState(false);
   const [evalBadgeTooltip, setEvalBadgeTooltip] = useState<{ x: number; y: number } | null>(null);
+  const [focusDropdownRect, setFocusDropdownRect] = useState<DOMRect | null>(null);
+  const focusInputWrapRef = useRef<HTMLDivElement>(null);
   const [runsPage, setRunsPage] = useState(0);
   const [activeTab, setActiveTab] = useState<PipelineTab>('research');
   const RUNS_PER_PAGE = 10;
@@ -260,6 +262,29 @@ export function PipelinePage({
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTab]);
+
+  // ── Per-pipeline start detection ─────────────────────────────────────────────
+  // When a pipeline starts running, immediately switch to its tab.
+  const prevResearchRunningStart = useRef(researchRunning);
+  const prevTradeRunningStart    = useRef(tradeRunning);
+  const prevEvalRunningStart     = useRef(evalRunning);
+  useEffect(() => {
+    const rStarted = !prevResearchRunningStart.current && researchRunning;
+    const tStarted = !prevTradeRunningStart.current    && tradeRunning;
+    const eStarted = !prevEvalRunningStart.current     && evalRunning;
+    prevResearchRunningStart.current = researchRunning;
+    prevTradeRunningStart.current    = tradeRunning;
+    prevEvalRunningStart.current     = evalRunning;
+
+    const startedTab: PipelineTab | null = eStarted ? 'eval' : tStarted ? 'trade' : rStarted ? 'research' : null;
+    if (startedTab) {
+      setActiveTab(startedTab);
+      setSelectedRunId(null);
+      setSelectedRunEvents([]);
+      setRunsPage(0);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [researchRunning, tradeRunning, evalRunning]);
 
   // ── Per-pipeline finish detection ────────────────────────────────────────────
   // When a specific pipeline finishes, switch to its tab and auto-select the run.
@@ -320,6 +345,29 @@ export function PipelinePage({
     setFocusSearch(''); setFocusSearchOpen(false); setTickerSearchResults([]);
   };
 
+  const [resolvingFocus, setResolvingFocus] = useState(false);
+  const [resolvedFocusText, setResolvedFocusText] = useState('');
+
+  const handleFindTickers = () => {
+    if (!investmentFocus.trim() || resolvingFocus) return;
+    const focusText = investmentFocus.trim();
+    setResolvingFocus(true);
+    apiFetch('/focus/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ focus: focusText }),
+    })
+      .then(r => r.json())
+      .then(data => {
+        if (data.tickers?.length) {
+          setFocusTickers(() => data.tickers);
+          setResolvedFocusText(focusText);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setResolvingFocus(false));
+  };
+
   // ── Active Run View ──────────────────────────────────────────────────────────
   const renderActiveView = (events: PipelineEvent[], stepsArray: string[] = ORDERED_STEPS) => {
     const currentStep = getCurrentStep(events);
@@ -377,26 +425,38 @@ export function PipelinePage({
                 isActive ? 'bg-surface2' : isDone ? 'bg-up/[0.06]' : ''
               }`}>
                 {/* Status dot */}
+                {(() => {
+                  const isWarn = !isDone && events.some(e => e.step === s && e.status === 'WARN');
+                  return (
                 <div className={`mt-0.5 h-5 w-5 rounded-full shrink-0 flex items-center justify-center text-[10px] border ${
                   isActive  ? `${c.ring} ${c.bg} animate-pulse` :
                   isDone    ? 'border-up bg-up/20' :
+                  isWarn    ? 'border-amber-500/50 bg-amber-500/15' :
                               'border-borderLight bg-surface3 opacity-30'
                 }`}>
                   {isDone
                     ? <span className="text-up text-[9px] font-bold">✓</span>
-                    : <span className={isActive ? c.text : 'text-textDim'}>{m?.icon ?? '·'}</span>
+                    : isWarn
+                      ? <span className="text-amber-400 text-[9px]">⚠</span>
+                      : <span className={isActive ? c.text : 'text-textDim'}>{m?.icon ?? '·'}</span>
                   }
                 </div>
+                  );
+                })()}
 
                 <div className="flex-1 min-w-0">
+                  {(() => {
+                  const isWarn = !isDone && events.some(e => e.step === s && e.status === 'WARN');
+                  return (
                   <div className="flex items-center gap-2">
                     <span className={`text-[11px] font-semibold ${
-                      isActive ? c.text : isDone ? 'text-up' : 'text-textDim opacity-40'
+                      isActive ? c.text : isDone ? 'text-up' : isWarn ? 'text-amber-400' : 'text-textDim opacity-40'
                     }`}>
                       {STEP_LABELS[s] ?? s}
                     </span>
                     {isActive && <span className="text-[9px] text-amber-400 animate-pulse">running</span>}
                     {isDone && <span className="text-[9px] text-up/60 font-medium">done</span>}
+                    {isWarn && !isDone && <span className="text-[9px] text-amber-400/80 font-medium">timed out</span>}
                     {isDone && s === 'WEB_RESEARCH' && research.length > 0 && (
                       <button
                         onClick={() => setResearchStepOpen(o => !o)}
@@ -405,6 +465,8 @@ export function PipelinePage({
                       </button>
                     )}
                   </div>
+                  );
+                  })()}
                   {detail && (
                     <p className="text-[10px] text-textDim mt-0.5 leading-relaxed truncate max-w-sm" title={detail}>
                       {detail.length > 80 ? detail.slice(0, 80) + '…' : detail}
@@ -556,8 +618,10 @@ export function PipelinePage({
   // ── Eval Completed View ───────────────────────────────────────────────────
   const renderEvalCompletedView = (events: PipelineEvent[], run?: PipelineRun) => {
     const complete = run?.status === 'done' || isRunComplete(events);
-    const orphaned = !complete && events.length > 0 && events.every(e => e.status === 'IN_PROGRESS');
+    const isTerminalNonSuccess = run ? run.status === 'error' : true;
+    const orphaned = !complete && isTerminalNonSuccess && events.length > 0 && events.every(e => e.status === 'IN_PROGRESS');
     const errored = !complete && (run?.status === 'error' || hasError(events) || orphaned);
+    const stillRunning = !complete && !errored && run != null && run.status !== 'error' && run.status !== 'done';
     const dur = getRunDuration(events);
 
     // Extract key data from events
@@ -575,16 +639,16 @@ export function PipelinePage({
     return (
       <div className="flex-1 flex flex-col overflow-y-auto">
         {/* Outcome banner */}
-        <div className={`px-6 py-5 border-b border-borderLight ${errored ? 'bg-down-bg/40' : 'bg-purple-500/5'}`}>
+        <div className={`px-6 py-5 border-b border-borderLight ${errored ? 'bg-down-bg/40' : stillRunning ? 'bg-cyan-500/5' : 'bg-purple-500/5'}`}>
           <div className="flex items-start justify-between gap-4">
             <div className="flex items-center gap-3">
-              <div className={`h-10 w-10 rounded-full flex items-center justify-center text-lg ${errored ? 'bg-down-bg text-down-text' : 'bg-purple-500/15 text-purple-400'}`}>
-                {errored ? '✕' : '🧬'}
+              <div className={`h-10 w-10 rounded-full flex items-center justify-center text-lg ${errored ? 'bg-down-bg text-down-text' : stillRunning ? 'bg-cyan-500/10 text-cyan-400' : 'bg-purple-500/15 text-purple-400'}`}>
+                {errored ? '✕' : stillRunning ? '↻' : '🧬'}
               </div>
               <div>
                 <div className="flex items-center gap-2">
-                  <p className={`text-sm font-semibold ${errored ? 'text-down-text' : 'text-purple-400'}`}>
-                    {errored ? 'Evaluation Failed' : 'Evaluation Complete'}
+                  <p className={`text-sm font-semibold ${errored ? 'text-down-text' : stillRunning ? 'text-cyan-400' : 'text-purple-400'}`}>
+                    {errored ? 'Evaluation Failed' : stillRunning ? 'Evaluation Running…' : 'Evaluation Complete'}
                   </p>
                   <span className="text-[9px] text-purple-400 bg-purple-900/30 border border-purple-700/30 px-1.5 py-0.5 rounded uppercase tracking-wider">Eval</span>
                 </div>
@@ -760,11 +824,15 @@ export function PipelinePage({
     // Use run.status as the authoritative signal — events may be incomplete if
     // the Vercel function timed out before the final MEMORY_WRITE DONE log.
     const complete = run?.status === 'done' || isRunComplete(events);
-    // Only show as errored if the run didn't complete — intermediate errors (e.g. KG_INGEST)
-    // are non-fatal and the pipeline can still finish successfully.
-    const orphaned = !complete && events.length > 0 && events.every(e => e.status === 'IN_PROGRESS');
+    // Only show as orphaned if the run has no status (no run record) OR the run's
+    // DB step is a terminal non-success state. A run with status like 'research' or
+    // 'agents' is still in progress — don't show it as failed.
+    const isTerminalNonSuccess = run ? run.status === 'error' : true;
+    const orphaned = !complete && isTerminalNonSuccess && events.length > 0 && events.every(e => e.status === 'IN_PROGRESS');
     const errored = !complete && (run?.status === 'error' || hasError(events) || orphaned);
-    const wasStopped = !errored && !complete;
+    // A run is still in progress if its DB step is not a terminal state
+    const stillRunning = !complete && !errored && run != null && run.status !== 'error' && run.status !== 'done';
+    const wasStopped = !errored && !complete && !stillRunning;
     const dur = getRunDuration(events);
     const errorEvent = events.find(e => e.status === 'ERROR');
 
@@ -788,22 +856,24 @@ export function PipelinePage({
       <div className="flex-1 flex flex-col overflow-y-auto">
         {/* ── Outcome banner ─────────────────────────────────────────────── */}
         <div className={`px-6 py-5 border-b border-borderLight ${
-          errored    ? 'bg-down-bg/40'    :
-          wasStopped ? 'bg-warning-bg/40'  :
-                       'bg-up/5'
+          errored      ? 'bg-down-bg/40'    :
+          stillRunning ? 'bg-cyan-500/5'    :
+          wasStopped   ? 'bg-warning-bg/40' :
+                         'bg-up/5'
         }`}>
           <div className="flex items-start justify-between gap-4">
             <div className="flex items-center gap-3">
               <div className={`h-10 w-10 rounded-full flex items-center justify-center text-lg font-bold ${
-                errored    ? 'bg-down-bg text-down-text'    :
-                wasStopped ? 'bg-warning-bg text-warning' :
-                             'bg-up/15 text-up'
+                errored      ? 'bg-down-bg text-down-text'      :
+                stillRunning ? 'bg-cyan-500/10 text-cyan-400'   :
+                wasStopped   ? 'bg-warning-bg text-warning'     :
+                               'bg-up/15 text-up'
               }`}>
-                {errored ? '✕' : wasStopped ? '⏹' : '✓'}
+                {errored ? '✕' : stillRunning ? '↻' : wasStopped ? '⏹' : '✓'}
               </div>
               <div>
-                <p className={`text-sm font-semibold ${errored ? 'text-down-text' : wasStopped ? 'text-warning' : 'text-up'}`}>
-                  {errored ? 'Pipeline Failed' : wasStopped ? 'Pipeline Stopped' : 'Pipeline Complete'}
+                <p className={`text-sm font-semibold ${errored ? 'text-down-text' : stillRunning ? 'text-cyan-400' : wasStopped ? 'text-warning' : 'text-up'}`}>
+                  {errored ? 'Pipeline Failed' : stillRunning ? 'Pipeline Running…' : wasStopped ? 'Pipeline Stopped' : 'Pipeline Complete'}
                 </p>
                 {errored && errorEvent && (
                   <p className="text-[11px] text-textDim mt-0.5">
@@ -889,7 +959,7 @@ export function PipelinePage({
                 {events.map((ev, idx) => {
                   const meta = STEP_META[ev.step] ?? { icon: '·', label: ev.step, color: 'text-textMuted' };
                   const isAgentQuery = ev.step === 'AGENT_QUERY';
-                  const hasLaterResolution = ev.status === 'IN_PROGRESS' && events.slice(idx + 1).some(e => e.step === ev.step && (e.status === 'DONE' || e.status === 'ERROR'));
+                  const hasLaterResolution = ev.status === 'IN_PROGRESS' && events.slice(idx + 1).some(e => e.step === ev.step && (e.status === 'DONE' || e.status === 'WARN' || e.status === 'ERROR'));
                   let displayStatus = ev.status;
                   if (ev.status === 'IN_PROGRESS' && hasLaterResolution) displayStatus = 'DONE';
                   if (ev.status === 'IN_PROGRESS' && !hasLaterResolution) {
@@ -904,11 +974,12 @@ export function PipelinePage({
                         <div className="relative z-10 shrink-0">
                           <div className={`h-7 w-7 rounded-full flex items-center justify-center text-[11px] font-bold ${
                             displayStatus === 'ERROR' ? 'bg-down-bg border-2 border-down/50' :
+                            displayStatus === 'WARN'  ? 'bg-amber-500/15 border-2 border-amber-500/50' :
                             displayStatus === 'DONE'  ? 'bg-up/15 border-2 border-up/50' :
                                                         'bg-surface3 border-2 border-borderMid'
                           }`}>
-                            <span className={`text-xs ${displayStatus === 'ERROR' ? 'text-down-text' : displayStatus === 'DONE' ? 'text-up' : c.text}`}>
-                              {displayStatus === 'DONE' ? '✓' : meta.icon}
+                            <span className={`text-xs ${displayStatus === 'ERROR' ? 'text-down-text' : displayStatus === 'WARN' ? 'text-amber-400' : displayStatus === 'DONE' ? 'text-up' : c.text}`}>
+                              {displayStatus === 'DONE' ? '✓' : displayStatus === 'WARN' ? '⚠' : meta.icon}
                             </span>
                           </div>
                         </div>
@@ -1226,8 +1297,15 @@ export function PipelinePage({
       return renderCompletedView(panelEvents, run, TRADE_ORDERED_STEPS);
     }
 
-    // Live view — tab's pipeline is running, always show active view
+    // Live view — tab's pipeline is running (or just finished before poller caught up)
     if (tabIsActive(activeTab)) {
+      // If events already show the run is complete, switch to completed view immediately
+      // without waiting for the poller to update the running flag.
+      if (isRunComplete(panelEvents)) {
+        if (activeTab === 'eval') return renderEvalCompletedView(panelEvents);
+        if (activeTab === 'research') return renderCompletedView(panelEvents, undefined, RESEARCH_ORDERED_STEPS);
+        return renderCompletedView(panelEvents, undefined, TRADE_ORDERED_STEPS);
+      }
       if (activeTab === 'eval') return renderEvalActiveView(panelEvents);
       if (activeTab === 'research') return renderActiveView(panelEvents, RESEARCH_ORDERED_STEPS);
       return renderActiveView(panelEvents, TRADE_ORDERED_STEPS);
@@ -1242,6 +1320,31 @@ export function PipelinePage({
 
   return (
     <div className="space-y-4">
+      {/* ── Fixed-position ticker search dropdown (escapes overflow:hidden) ───── */}
+      {showFocusDropdown && focusDropdownRect && (
+        <div
+          className="fixed z-[9999] bg-surface border border-borderMid rounded-lg shadow-xl overflow-hidden"
+          style={{
+            left: focusDropdownRect.left,
+            top: focusDropdownRect.bottom + 4,
+            width: focusDropdownRect.width,
+            maxHeight: 240,
+            overflowY: 'auto',
+          }}
+        >
+          {tickerSearchLoading && focusVisibleResults.length === 0 && (
+            <div className="px-3 py-2 text-xs text-textDim animate-pulse">Searching…</div>
+          )}
+          {focusVisibleResults.map(t => (
+            <button key={t.symbol} onMouseDown={e => { e.preventDefault(); addFocusTicker(t.symbol); }}
+              className="w-full text-left px-3 py-2 hover:bg-surface2 flex items-center justify-between gap-2 border-b border-borderLight last:border-0">
+              <span className="text-xs font-mono font-semibold text-textMain">{t.symbol}</span>
+              <span className="text-[10px] text-textDim truncate flex-1 text-right">{t.name}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
       {/* ── Fixed-position tooltip (escapes overflow:hidden parents) ─────────── */}
       {evalBadgeTooltip && (
         <div
@@ -1359,23 +1462,47 @@ export function PipelinePage({
         )}
 
         {/* Row 1: Focus prompt (research + trade tabs) + Run button */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-borderLight">
+        <div className="relative flex items-center gap-3 px-4 py-3 border-b border-borderLight">
+          {/* Loading bar — spans the full row bottom edge while resolving */}
+          {resolvingFocus && (
+            <div className="absolute bottom-0 left-0 right-0 h-0.5 overflow-hidden">
+              <div className="h-full bg-brand-500 animate-[focusLoad_1.4s_ease-in-out_infinite]" />
+            </div>
+          )}
+          <style>{`@keyframes focusLoad { 0% { transform: translateX(-100%); } 100% { transform: translateX(100%); } }`}</style>
           {(activeTab === 'research' || activeTab === 'trade') && (
             <>
               <span className="text-[10px] font-semibold text-textDim uppercase tracking-widest shrink-0">Focus</span>
               <input
                 type="text"
                 value={investmentFocus}
-                onChange={e => setInvestmentFocus(e.target.value)}
-                onKeyDown={e => { if (e.key === 'Enter') saveInvestmentFocus(investmentFocus); }}
-                placeholder="e.g. AI semiconductors, Indian IT, Bitcoin momentum…"
+                onChange={e => {
+                  const val = e.target.value;
+                  setInvestmentFocus(val);
+                  if (resolvedFocusText && val.trim() !== resolvedFocusText) {
+                    setFocusTickers(() => []);
+                    setResolvedFocusText('');
+                  }
+                  if (!val) saveInvestmentFocus('');
+                }}
+                onKeyDown={e => { if (e.key === 'Enter') handleFindTickers(); }}
+                placeholder="e.g. leading AI stocks in India, top US semiconductors, Bitcoin and Ethereum…"
                 className="flex-1 bg-transparent text-xs text-textMain placeholder-textDim focus:outline-none min-w-0"
               />
               {investmentFocus && (
                 <button
-                  onClick={() => saveInvestmentFocus(investmentFocus)}
-                  className={`shrink-0 px-2.5 py-1 rounded text-[10px] font-semibold border transition-all ${investmentFocusSaved ? 'bg-up-bg text-up border-up/30' : 'bg-surface2 border-borderMid text-textMuted hover:border-brand-500 hover:text-brand-400'}`}
-                >{investmentFocusSaved ? '✓ Saved' : 'Save'}</button>
+                  onClick={handleFindTickers}
+                  disabled={resolvingFocus}
+                  className="shrink-0 px-2.5 py-1 rounded text-[10px] font-semibold border transition-all bg-surface2 border-borderMid text-textMuted hover:border-brand-500 hover:text-brand-400 disabled:opacity-50 disabled:cursor-wait"
+                >{resolvingFocus ? 'Finding…' : 'Find'}</button>
+              )}
+              {/* Clear button — only shown when there's resolved text, preserves query until explicitly cleared */}
+              {resolvedFocusText && !resolvingFocus && (
+                <button
+                  onClick={() => { setInvestmentFocus(''); setFocusTickers(() => []); setResolvedFocusText(''); saveInvestmentFocus(''); }}
+                  className="shrink-0 text-[10px] text-textDim hover:text-textMuted transition-colors"
+                  title="Clear focus"
+                >✕</button>
               )}
               <div className="h-4 w-px bg-borderLight shrink-0" />
             </>
@@ -1463,12 +1590,13 @@ export function PipelinePage({
               )}
           </div>
           {/* Ticker search */}
-          <div className="relative shrink-0 w-56">
+          <div className="relative shrink-0 w-56" ref={focusInputWrapRef}>
             <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border bg-surface2 transition-colors ${focusSearchOpen ? 'border-cyan-500' : 'border-borderLight'}`}>
               <span className="text-textDim text-[10px] shrink-0">{tickerSearchLoading ? <span className="animate-spin inline-block">↻</span> : '⌕'}</span>
               <input type="text" value={focusSearch}
                 onChange={e => {
                   const val = e.target.value; setFocusSearch(val); setFocusSearchOpen(true);
+                  if (focusInputWrapRef.current) setFocusDropdownRect(focusInputWrapRef.current.getBoundingClientRect());
                   if (focusSearchTimerRef.current) clearTimeout(focusSearchTimerRef.current);
                   if (!val.trim()) { setTickerSearchResults([]); setTickerSearchLoading(false); return; }
                   setTickerSearchLoading(true);
@@ -1477,28 +1605,19 @@ export function PipelinePage({
                     setTickerSearchLoading(false);
                   }, 350);
                 }}
-                onFocus={() => setFocusSearchOpen(true)}
-                onBlur={() => setTimeout(() => setFocusSearchOpen(false), 150)}
+                onFocus={() => {
+                  setFocusSearchOpen(true);
+                  if (focusInputWrapRef.current) setFocusDropdownRect(focusInputWrapRef.current.getBoundingClientRect());
+                }}
+                onBlur={() => setTimeout(() => { setFocusSearchOpen(false); setFocusDropdownRect(null); }, 150)}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && focusVisibleResults.length > 0) addFocusTicker(focusVisibleResults[0].symbol);
-                  if (e.key === 'Escape') { setFocusSearchOpen(false); setFocusSearch(''); }
+                  if (e.key === 'Escape') { setFocusSearchOpen(false); setFocusSearch(''); setFocusDropdownRect(null); }
                 }}
                 placeholder="Add ticker…"
                 className="flex-1 bg-transparent text-[11px] text-textMain placeholder-textDim focus:outline-none w-0 min-w-0"
               />
             </div>
-            {showFocusDropdown && (
-              <div className="absolute left-0 right-0 top-full mt-1 bg-surface border border-borderMid rounded-lg shadow-xl z-20 overflow-hidden max-h-60 overflow-y-auto">
-                {tickerSearchLoading && focusVisibleResults.length === 0 && <div className="px-3 py-2 text-xs text-textDim animate-pulse">Searching…</div>}
-                {focusVisibleResults.map(t => (
-                  <button key={t.symbol} onMouseDown={e => { e.preventDefault(); addFocusTicker(t.symbol); }}
-                    className="w-full text-left px-3 py-2 hover:bg-surface2 flex items-center justify-between gap-2 border-b border-borderLight last:border-0">
-                    <span className="text-xs font-mono font-semibold text-textMain">{t.symbol}</span>
-                    <span className="text-[10px] text-textMuted truncate flex-1 text-right">{t.name}</span>
-                  </button>
-                ))}
-              </div>
-            )}
           </div>
           {(focusTickers.length > 0 || focusSectorFilter) && (
             <button onClick={() => { setFocusTickers(() => []); setFocusSectorFilter(null); }} className="text-[10px] text-textDim hover:text-textMuted transition-colors shrink-0">✕ Clear</button>
