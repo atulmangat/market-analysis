@@ -7,25 +7,31 @@ Design principles:
   MARKET (regional market nodes: US, India, Crypto, MCX)
 - Edges carry typed relationships with confidence scores
 
-Ingest pipeline (per run):
-  1. News compression  — LLM condenses raw articles into dense regional summaries
-  2. Graph extraction  — LLM receives compressed news + existing graph snapshot
-                         and outputs net-new nodes/edges (no dedup step needed)
-  3. Auto-market links — assets under India/Crypto/MCX/US market nodes are
-                         automatically linked to their market node and to any
-                         events mentioning their region
+Ingest pipeline (per run) — two-stage, no timeout needed:
+  Stage 1 — Compress  (many tiny parallel LLM calls, ~5s each):
+    Split articles into batches of 15 → each batch → LLM extracts
+    "TICKER | FACT | DIRECTION" lines. No JSON schema, just dense text.
+    All batches run in parallel.
+
+  Stage 2 — Graph extract (per-ticker parallel LLM calls):
+    Group compressed facts by ticker → one LLM call per ticker →
+    outputs KG nodes/edges JSON. Small focused input, fast output.
+    All tickers run in parallel.
+
+  Stage 3 — Auto-market links:
+    Assets under India/Crypto/MCX/US market nodes are automatically
+    linked to their market node and to any events mentioning their region.
 """
 
 import json
-import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 import core.models as models
-from agents.llm import _call_openrouter
+from agents.llm import query_agent
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -78,38 +84,25 @@ MARKET_KEYWORDS: dict[str, list[str]] = {
 }
 
 
-# ── KG-specific LLM call (short timeout, 2 retries) ───────────────────────────
-
-def _kg_llm(system_prompt: str, user_content: str) -> str | None:
-    """
-    LLM call tuned for KG ingest: 40s timeout per attempt, 2 retries.
-    Faster than the default agent call (120s timeout, 3 retries).
-    Returns None on total failure.
-    """
-    api_key  = os.getenv("OPENROUTER_API_KEY", "").strip()
-    model    = os.getenv("LLM_MODEL", "stepfun/step-3.5-flash:free")
-    fallback = os.getenv("FALLBACK_LLM_MODEL", "minimax/minimax-m2.5:nitro")
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": user_content},
-    ]
-    try:
-        return _call_openrouter(model, messages, api_key, retries=2, timeout=40)
-    except Exception as e:
-        print(f"[KG] Primary model failed: {e}. Trying fallback...")
-        try:
-            return _call_openrouter(fallback, messages, api_key, retries=2, timeout=40)
-        except Exception as e2:
-            print(f"[KG] Fallback also failed: {e2}")
-            return None
-
-
 # ── LLM prompts ────────────────────────────────────────────────────────────────
 
-KG_EXTRACT_SYSTEM_PROMPT = """You are a financial knowledge graph builder.
+# Stage 1: compress articles into dense fact lines — no JSON, just fast text
+KG_COMPRESS_PROMPT = """You are a financial news analyst. Extract tradeable facts from these news articles.
 
-You receive a batch of news headlines and an existing graph snapshot.
-Extract net-new market facts not already in the graph.
+For each relevant fact output ONE line in this exact format:
+TICKER: <symbol or MACRO> | FACT: <one sentence with specific numbers/percentages> | DIR: bullish|bearish|neutral | CATALYST: earnings|macro|geopolitical|regulatory|technical|sentiment
+
+Rules:
+- Only output lines matching the format above, nothing else
+- Skip vague facts with no numbers or price-moving information
+- Use real ticker symbols (NVDA, HDFCBANK.NS, BTC-USD, GC=F) or MACRO for broad market facts
+- Max 8 lines per batch — prioritise the most price-moving facts"""
+
+# Stage 2: extract KG nodes/edges from compressed facts for a specific ticker
+KG_EXTRACT_PROMPT = """You are a financial knowledge graph builder.
+
+You receive compressed market facts about a specific ticker and an existing graph snapshot.
+Extract net-new events and relationships NOT already in the graph.
 
 For each distinct new fact output ONE JSON object per line (no preamble):
 
@@ -117,7 +110,7 @@ For each distinct new fact output ONE JSON object per line (no preamble):
 
 Node IDs: asset:NVDA | entity:FederalReserve | indicator:VIX | market:US | event:slug-YYYY-MM-DD
 Relations: affects | correlated_with | caused_by | related_to | sector_peer
-Rules: skip vague facts, include specific numbers, expires_days: breaking=2 earnings=7 macro=14 structural=30, max 6 events per batch."""
+Rules: skip vague facts, include specific numbers, expires_days: breaking=2 earnings=7 macro=14 structural=30, max 15 events per ticker."""
 
 
 # ── Node helpers ───────────────────────────────────────────────────────────────
@@ -254,30 +247,59 @@ def _build_graph_snapshot(db: Session, max_nodes: int = 80) -> str:
     return "\n".join(lines)
 
 
-# ── Batch extraction ───────────────────────────────────────────────────────────
+# ── Stage 1: compress a batch of articles → fact lines ────────────────────────
 
-def _extract_batch(batch: list[dict], graph_snapshot: str) -> list[dict]:
+def _compress_batch(batch: list[dict], run_id: str | None = None) -> list[str]:
     """
-    Single LLM call: batch of news articles (title + snippet) + graph snapshot → net-new facts.
-    Each batch is ~25 articles — small enough for fast free-tier response (<30s).
+    Fast LLM call: 15 article titles+snippets → dense TICKER|FACT|DIR lines.
+    No JSON, no schema — just plain text. Completes in ~5s on free tier.
     """
     today = datetime.utcnow().strftime("%Y-%m-%d")
     articles = []
     for i, r in enumerate(batch):
         if not r.get("title"):
             continue
-        snippet = r.get("snippet", "").strip()
-        if snippet:
-            articles.append(f"[{i+1}] {r['title']}\n    {snippet[:250]}")
-        else:
-            articles.append(f"[{i+1}] {r['title']}")
+        snippet = r.get("snippet", "").strip()[:150]
+        articles.append(f"[{i+1}] {r['title']}" + (f" — {snippet}" if snippet else ""))
+    if not articles:
+        return []
     news_block = "\n".join(articles)
-    prompt_body = f"TODAY: {today}\n\n{graph_snapshot}\n\n=== NEWS BATCH ===\n{news_block}"
+    prompt_body = f"TODAY: {today}\n\n=== NEWS BATCH ===\n{news_block}"
 
-    raw = _kg_llm(KG_EXTRACT_SYSTEM_PROMPT, prompt_body)
+    raw = query_agent(KG_COMPRESS_PROMPT, prompt_body,
+                      caller="kg_compress", run_id=run_id,
+                      timeout=30, retries=1)
     if not raw:
         return []
+    lines = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if line.startswith("TICKER:") and "| FACT:" in line and "| DIR:" in line:
+            lines.append(line)
+    return lines
 
+
+# ── Stage 2: extract KG facts for one ticker from compressed lines ─────────────
+
+def _extract_ticker_facts(ticker: str, fact_lines: list[str],
+                           graph_snapshot: str, run_id: str | None = None) -> list[dict]:
+    """
+    One LLM call per ticker: compressed fact lines + graph snapshot → KG JSON events.
+    Input is tiny (just facts relevant to this ticker) → fast and focused.
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    facts_block = "\n".join(fact_lines)
+    prompt_body = (
+        f"TODAY: {today}\n"
+        f"FOCUS TICKER: {ticker}\n\n"
+        f"{graph_snapshot}\n\n"
+        f"=== COMPRESSED FACTS ===\n{facts_block}"
+    )
+    raw = query_agent(KG_EXTRACT_PROMPT, prompt_body,
+                      caller="kg_extract", run_id=run_id,
+                      timeout=30, retries=1)
+    if not raw:
+        return []
     facts = []
     for line in raw.strip().splitlines():
         line = line.strip()
@@ -323,11 +345,15 @@ def _detect_markets_for_event(event_label: str, event_summary: str,
 def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
                                run_id: str, now: datetime = None) -> int:
     """
-    Parallel batch KG ingest:
-      - Build graph snapshot (DB, fast) once
-      - Split articles into batches of 25, run each batch as a parallel LLM call
-      - Each call: ~25 titles + graph snapshot → up to 6 net-new facts
-      - 3 batches × parallel = ~1 LLM latency instead of 2 sequential
+    Two-stage parallel KG ingest — no timeout needed:
+
+    Stage 1 — Compress (parallel, ~5s per batch):
+      Split articles into batches of 15 → each batch → fast LLM call →
+      TICKER|FACT|DIR lines. No JSON schema. All batches in parallel.
+
+    Stage 2 — Graph extract (parallel, one call per ticker, ~5s each):
+      Group compressed facts by ticker → one focused LLM call per ticker →
+      KG nodes/edges JSON. All tickers run in parallel.
 
     Returns number of new edges added.
     """
@@ -341,26 +367,88 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
     if not items:
         return 0
 
-    # Build graph snapshot once (pure DB, fast)
+    # ── Stage 1: compress articles → fact lines ───────────────────────────────
+    # Hard cap: process at most 60 articles (4 batches) to stay within Vercel's
+    # 5-minute function limit. Articles are already sorted by recency so we
+    # take the freshest ones.
+    STAGE1_ARTICLE_CAP = 60
+    STAGE1_TIMEOUT_S   = 60   # wall-clock budget for all Stage 1 batches
+
+    capped_items = items[:STAGE1_ARTICLE_CAP]
     t0 = time.time()
+    batches = [capped_items[i:i+15] for i in range(0, len(capped_items), 15)]
+    print(f"[KG] Stage 1: compressing {len(capped_items)} articles in {len(batches)} parallel batches…")
+
+    all_fact_lines: list[str] = []
+    with ThreadPoolExecutor(max_workers=min(len(batches), 4)) as pool:
+        futures = [pool.submit(_compress_batch, batch, run_id) for batch in batches]
+        try:
+            for f in as_completed(futures, timeout=STAGE1_TIMEOUT_S):
+                try:
+                    all_fact_lines.extend(f.result())
+                except Exception as e:
+                    print(f"[KG] Compress batch failed: {e}")
+        except FuturesTimeoutError:
+            print("[KG] Stage 1 wall-clock budget exceeded — using facts collected so far")
+    print(f"[KG] Stage 1 done in {time.time()-t0:.1f}s — {len(all_fact_lines)} fact lines extracted")
+
+    if not all_fact_lines:
+        return 0
+
+    # ── Stage 2: group facts by ticker, extract KG per ticker ─────────────────
+    STAGE2_TICKER_CAP  = 8    # max tickers to run Stage 2 for
+    STAGE2_TIMEOUT_S   = 90   # wall-clock budget for all Stage 2 calls
+
+    # Build graph snapshot once (pure DB, fast)
     graph_snapshot = _build_graph_snapshot(db)
-    print(f"[KG] Graph snapshot built in {time.time()-t0:.1f}s")
 
-    # Split into batches of 25, cap at 3 batches (75 articles max)
-    batches = [items[i:i+25] for i in range(0, min(len(items), 75), 25)]
-    print(f"[KG] Running {len(batches)} parallel batch{'es' if len(batches)>1 else ''} ({len(items)} articles)...")
+    # Group fact lines by ticker symbol
+    ticker_facts: dict[str, list[str]] = {}
+    macro_facts: list[str] = []
+    for line in all_fact_lines:
+        # Parse: "TICKER: NVDA | FACT: ... | DIR: ..."
+        try:
+            ticker_part = line.split("|")[0].replace("TICKER:", "").strip()
+        except Exception:
+            continue
+        if not ticker_part or ticker_part == "MACRO":
+            macro_facts.append(line)
+        else:
+            ticker_facts.setdefault(ticker_part, []).append(line)
 
-    # Run all batches in parallel
+    # Each ticker also gets the macro facts for broader context
+    # Build per-ticker fact lists (own facts + macro, capped at 20 lines)
+    # Prioritise tickers with the most facts, cap total tickers at STAGE2_TICKER_CAP
+    extract_targets: dict[str, list[str]] = {}
+    sorted_tickers = sorted(ticker_facts.items(), key=lambda x: -len(x[1]))
+    for ticker, lines in sorted_tickers[:STAGE2_TICKER_CAP]:
+        extract_targets[ticker] = (lines + macro_facts)[:20]
+
+    # If there are only macro facts with no specific tickers, use a MACRO bucket
+    if not extract_targets and macro_facts:
+        extract_targets["MACRO"] = macro_facts[:20]
+
     t1 = time.time()
+    print(f"[KG] Stage 2: extracting KG for {len(extract_targets)} ticker(s) in parallel…")
+
     all_facts: list[dict] = []
-    with ThreadPoolExecutor(max_workers=len(batches)) as pool:
-        futures = [pool.submit(_extract_batch, batch, graph_snapshot) for batch in batches]
-        for f in as_completed(futures):
-            try:
-                all_facts.extend(f.result())
-            except Exception as e:
-                print(f"[KG] Batch failed: {e}")
-    print(f"[KG] All batches done in {time.time()-t1:.1f}s — {len(all_facts)} facts extracted")
+    with ThreadPoolExecutor(max_workers=min(len(extract_targets), 4)) as pool:
+        futures = {
+            pool.submit(_extract_ticker_facts, ticker, lines, graph_snapshot, run_id): ticker
+            for ticker, lines in extract_targets.items()
+        }
+        try:
+            for f in as_completed(futures, timeout=STAGE2_TIMEOUT_S):
+                ticker = futures[f]
+                try:
+                    facts = f.result()
+                    all_facts.extend(facts)
+                    print(f"[KG]   {ticker}: {len(facts)} events")
+                except Exception as e:
+                    print(f"[KG]   {ticker} extract failed: {e}")
+        except FuturesTimeoutError:
+            print("[KG] Stage 2 wall-clock budget exceeded — using facts collected so far")
+    print(f"[KG] Stage 2 done in {time.time()-t1:.1f}s — {len(all_facts)} total facts")
 
     facts = all_facts
 
