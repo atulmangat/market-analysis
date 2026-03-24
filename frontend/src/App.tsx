@@ -5,8 +5,8 @@ import type {
   AgentMemory, AgentPrompt, AgentFitness, WebResearch,
   PipelineEvent, PipelineRun, LiveQuote, MarketEvent, Page, PipelineReadiness
 } from './types';
-import { NAV } from './constants';
-import { getToken, apiFetch, applyTheme, getMarketForTicker } from './utils';
+import { NAV, API } from './constants';
+import { getToken, apiFetch, applyTheme, getMarketForTicker, getCurrencySymbol } from './utils';
 
 import { Badge } from './components/Badge';
 import { ToastList } from './components/ToastList';
@@ -21,7 +21,108 @@ import { PortfolioPage } from './pages/PortfolioPage';
 import { AgentPage } from './pages/AgentPage';
 import { PipelinePage } from './pages/PipelinePage';
 import { SettingsPage } from './pages/SettingsPage';
+import LLMUsagePage from './pages/LLMUsagePage';
 import { PageLoader } from './components/PageLoader';
+
+// ── Nav icons ──────────────────────────────────────────────────────────────
+// Inline SVG icons — no dependency, pixel-perfect at 18×18
+
+const NAV_ICONS: Record<string, (props: React.SVGProps<SVGSVGElement>) => React.ReactElement> = {
+  // Dashboard — command grid with pulse dot
+  dashboard: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <rect x="2" y="2" width="6" height="6" rx="1.5"/>
+      <rect x="10" y="2" width="6" height="6" rx="1.5"/>
+      <rect x="2" y="10" width="6" height="6" rx="1.5"/>
+      <path d="M10 13h6M13 10v6"/>
+    </svg>
+  ),
+  // Markets — candlestick chart
+  markets: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <line x1="4"  y1="2"  x2="4"  y2="16"/>
+      <rect x="2.5" y="5"  width="3" height="5" rx="0.75" fill="currentColor" stroke="none" opacity="0.9"/>
+      <line x1="9"  y1="2"  x2="9"  y2="16"/>
+      <rect x="7.5" y="3"  width="3" height="6" rx="0.75" fill="currentColor" stroke="none" opacity="0.9"/>
+      <line x1="14" y1="4"  x2="14" y2="16"/>
+      <rect x="12.5" y="7" width="3" height="5" rx="0.75" fill="currentColor" stroke="none" opacity="0.9"/>
+    </svg>
+  ),
+  // Knowledge Graph — nodes connected in a network
+  graph: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" {...p}>
+      <circle cx="9"  cy="9"  r="2"   fill="currentColor" opacity="0.9" stroke="none"/>
+      <circle cx="3"  cy="4"  r="1.3" fill="currentColor" opacity="0.65" stroke="none"/>
+      <circle cx="15" cy="4"  r="1.3" fill="currentColor" opacity="0.65" stroke="none"/>
+      <circle cx="3"  cy="14" r="1.3" fill="currentColor" opacity="0.5"  stroke="none"/>
+      <circle cx="15" cy="14" r="1.3" fill="currentColor" opacity="0.5"  stroke="none"/>
+      <line x1="9" y1="9" x2="3"  y2="4"/>
+      <line x1="9" y1="9" x2="15" y2="4"/>
+      <line x1="9" y1="9" x2="3"  y2="14"/>
+      <line x1="9" y1="9" x2="15" y2="14"/>
+      <line x1="3" y1="4" x2="15" y2="4" opacity="0.4"/>
+    </svg>
+  ),
+  // Portfolio — stacked bar chart (capital allocation)
+  portfolio: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <line x1="2" y1="16" x2="16" y2="16"/>
+      <rect x="3"  y="9"  width="3" height="7" rx="0.75" fill="currentColor" stroke="none" opacity="0.9"/>
+      <rect x="7.5" y="5" width="3" height="11" rx="0.75" fill="currentColor" stroke="none" opacity="0.9"/>
+      <rect x="12" y="7" width="3" height="9" rx="0.75" fill="currentColor" stroke="none" opacity="0.9"/>
+      <path d="M3 7 L7.5 3.5 L12 5.5 L16 2" strokeWidth="1.3" opacity="0.7"/>
+    </svg>
+  ),
+  // Agents — brain with circuit traces (AI minds)
+  agents: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <path d="M6.5 4a3.5 3.5 0 0 1 5 5c0 1-.4 1.9-1 2.6L9 13l-1.5-1.4A3.5 3.5 0 0 1 6.5 4z"/>
+      <line x1="9"  y1="13" x2="9"  y2="16"/>
+      <line x1="7"  y1="15" x2="11" y2="15"/>
+      <line x1="7.5" y1="7.5" x2="10.5" y2="7.5" opacity="0.6"/>
+      <line x1="9"   y1="6"  x2="9"    y2="9"    opacity="0.6"/>
+    </svg>
+  ),
+  // Pipeline — linked workflow steps
+  pipeline: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <rect x="1"  y="7" width="4" height="4" rx="1"/>
+      <rect x="7"  y="7" width="4" height="4" rx="1"/>
+      <rect x="13" y="7" width="4" height="4" rx="1"/>
+      <line x1="5"  y1="9" x2="7"  y2="9"/>
+      <line x1="11" y1="9" x2="13" y2="9"/>
+      <path d="M3 7 V4 Q3 2 5 2 H13 Q15 2 15 4 V7" opacity="0.45"/>
+    </svg>
+  ),
+  // LLM Usage — CPU chip (compute/tokens)
+  llm: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" {...p}>
+      <rect x="5" y="5" width="8" height="8" rx="1.5"/>
+      <line x1="7" y1="5" x2="7" y2="2"/><line x1="11" y1="5" x2="11" y2="2"/>
+      <line x1="7" y1="13" x2="7" y2="16"/><line x1="11" y1="13" x2="11" y2="16"/>
+      <line x1="5" y1="7" x2="2" y2="7"/><line x1="5" y1="11" x2="2" y2="11"/>
+      <line x1="13" y1="7" x2="16" y2="7"/><line x1="13" y1="11" x2="16" y2="11"/>
+      <rect x="7.5" y="7.5" width="3" height="3" rx="0.75" fill="currentColor" stroke="none" opacity="0.7"/>
+    </svg>
+  ),
+  // Settings — tuning sliders
+  settings: (p) => (
+    <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" {...p}>
+      <line x1="2" y1="5"  x2="16" y2="5"/>
+      <line x1="2" y1="9"  x2="16" y2="9"/>
+      <line x1="2" y1="13" x2="16" y2="13"/>
+      <circle cx="6"  cy="5"  r="1.8" fill="var(--color-surface)" stroke="currentColor" strokeWidth="1.5"/>
+      <circle cx="12" cy="9"  r="1.8" fill="var(--color-surface)" stroke="currentColor" strokeWidth="1.5"/>
+      <circle cx="7"  cy="13" r="1.8" fill="var(--color-surface)" stroke="currentColor" strokeWidth="1.5"/>
+    </svg>
+  ),
+};
+
+function NavIcon({ id, className, style }: { id: string; className?: string; style?: React.CSSProperties }) {
+  const Icon = NAV_ICONS[id];
+  if (!Icon) return null;
+  return <Icon className={className} style={style} aria-hidden="true" />;
+}
 
 // ── Main App ───────────────────────────────────────────────────────────────
 
@@ -58,14 +159,13 @@ function AppInner() {
   const [reportError, setReportError]       = useState<string | null>(null);
   const [budgetInput, setBudgetInput]       = useState<string>('10000');
   const [approvalMode, setApprovalMode]     = useState('auto');
-  const [scheduleInterval, setScheduleInterval] = useState<number>(60);
   const [scheduleResearch, setScheduleResearch] = useState<number>(60);
   const [scheduleTrade, setScheduleTrade]       = useState<number>(60);
   const [scheduleEval, setScheduleEval]         = useState<number>(120);
   const [isTriggering, setIsTriggering]     = useState(false);
   const isTriggeringRef = useRef(false);
   const [investmentFocus, setInvestmentFocus] = useState('');
-  const [investmentFocusSaved, setInvestmentFocusSaved] = useState(false);
+  const focusLoadedRef = useRef(false);
   const [strategiesLoaded, setStrategiesLoaded] = useState(false);
   const [dataLoaded, setDataLoaded] = useState(false);
   // URL path ↔ Page mapping. '/agents' maps to the internal 'memory' page id.
@@ -76,6 +176,7 @@ function AppInner() {
     '/portfolio': 'portfolio',
     '/agents':    'memory',
     '/pipeline':  'pipeline',
+    '/llm':       'llm',
     '/settings':  'settings',
   };
   const PAGE_TO_URL: Record<Page, string> = {
@@ -85,6 +186,7 @@ function AppInner() {
     portfolio: '/portfolio',
     memory:    '/agents',
     pipeline:  '/pipeline',
+    llm:       '/llm',
     settings:  '/settings',
   };
 
@@ -113,7 +215,9 @@ function AppInner() {
 
 
 
-  const userNavigatedRef = useRef(false);
+  // If the user loaded the app directly on a non-default page (e.g. /markets),
+  // treat it as an intentional navigation — don't redirect them to /pipeline.
+  const userNavigatedRef = useRef(pageFromPath() !== 'dashboard');
   const [darkMode, setDarkMode]             = useState<boolean>(() => {
     const saved = localStorage.getItem('theme');
     const isDark = saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -150,10 +254,10 @@ function AppInner() {
 
   const fetchData = async () => {
     try {
-      const [stratRes, mktRes, debRes, appRes, memRes, resRes, schedRes, agentRes] = await Promise.all([
+      const [stratRes, mktRes, debRes, appRes, memRes, resRes, agentRes] = await Promise.all([
         apiFetch('/strategies'),
         apiFetch('/config/markets'), apiFetch('/debates'), apiFetch('/config/approval_mode'),
-        apiFetch('/memory'), apiFetch('/research'), apiFetch('/config/schedule'),
+        apiFetch('/memory'), apiFetch('/research'),
         apiFetch('/agents'),
       ]);
       if (stratRes.ok) setStrategies(await stratRes.json());
@@ -164,7 +268,6 @@ function AppInner() {
       if (appRes.ok) { const d = await appRes.json(); setApprovalMode(d.approval_mode); }
       if (memRes.ok) setMemories(await memRes.json());
       if (resRes.ok) { const d = await resRes.json(); setResearch(d); try { localStorage.setItem('cache_research', JSON.stringify(d)); } catch { /* storage quota */ } }
-      if (schedRes.ok) { const d = await schedRes.json(); setScheduleInterval(d.interval_minutes); }
       if (agentRes.ok) setAgents(await agentRes.json());
       const [fitnessRes, budgetRes, pnlRes, focusRes, schedRRes, schedTRes, schedERes] = await Promise.all([
         apiFetch('/agents/fitness'),
@@ -178,7 +281,7 @@ function AppInner() {
       if (fitnessRes.ok) setAgentFitness(await fitnessRes.json());
       if (budgetRes.ok) { const d = await budgetRes.json(); setBudgetInput(d.trading_budget.toString()); }
       if (pnlRes.ok) setPortfolio(await pnlRes.json());
-      if (focusRes.ok) { const d = await focusRes.json(); setInvestmentFocus(d.investment_focus ?? ''); }
+      if (focusRes.ok && !focusLoadedRef.current) { const d = await focusRes.json(); setInvestmentFocus(d.investment_focus ?? ''); focusLoadedRef.current = true; }
       if (schedRRes.ok) { const d = await schedRRes.json(); setScheduleResearch(d.interval_minutes); }
       if (schedTRes.ok) { const d = await schedTRes.json(); setScheduleTrade(d.interval_minutes); }
       if (schedERes.ok) { const d = await schedERes.json(); setScheduleEval(d.interval_minutes); }
@@ -229,8 +332,12 @@ function AppInner() {
   const lastTriggerAtRef = useRef<{ research: number; trade: number; eval: number }>({ research: 0, trade: 0, eval: 0 });
   const TRIGGER_GUARD_MS = 6000; // ignore backend running=false for 6s after trigger
 
-  const [pipelineEvents, setPipelineEvents]       = useState<PipelineEvent[]>([]);
-  const [pipelineRunId, setPipelineRunId]         = useState<string | null>(null);
+  // SSE connections — one per pipeline type, keyed by run_id currently streamed
+  type SseEntry = { es: EventSource; runId: string };
+  const sseRefs = useRef<{ research: SseEntry | null; trade: SseEntry | null; eval: SseEntry | null }>({
+    research: null, trade: null, eval: null,
+  });
+
   // Per-pipeline running state — single object so all fields update atomically
   const [pipelineStatus, setPipelineStatus] = useState({
     researchRunning: false, tradeRunning: false, evalRunning: false,
@@ -253,14 +360,10 @@ function AppInner() {
     evalEvents:     [] as PipelineEvent[],
   });
   const { researchEvents, tradeEvents, evalEvents } = pipelineTabEvents;
-  const setResearchEvents = (v: PipelineEvent[]) => setPipelineTabEvents(s => ({ ...s, researchEvents: v }));
-  const setTradeEvents    = (v: PipelineEvent[]) => setPipelineTabEvents(s => ({ ...s, tradeEvents: v }));
-  const setEvalEvents     = (v: PipelineEvent[]) => setPipelineTabEvents(s => ({ ...s, evalEvents: v }));
   const [researchStepOpen, setResearchStepOpen]   = useState(false);
   const [pendingDropdownOpen, setPendingDropdownOpen] = useState(false);
   const [disableMarketPrompt, setDisableMarketPrompt] = useState<{ name: string; affected: Strategy[] } | null>(null);
   const [pipelineRuns, setPipelineRuns]           = useState<PipelineRun[]>([]);
-  const [pipelineRunsLoaded, setPipelineRunsLoaded] = useState(false);
   const [pipelineReadiness, setPipelineReadiness] = useState<PipelineReadiness>({ has_research_data: false, last_research_at: null, active_positions: 0 });
   const [selectedRunId, setSelectedRunId]         = useState<string | null>(null);
   const [selectedRunEvents, setSelectedRunEvents] = useState<PipelineEvent[]>([]);
@@ -271,42 +374,74 @@ function AppInner() {
   const [kgRefreshTrigger, setKgRefreshTrigger] = useState(0);
   const lastKgRunIdRef = useRef<string | null>(null);
 
+  // Global Esc handler — closes whichever modal is open
   useEffect(() => {
-    const pollPipeline = async () => {
-      try {
-        const res = await apiFetch('/pipeline/events');
-        if (res.ok) {
-          const data = await res.json();
-          const runId = data.run_id as string | null;
-          // Trust the backend's is_running flag — it includes the stale-lock guard.
-          // Do NOT re-derive from run_step: an intermediate step with is_running=false
-          // means the pipeline died mid-step, not that it's still running.
-          const running = !!data.is_running;
-          // Do NOT call setIsTriggering here — /system/status is the single source of truth
-          // for isTriggering (it includes the per-pipeline flags + trigger guard). Calling it
-          // here too causes isTriggering to bounce between two values in a single poll tick,
-          // triggering the transition effect twice and making the UI flicker.
-          if (running) isTriggeringRef.current = true; // only set true optimistically; /system/status owns false
-          setPipelineRunId(runId);
-          // Always show events for the current run_id — don't clear on refresh
-          const events: PipelineEvent[] = data.events ?? [];
-          if (runId) {
-            setPipelineEvents(events);
-          } else {
-            setPipelineEvents([]);
-          }
-          if (running && !initialPollDoneRef.current && !userNavigatedRef.current) {
-            navigate('pipeline');
-          }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (reportStratId !== null) { setReportStratId(null); setReportData(null); setReportError(null); return; }
+      if (disableMarketPrompt) { setDisableMarketPrompt(null); return; }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [reportStratId, disableMarketPrompt]);
+
+  useEffect(() => {
+    const closeSse = (type: 'research' | 'trade' | 'eval') => {
+      const entry = sseRefs.current[type];
+      if (entry) { entry.es.close(); sseRefs.current[type] = null; }
+    };
+
+    const openSse = (type: 'research' | 'trade' | 'eval', runId: string) => {
+      // Already streaming this run — do nothing
+      if (sseRefs.current[type]?.runId === runId) return;
+      closeSse(type);
+      // Clear stale events from the previous run
+      const evtKey = type === 'research' ? 'researchEvents' : type === 'trade' ? 'tradeEvents' : 'evalEvents';
+      setPipelineTabEvents(s => ({ ...s, [evtKey]: [] }));
+
+      const token = getToken();
+      if (!token) return;
+      const url = `${API}/pipeline/stream/${runId}?token=${encodeURIComponent(token)}`;
+      const es = new EventSource(url);
+
+      es.onmessage = (e) => {
+        const evt = JSON.parse(e.data) as PipelineEvent;
+        if (type === 'research') {
+          setPipelineTabEvents(s => ({
+            ...s,
+            researchEvents: s.researchEvents.some(x => x.id === evt.id)
+              ? s.researchEvents
+              : [...s.researchEvents, evt],
+          }));
           // Refresh KG viewer as soon as KG_INGEST DONE appears (once per run)
-          const kgDone = events.some(e => e.step === 'KG_INGEST' && e.status === 'DONE');
-          if (kgDone && runId && lastKgRunIdRef.current !== runId) {
+          if (evt.step === 'KG_INGEST' && evt.status === 'DONE' && lastKgRunIdRef.current !== runId) {
             lastKgRunIdRef.current = runId;
             setKgRefreshTrigger(t => t + 1);
           }
-          initialPollDoneRef.current = true;
+        } else if (type === 'trade') {
+          setPipelineTabEvents(s => ({
+            ...s,
+            tradeEvents: s.tradeEvents.some(x => x.id === evt.id)
+              ? s.tradeEvents
+              : [...s.tradeEvents, evt],
+          }));
+        } else {
+          setPipelineTabEvents(s => ({
+            ...s,
+            evalEvents: s.evalEvents.some(x => x.id === evt.id)
+              ? s.evalEvents
+              : [...s.evalEvents, evt],
+          }));
         }
-      } catch { /* ignore */ }
+      };
+
+      es.addEventListener('done', () => { closeSse(type); });
+      es.onerror = () => { closeSse(type); };
+
+      sseRefs.current[type] = { es, runId };
+    };
+
+    const pollPipeline = async () => {
       try {
         const r = await apiFetch('/system/status');
         if (r.ok) {
@@ -331,22 +466,15 @@ function AppInner() {
             last_research_at: d.last_research_at ?? null,
             active_positions: d.active_positions ?? 0,
           });
-          // Fetch live events only while running, then update events atomically
-          const fetches: Promise<void>[] = [];
-          if (rr && ridR) fetches.push(
-            apiFetch(`/pipeline/runs/${ridR}`).then(r => r.ok ? r.json() : null)
-              .then(d => { if (d) setPipelineTabEvents(s => ({ ...s, researchEvents: d.events ?? [] })); }).catch(() => {})
-          );
-          if (tr && ridT) fetches.push(
-            apiFetch(`/pipeline/runs/${ridT}`).then(r => r.ok ? r.json() : null)
-              .then(d => { if (d) setPipelineTabEvents(s => ({ ...s, tradeEvents: d.events ?? [] })); }).catch(() => {})
-          );
-          if (er && ridE) fetches.push(
-            apiFetch(`/pipeline/runs/${ridE}`).then(r => r.ok ? r.json() : null)
-              .then(d => { if (d) setPipelineTabEvents(s => ({ ...s, evalEvents: d.events ?? [] })); }).catch(() => {})
-          );
-          // No need to await — updates will arrive and trigger re-renders naturally
-          void fetches;
+          // Navigate to pipeline page on first poll if any pipeline is running
+          if (anyRunning && !initialPollDoneRef.current && !userNavigatedRef.current) {
+            navigate('pipeline');
+          }
+          initialPollDoneRef.current = true;
+          // Open SSE streams for running pipelines; close for stopped ones
+          if (rr && ridR) openSse('research', ridR); else closeSse('research');
+          if (tr && ridT) openSse('trade',    ridT); else closeSse('trade');
+          if (er && ridE) openSse('eval',     ridE); else closeSse('eval');
         }
       } catch { /* ignore */ }
       pollTimerRef.current = setTimeout(pollPipeline, isTriggeringRef.current ? 2000 : 8000);
@@ -358,7 +486,10 @@ function AppInner() {
     };
 
     pollPipeline();
-    return () => { if (pollTimerRef.current) clearTimeout(pollTimerRef.current); };
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+      closeSse('research'); closeSse('trade'); closeSse('eval');
+    };
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -407,6 +538,12 @@ function AppInner() {
       setMarkets(p => { const u = p.map(m => m.market_name === name ? { ...m, is_enabled: 1 } : m); localStorage.setItem('markets', JSON.stringify(u)); return u; });
       apiFetch('/config/markets', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify([{ market_name: name, is_enabled: true }]) }).catch(console.error);
     }
+  };
+
+  const reloadMarkets = () => {
+    apiFetch('/config/markets').then(r => r.ok ? r.json() : null).then(d => {
+      if (d) { setMarkets(d); localStorage.setItem('markets', JSON.stringify(d)); }
+    }).catch(() => {});
   };
 
   const setMode = (mode: string) => {
@@ -470,37 +607,10 @@ function AppInner() {
   const [tickerSearchLoading, setTickerSearchLoading] = useState(false);
 
   const saveInvestmentFocus = (text: string) => {
-    setInvestmentFocusSaved(true);
-    setTimeout(() => setInvestmentFocusSaved(false), 2000);
     apiFetch('/config/investment_focus', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ investment_focus: text }),
     }).catch(console.error);
-  };
-
-  const handleManualTrigger = (tickers?: string[]) => {
-    if (isTriggering) return;
-    isTriggeringRef.current = true;
-    setIsTriggering(true);
-    const body = tickers && tickers.length > 0 ? { tickers } : {};
-    setTimeout(() => { triggerPollRef.current?.(); }, 500);
-    apiFetch('/trigger', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-      .then(res => res.json())
-      .then(data => {
-        if (data.status === 'error') { isTriggeringRef.current = false; setIsTriggering(false); alert(data.message); }
-        else {
-          if (data.run_id) setPipelineRunId(data.run_id);
-          setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000);
-        }
-      })
-      .catch(() => { isTriggeringRef.current = false; setIsTriggering(false); });
-  };
-
-  const handleScheduleUpdate = (minutes: number) => {
-    setScheduleInterval(minutes);
-    apiFetch('/config/schedule', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ interval_minutes: minutes }) })
-      .then(() => apiFetch('/system/sync_schedule', { method: 'POST' }))
-      .catch(console.error);
   };
 
   const handleStopPipeline = (pipeline: 'research' | 'trade' | 'eval' = 'all' as never) => {
@@ -518,7 +628,7 @@ function AppInner() {
     if (evalRunning) return;
     lastTriggerAtRef.current.eval = Date.now();
     setEvalRunning(true);
-    setEvalEvents([]);
+    setPipelineTabEvents(s => ({ ...s, evalEvents: [] }));
     setTimeout(() => { triggerPollRef.current?.(); }, 500);
     apiFetch('/eval/trigger', { method: 'POST' })
       .then(res => res.json())
@@ -537,15 +647,28 @@ function AppInner() {
     if (researchRunning) return;
     lastTriggerAtRef.current.research = Date.now();
     setResearchRunning(true);
-    setResearchEvents([]);
+    setPipelineTabEvents(s => ({ ...s, researchEvents: [] }));
     setTimeout(() => { triggerPollRef.current?.(); }, 500);
-    apiFetch('/research/trigger', { method: 'POST' })
+    apiFetch('/research/trigger', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        investment_focus: investmentFocus.trim(),
+        tickers: focusTickers,
+      }),
+    })
       .then(res => res.json())
       .then(data => {
         if (data.status === 'error') { setResearchRunning(false); toast(data.message, 'err'); }
         else {
-          if (data.run_id) { setCurrentRunIdResearch(data.run_id); setPipelineRunId(data.run_id); }
-          toast('Research pipeline started', 'ok');
+          if (data.run_id) { setCurrentRunIdResearch(data.run_id); }
+          // Populate focus chips with LLM-resolved tickers
+          if (data.resolved_tickers?.length) {
+            setFocusTickers(data.resolved_tickers);
+            toast(`Focused on: ${data.resolved_tickers.join(', ')}`, 'ok');
+          } else {
+            toast('Research pipeline started', 'ok');
+          }
           setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000);
         }
       })
@@ -556,15 +679,27 @@ function AppInner() {
     if (tradeRunning) return;
     lastTriggerAtRef.current.trade = Date.now();
     setTradeRunning(true);
-    setTradeEvents([]);
+    setPipelineTabEvents(s => ({ ...s, tradeEvents: [] }));
     setTimeout(() => { triggerPollRef.current?.(); }, 500);
-    apiFetch('/trade/trigger', { method: 'POST' })
+    apiFetch('/trade/trigger', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        investment_focus: investmentFocus.trim(),
+        tickers: focusTickers,
+      }),
+    })
       .then(res => res.json())
       .then(data => {
         if (data.status === 'error') { setTradeRunning(false); toast(data.message, 'err'); }
         else {
-          if (data.run_id) { setCurrentRunIdTrade(data.run_id); setPipelineRunId(data.run_id); }
-          toast('Trade pipeline started', 'ok');
+          if (data.run_id) { setCurrentRunIdTrade(data.run_id); }
+          if (data.resolved_tickers?.length) {
+            setFocusTickers(data.resolved_tickers);
+            toast(`Trades scoped to: ${data.resolved_tickers.join(', ')}`, 'ok');
+          } else {
+            toast('Trade pipeline started', 'ok');
+          }
           setTimeout(() => { triggerPollRef.current?.(); fetchData(); }, 1000);
         }
       })
@@ -619,7 +754,7 @@ function AppInner() {
     const wasRunning = prevIsTriggering.current;
     const isNowRunning = isTriggering;
     if (!wasRunning && isNowRunning) {
-      setPipelineEvents([]);
+      setPipelineTabEvents({ researchEvents: [], tradeEvents: [], evalEvents: [] });
     }
     prevIsTriggering.current = isNowRunning;
   }, [isTriggering]);
@@ -676,6 +811,7 @@ function AppInner() {
       case 'markets':
         return (
           <MarketsPage
+            markets={markets}
             enabledMarketNames={enabledMarketNames}
             activeStrategies={activeStrategies}
             pendingStrategies={pendingStrategies}
@@ -688,6 +824,7 @@ function AppInner() {
             setQuotesStockTab={setQuotesStockTab}
             watchlist={watchlist}
             setWatchlist={setWatchlist}
+            onMarketsChange={reloadMarkets}
             marketsSearchOpen={marketsSearchOpen}
             setMarketsSearchOpen={setMarketsSearchOpen}
             marketsSearchQuery={marketsSearchQuery}
@@ -697,10 +834,8 @@ function AppInner() {
             marketsSearchLoading={marketsSearchLoading}
             setMarketsSearchLoading={setMarketsSearchLoading}
             marketsSearchTimer={marketsSearchTimer}
-            isTriggering={isTriggering}
             fetchQuotes={fetchQuotes}
             openReport={openReport}
-            onTrigger={handleManualTrigger}
             onApprove={handleApproval}
           />
         );
@@ -740,7 +875,6 @@ function AppInner() {
       case 'pipeline':
         return (
           <PipelinePage
-            isTriggering={isTriggering}
             researchRunning={researchRunning}
             tradeRunning={tradeRunning}
             evalRunning={evalRunning}
@@ -750,10 +884,7 @@ function AppInner() {
             researchEvents={researchEvents}
             tradeEvents={tradeEvents}
             evalEvents={evalEvents}
-            pipelineEvents={pipelineEvents}
-            pipelineRunId={pipelineRunId}
             pipelineRuns={pipelineRuns}
-            pipelineRunsLoaded={pipelineRunsLoaded}
             selectedRunId={selectedRunId}
             setSelectedRunId={setSelectedRunId}
             selectedRunEvents={selectedRunEvents}
@@ -762,13 +893,11 @@ function AppInner() {
             setSelectedRunLoading={setSelectedRunLoading}
             loadRunEvents={loadRunEvents}
             setPipelineRuns={setPipelineRuns}
-            setPipelineRunsLoaded={setPipelineRunsLoaded}
             researchStepOpen={researchStepOpen}
             setResearchStepOpen={setResearchStepOpen}
             research={research}
             investmentFocus={investmentFocus}
             setInvestmentFocus={setInvestmentFocus}
-            investmentFocusSaved={investmentFocusSaved}
             saveInvestmentFocus={saveInvestmentFocus}
             focusTickers={focusTickers}
             setFocusTickers={setFocusTickers}
@@ -782,7 +911,6 @@ function AppInner() {
             setTickerSearchResults={setTickerSearchResults}
             tickerSearchLoading={tickerSearchLoading}
             setTickerSearchLoading={setTickerSearchLoading}
-            handleManualTrigger={handleManualTrigger}
             handleStopPipeline={(pipeline) => handleStopPipeline(pipeline ?? 'all' as never)}
             handleEvalTrigger={handleEvalTrigger}
             handleResearchTrigger={handleResearchTrigger}
@@ -794,8 +922,16 @@ function AppInner() {
             pipelineReadiness={pipelineReadiness}
             enabledMarketNames={enabledMarketNames}
             openReport={openReport}
+            clearTabEvents={(tab) => setPipelineTabEvents(s => ({
+              ...s,
+              researchEvents: tab === 'research' ? [] : s.researchEvents,
+              tradeEvents:    tab === 'trade'    ? [] : s.tradeEvents,
+              evalEvents:     tab === 'eval'     ? [] : s.evalEvents,
+            }))}
           />
         );
+      case 'llm':
+        return <LLMUsagePage />;
       case 'settings':
         return (
           <SettingsPage
@@ -805,10 +941,7 @@ function AppInner() {
             setMode={setMode}
             markets={markets}
             toggleMarket={toggleMarket}
-            scheduleInterval={scheduleInterval}
-            handleScheduleUpdate={handleScheduleUpdate}
-            handleManualTrigger={handleManualTrigger}
-            isTriggering={isTriggering}
+            reloadMarkets={reloadMarkets}
           />
         );
       default:
@@ -817,67 +950,120 @@ function AppInner() {
   };
 
   return (
-    <div className="flex min-h-screen bg-background overflow-hidden">
+    <div className="flex min-h-dvh bg-background overflow-hidden">
       {/* ── Sidebar ── */}
-      <aside className="w-52 shrink-0 border-r border-borderLight bg-surface flex flex-col overflow-hidden">
+      <aside
+        className="w-[212px] shrink-0 flex flex-col overflow-hidden"
+        style={{
+          background: 'var(--color-surface)',
+          borderRight: '1px solid var(--color-borderLight)',
+          boxShadow: '4px 0 32px rgba(0,0,0,0.2)',
+        }}
+      >
         {/* Logo */}
-        <div className="px-5 py-[18px] border-b border-borderLight">
+        <div className="px-4 pt-5 pb-4" style={{ borderBottom: '1px solid var(--color-borderLight)' }}>
           <div className="flex items-center gap-3">
-            <div className="h-8 w-8 rounded-lg bg-brand-600 flex items-center justify-center shrink-0">
-              <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
-                <path d="M2 12 L5 8 L8 10 L11 5 L14 7" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/>
-                <circle cx="14" cy="7" r="1.5" fill="white"/>
+            {/* App logomark: knowledge-graph nodes + upward signal */}
+            <div
+              className="h-8 w-8 rounded-xl flex items-center justify-center shrink-0"
+              style={{
+                background: 'linear-gradient(135deg, #1d4ed8 0%, #4f46e5 60%, #7c3aed 100%)',
+                boxShadow: '0 0 16px rgba(79,70,229,0.55), 0 2px 6px rgba(0,0,0,0.35)',
+              }}
+            >
+              <svg width="18" height="18" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                {/* Central hub node */}
+                <circle cx="10" cy="10" r="2.2" fill="white" opacity="0.95"/>
+                {/* Satellite nodes */}
+                <circle cx="4"  cy="5"  r="1.4" fill="white" opacity="0.7"/>
+                <circle cx="16" cy="5"  r="1.4" fill="white" opacity="0.7"/>
+                <circle cx="4"  cy="15" r="1.4" fill="white" opacity="0.55"/>
+                <circle cx="16" cy="15" r="1.4" fill="white" opacity="0.55"/>
+                {/* Edges from hub */}
+                <line x1="10" y1="10" x2="4"  y2="5"  stroke="white" strokeWidth="1.1" opacity="0.6"/>
+                <line x1="10" y1="10" x2="16" y2="5"  stroke="white" strokeWidth="1.1" opacity="0.6"/>
+                <line x1="10" y1="10" x2="4"  y2="15" stroke="white" strokeWidth="1.1" opacity="0.4"/>
+                <line x1="10" y1="10" x2="16" y2="15" stroke="white" strokeWidth="1.1" opacity="0.4"/>
+                {/* Upward signal arrow on top-right node */}
+                <path d="M14.5 2.5 L16 5 L17.5 2.5" stroke="white" strokeWidth="1.1" strokeLinecap="round" strokeLinejoin="round" opacity="0.9"/>
               </svg>
             </div>
             <div>
-              <p className="text-[13px] font-semibold text-textMain leading-none tracking-tight">Market Intel</p>
-              <p className="text-[10px] text-textDim mt-0.5 tracking-wide">AI Strategy Engine</p>
+              <p className="text-[13px] font-bold text-textMain leading-none tracking-tight">Market Intel</p>
+              <p className="text-[9px] mt-1 tracking-[0.14em] uppercase font-semibold" style={{ color: 'var(--color-textDim)' }}>AI Engine</p>
             </div>
           </div>
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 py-3 px-2.5 space-y-px">
-          {NAV.map(n => (
-            <button
-              key={n.id}
-              onClick={() => { userNavigatedRef.current = true; navigate(n.id); }}
-              className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-[13px] font-medium transition-all text-left group ${
-                page === n.id
-                  ? 'bg-brand-600/12 text-brand-400'
-                  : 'text-textDim hover:text-textMuted hover:bg-surface2'
-              }`}
-            >
-              <span className={`text-sm w-4 text-center shrink-0 transition-colors ${
-                page === n.id ? 'text-brand-400' :
-                n.id === 'pipeline' && isTriggering ? 'text-amber-400 animate-spin' :
-                'text-textDim group-hover:text-textMuted'
-              }`}>{n.icon}</span>
-              <span className="flex-1 truncate">{n.label}</span>
-              {n.id === 'pipeline' && isTriggering && (
-                <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
-              )}
-            </button>
-          ))}
+        <nav className="flex-1 py-3 px-2.5 space-y-0.5" aria-label="Main navigation">
+          {NAV.map(n => {
+            const isActive = page === n.id;
+            const isPipelineLive = n.id === 'pipeline' && isTriggering;
+            return (
+              <button
+                key={n.id}
+                onClick={() => { userNavigatedRef.current = true; navigate(n.id); }}
+                aria-current={isActive ? 'page' : undefined}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-[12.5px] font-medium transition-all duration-200 text-left group cursor-pointer ${
+                  isActive
+                    ? 'nav-active text-brand-400'
+                    : 'text-textDim hover:text-textMuted hover:bg-surface2'
+                }`}
+              >
+                <NavIcon
+                  id={n.icon}
+                  className={`w-[18px] h-[18px] shrink-0 transition-all duration-200 ${
+                    isActive
+                      ? 'text-brand-400'
+                      : isPipelineLive
+                        ? 'text-warning'
+                        : 'text-textDim group-hover:text-textMuted'
+                  }`}
+                  style={isActive ? { filter: 'drop-shadow(0 0 5px rgba(96,165,250,0.6))' } : undefined}
+                />
+                <span className="flex-1 truncate">{n.label}</span>
+                {isPipelineLive && (
+                  <span className="h-1.5 w-1.5 rounded-full bg-warning animate-pulse shrink-0" aria-label="Pipeline running" />
+                )}
+              </button>
+            );
+          })}
         </nav>
 
-        {/* Footer */}
-        <div className="px-3 py-3 border-t border-borderLight space-y-2">
-          <div className="flex items-center gap-2 px-3 py-2">
-            <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${isTriggering ? 'bg-amber-400 animate-pulse' : 'bg-up'}`} />
-            <button
-              onClick={() => isTriggering && navigate('pipeline')}
-              className={`text-[11px] truncate ${isTriggering ? 'text-amber-400 hover:underline cursor-pointer' : 'text-textDim'}`}
-            >
+        {/* Status footer */}
+        <div className="px-2.5 py-3 space-y-1" style={{ borderTop: '1px solid var(--color-borderLight)' }}>
+          <button
+            onClick={() => isTriggering && navigate('pipeline')}
+            className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl transition-all duration-200 ${isTriggering ? 'cursor-pointer' : 'cursor-default'}`}
+            style={isTriggering ? {
+              background: 'rgba(245,158,11,0.08)',
+              border: '1px solid rgba(245,158,11,0.18)',
+            } : undefined}
+            aria-label={isTriggering ? 'View pipeline' : 'System status'}
+          >
+            <span
+              className={`h-2 w-2 rounded-full shrink-0 ${isTriggering ? 'bg-warning animate-pulse' : 'bg-up'}`}
+              aria-hidden="true"
+            />
+            <span className={`text-[11px] truncate font-medium ${isTriggering ? 'text-warning' : 'text-textDim'}`}>
               {isTriggering ? 'Pipeline running…' : 'System active'}
-            </button>
-          </div>
+            </span>
+          </button>
           <button
             onClick={toggleDarkMode}
-            className="w-full flex items-center justify-between px-3 py-2 rounded-lg hover:bg-surface2 transition-colors group"
+            className="w-full flex items-center justify-between px-3 py-1.5 rounded-xl hover:bg-surface2 transition-colors duration-150 group cursor-pointer"
+            aria-label={`Switch to ${darkMode ? 'light' : 'dark'} mode`}
           >
-            <span className="text-[11px] text-textDim group-hover:text-textMuted">{darkMode ? 'Dark' : 'Light'}</span>
-            <span className="text-xs text-textDim">{darkMode ? '○' : '●'}</span>
+            <span className="text-[11px] text-textDim group-hover:text-textMuted transition-colors">
+              {darkMode ? 'Dark mode' : 'Light mode'}
+            </span>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="text-textDim group-hover:text-textMuted transition-colors" aria-hidden="true">
+              {darkMode
+                ? <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></>
+                : <path d="M21 12.79A9 9 0 1 1 11.21 3a7 7 0 0 0 9.79 9.79z"/>
+              }
+            </svg>
           </button>
         </div>
       </aside>
@@ -885,49 +1071,71 @@ function AppInner() {
       {/* ── Main content ── */}
       <main className="flex-1 min-w-0 overflow-y-auto h-screen">
         {/* Top bar */}
-        <header className="sticky top-0 z-10 bg-background/90 backdrop-blur-md border-b border-borderLight px-7 py-3.5 flex items-center justify-between">
+        <header
+          className="sticky top-0 z-10 px-6 py-3.5 flex items-center justify-between"
+          style={{
+            background: 'color-mix(in srgb, var(--color-surface) 90%, transparent)',
+            backdropFilter: 'blur(20px) saturate(1.5)',
+            WebkitBackdropFilter: 'blur(20px) saturate(1.5)',
+            borderBottom: '1px solid var(--color-borderLight)',
+          }}
+        >
           <div className="flex items-center gap-3">
-            <h1 className="text-sm font-semibold text-textMain">
-              {NAV.find(n => n.id === page)?.label}
-            </h1>
-            <span className="text-borderMid">·</span>
-            <p className="text-[11px] text-textDim tabular-nums">{new Date().toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>
+            <div className="flex items-center gap-2.5">
+              <NavIcon
+                id={NAV.find(n => n.id === page)?.icon ?? ''}
+                className="w-[15px] h-[15px] shrink-0"
+                style={{ color: 'var(--color-textDim)' }}
+              />
+              <h1 className="text-[14px] font-semibold text-textMain tracking-tight">
+                {NAV.find(n => n.id === page)?.label}
+              </h1>
+            </div>
+            <span className="h-3.5 w-px" style={{ background: 'var(--color-borderMid)' }} aria-hidden="true" />
+            <p className="text-[11px] text-textDim tabular font-mono">{new Date().toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>
           </div>
           <div className="flex items-center gap-2">
             {pendingStrategies.length > 0 && (
               <div className="relative">
                 <button
                   onClick={() => setPendingDropdownOpen(o => !o)}
-                  className="flex items-center gap-1.5 px-2.5 py-1.5 bg-amber-400/8 border border-amber-400/20 text-amber-400 rounded-lg text-[11px] font-medium hover:bg-amber-400/12 transition-colors"
+                  aria-expanded={pendingDropdownOpen}
+                  aria-haspopup="true"
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-warning-bg border border-warning/25 text-warning-text rounded-lg text-[11px] font-semibold hover:bg-warning/20 transition-all duration-150 cursor-pointer btn-lift"
                 >
-                  <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-warning pulse-live" aria-hidden="true" />
                   {pendingStrategies.length} pending
                 </button>
                 {pendingDropdownOpen && (
-                  <div className="absolute right-0 top-full mt-2 z-50 w-72 bg-surface border border-borderMid rounded-xl shadow-2xl overflow-hidden">
-                    <div className="px-4 py-2.5 border-b border-borderLight flex items-center justify-between">
-                      <span className="text-[11px] font-semibold text-textMuted uppercase tracking-wider">Pending Approval</span>
-                      <button onClick={() => setPendingDropdownOpen(false)} className="text-textDim hover:text-textMain text-base leading-none w-5 h-5 flex items-center justify-center">×</button>
+                  <div className="absolute right-0 top-full mt-2 z-50 w-80 bg-surface/95 backdrop-blur-xl rounded-2xl overflow-hidden border border-borderMid animate-scale-in" style={{ boxShadow: '0 16px 48px rgba(0,0,0,0.35), 0 0 0 1px rgba(255,255,255,0.04)' }} role="dialog" aria-label="Pending approvals">
+                    <div className="px-4 py-3 border-b border-borderLight flex items-center justify-between bg-surface2/60">
+                      <div className="flex items-center gap-2">
+                        <span className="h-1.5 w-1.5 rounded-full bg-warning pulse-live" aria-hidden="true" />
+                        <span className="text-[11px] font-semibold text-textMain uppercase tracking-wider">Pending Approval</span>
+                      </div>
+                      <button onClick={() => setPendingDropdownOpen(false)} aria-label="Close" className="text-textDim hover:text-textMain w-6 h-6 flex items-center justify-center rounded-md hover:bg-surface3 transition-colors cursor-pointer">
+                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M1 1l10 10M11 1L1 11"/></svg>
+                      </button>
                     </div>
                     <div className="divide-y divide-borderLight max-h-96 overflow-y-auto">
                       {pendingStrategies.map(s => (
-                        <div key={s.id} className="px-4 py-3 space-y-2.5">
+                        <div key={s.id} className="px-4 py-3 space-y-2.5 hover:bg-surface2/40 transition-colors">
                           <div className="flex items-center justify-between">
                             <div className="flex items-center gap-2">
-                              <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${s.strategy_type === 'LONG' ? 'bg-up/10 text-up border border-up/15' : 'bg-down/10 text-down border border-down/15'}`}>{s.strategy_type}</span>
-                              <span className="text-sm font-semibold text-textMain font-mono">{s.symbol}</span>
+                              <Badge type={s.strategy_type} />
+                              <span className="text-[13px] font-bold text-textMain font-mono tabular">{s.symbol}</span>
                             </div>
-                            <span className="text-[11px] text-textDim font-mono">${(s.entry_price ?? 0).toFixed(2)}</span>
+                            <span className="text-[11px] text-textDim font-mono tabular">{(s.entry_price ?? 0) > 0 ? `${getCurrencySymbol(getMarketForTicker(s.symbol))}${s.entry_price!.toFixed(2)}` : '—'}</span>
                           </div>
                           <p className="text-[11px] text-textMuted leading-relaxed line-clamp-2">{s.reasoning_summary}</p>
                           <div className="flex gap-2">
                             <button
                               onClick={() => { handleApproval(s.id, 'approve'); setPendingDropdownOpen(false); }}
-                              className="flex-1 py-1.5 text-[11px] font-semibold rounded-lg bg-up/10 border border-up/20 text-up hover:bg-up/15 transition-colors"
+                              className="flex-1 py-1.5 text-[11px] font-semibold rounded-lg bg-up-bg border border-up/25 text-up-text hover:bg-up/20 transition-colors duration-150 cursor-pointer"
                             >Approve</button>
                             <button
                               onClick={() => { handleApproval(s.id, 'reject'); setPendingDropdownOpen(false); }}
-                              className="flex-1 py-1.5 text-[11px] font-semibold rounded-lg bg-down/10 border border-down/20 text-down hover:bg-down/15 transition-colors"
+                              className="flex-1 py-1.5 text-[11px] font-semibold rounded-lg bg-down-bg border border-down/25 text-down-text hover:bg-down/20 transition-colors duration-150 cursor-pointer"
                             >Reject</button>
                           </div>
                         </div>
@@ -937,42 +1145,37 @@ function AppInner() {
                 )}
               </div>
             )}
-            <button
-              onClick={toggleDarkMode}
-              className="h-8 w-8 flex items-center justify-center rounded-lg border border-borderLight hover:bg-surface2 transition-colors text-textDim hover:text-textMuted"
-              title={darkMode ? 'Light mode' : 'Dark mode'}
-            >
-              <span className="text-xs">{darkMode ? '○' : '●'}</span>
-            </button>
           </div>
         </header>
 
-        <div className="px-7 py-6">
+        <div className="px-6 py-6 page-enter">
           {renderPage()}
         </div>
       </main>
 
       {/* Disable Market Confirmation Dialog */}
       {disableMarketPrompt && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm px-4">
-          <div className="bg-surface border border-borderMid rounded-2xl shadow-2xl w-full max-w-md p-6 space-y-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/65 backdrop-blur-sm px-4" role="dialog" aria-modal="true" aria-labelledby="disable-market-title">
+          <div className="glass border border-borderMid rounded-2xl shadow-[0_24px_64px_rgba(0,0,0,0.6)] w-full max-w-md p-6 space-y-4">
             <div className="flex items-start gap-3">
-              <span className="text-amber-400 text-xl shrink-0">⚠</span>
+              <div className="h-9 w-9 rounded-xl bg-warning-bg border border-warning/25 flex items-center justify-center shrink-0">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-warning" aria-hidden="true"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+              </div>
               <div>
-                <h3 className="text-sm font-semibold text-textMain">Disable {disableMarketPrompt.name} Market?</h3>
-                <p className="text-xs text-textMuted mt-1">
+                <h3 id="disable-market-title" className="text-[14px] font-semibold text-textMain">Disable {disableMarketPrompt.name} Market?</h3>
+                <p className="text-[12px] text-textMuted mt-1">
                   This will close {disableMarketPrompt.affected.length} active position{disableMarketPrompt.affected.length !== 1 ? 's' : ''} at current market price:
                 </p>
               </div>
             </div>
-            <div className="bg-surface2 rounded-lg divide-y divide-borderLight">
+            <div className="bg-surface2 rounded-xl border border-borderLight divide-y divide-borderLight overflow-hidden">
               {disableMarketPrompt.affected.map(s => (
-                <div key={s.id} className="flex items-center justify-between px-3 py-2">
+                <div key={s.id} className="flex items-center justify-between px-3.5 py-2.5">
                   <div className="flex items-center gap-2">
-                    <span className="text-xs font-mono font-bold text-textMain">{s.symbol}</span>
+                    <span className="text-[12px] font-mono font-bold text-textMain tabular">{s.symbol}</span>
                     <Badge type={s.strategy_type} />
                   </div>
-                  <span className={`text-xs font-mono ${(s.current_return ?? 0) >= 0 ? 'text-up' : 'text-down'}`}>
+                  <span className={`text-[12px] font-mono font-semibold tabular ${(s.current_return ?? 0) >= 0 ? 'text-up-text' : 'text-down-text'}`}>
                     {s.current_return != null ? `${s.current_return >= 0 ? '+' : ''}${s.current_return.toFixed(2)}%` : '—'}
                   </span>
                 </div>
@@ -981,13 +1184,13 @@ function AppInner() {
             <div className="flex gap-3 pt-1">
               <button
                 onClick={() => setDisableMarketPrompt(null)}
-                className="flex-1 py-2 rounded-lg border border-borderMid text-sm text-textMuted hover:text-textMain hover:border-borderMid transition-colors"
+                className="flex-1 py-2.5 rounded-xl border border-borderMid text-[13px] font-medium text-textMuted hover:text-textMain hover:border-textDim transition-colors duration-150 cursor-pointer"
               >
                 Cancel
               </button>
               <button
                 onClick={() => { const m = disableMarketPrompt; setDisableMarketPrompt(null); _doDisableMarket(m.name); }}
-                className="flex-1 py-2 rounded-lg bg-down text-white text-sm font-semibold hover:opacity-90 transition-opacity"
+                className="flex-1 py-2.5 rounded-xl bg-down text-white text-[13px] font-semibold hover:opacity-90 transition-opacity duration-150 cursor-pointer"
               >
                 Exit Positions & Disable
               </button>
@@ -1015,7 +1218,15 @@ function App() {
 
   const handleLogin = () => {
     setAuthed(true);
+    window.history.replaceState(null, '', '/dashboard');
   };
+
+  useEffect(() => {
+    if (!authed && window.location.pathname !== '/') {
+      window.history.replaceState(null, '', '/');
+    }
+  }, [authed]);
+
   if (!authed) return <LandingPage onLogin={handleLogin} />;
   return <AppInner />;
 }

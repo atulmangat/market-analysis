@@ -1,14 +1,16 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from core.database import get_db, SessionLocal
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from datetime import datetime
+import asyncio
 import json
 import math
 import core.models as models
 import yfinance as yf
-from core.auth import require_auth, verify_password, create_token, check_rate_limit, record_failed_attempt, record_success
+from core.auth import require_auth, verify_password, create_token, check_rate_limit, record_failed_attempt, record_success, verify_token
 from core.cache import cache_get, cache_set, cache_invalidate, cache_invalidate_prefix, cache_stats
 
 # TTL constants (seconds)
@@ -90,12 +92,12 @@ def _strategy_to_dict(s) -> dict:
         "current_return":   s.current_return,
         "reasoning_summary": s.reasoning_summary,
         "status":           s.status,
-        "timestamp":        s.timestamp.isoformat() if s.timestamp else None,
+        "timestamp":        s.timestamp.isoformat() + "Z" if s.timestamp else None,
         "position_size":    s.position_size,
         "exit_price":       s.exit_price,
         "realized_pnl":     s.realized_pnl,
         "close_reason":     s.close_reason,
-        "closed_at":        s.closed_at.isoformat() if s.closed_at else None,
+        "closed_at":        s.closed_at.isoformat() + "Z" if s.closed_at else None,
         "notes":            s.notes,
         "debate_round_id":  s.debate_round_id,
     }
@@ -320,7 +322,7 @@ def get_strategy_report(strategy_id: int, db: Session = Depends(get_db)):
                 ]
                 debate_block = {
                     "id":               dr.id,
-                    "timestamp":        dr.timestamp.isoformat(),
+                    "timestamp":        dr.timestamp.isoformat() + "Z",
                     "consensus_votes":  dr.consensus_votes,
                     "judge_reasoning":  dr.judge_reasoning,
                     "proposals":        proposals_with_match,
@@ -346,7 +348,7 @@ def get_strategy_report(strategy_id: int, db: Session = Depends(get_db)):
                 ]
                 debate_block = {
                     "id":               dr.id,
-                    "timestamp":        dr.timestamp.isoformat(),
+                    "timestamp":        dr.timestamp.isoformat() + "Z",
                     "consensus_votes":  dr.consensus_votes,
                     "judge_reasoning":  dr.judge_reasoning,
                     "proposals":        proposals_with_match,
@@ -359,8 +361,15 @@ def get_strategy_report(strategy_id: int, db: Session = Depends(get_db)):
         if dr and dr.report_json:
             try:
                 cached = json.loads(dr.report_json)
-                cached_chart = cached.get("chart")
-                cached_fundamentals = cached.get("fundamentals")
+                # Prefer per-ticker chart/fundamentals from maps (multi-verdict runs)
+                charts_map = cached.get("charts_map") or {}
+                fundamentals_map = cached.get("fundamentals_map") or {}
+                cached_chart = charts_map.get(s.symbol) or (
+                    cached.get("chart") if cached.get("chart", {}).get("symbol") == s.symbol else None
+                )
+                cached_fundamentals = fundamentals_map.get(s.symbol) or (
+                    cached.get("fundamentals") if not charts_map else None
+                )
             except Exception:
                 pass
 
@@ -409,7 +418,7 @@ def get_debates(db: Session = Depends(get_db)):
             "enabled_markets": d.enabled_markets,
             "research_context": d.research_context,
             "judge_reasoning": d.judge_reasoning,
-            "timestamp": d.timestamp.isoformat() if d.timestamp else None,
+            "timestamp": d.timestamp.isoformat() + "Z" if d.timestamp else None,
             "report_json": d.report_json,
         }
         for d in debates
@@ -421,30 +430,50 @@ def get_debates(db: Session = Depends(get_db)):
 
 @protected.get("/pipeline/events")
 def get_pipeline_events(db: Session = Depends(get_db)):
-    """Returns pipeline events for the current run_id so the frontend can poll at 2s."""
-    run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-    run_id = run_id_conf.value if run_id_conf else None
-
+    """Returns current pipeline state — which types are running and the most recent active run_id per type."""
     is_running = _is_pipeline_running(db)
 
-    # Stale-lock guard: if is_running=true but the run's step is done/error,
-    # or the last event is >90s old (thread died on reload), auto-clear the locks.
+    # Stale-lock guard: release locks if no activity in the last 90s
+    if is_running:
+        locks = db.query(models.AppConfig).filter(
+            models.AppConfig.key.in_(list(_PIPELINE_LOCK_KEYS.values())),
+            models.AppConfig.value == "1",
+        ).all()
+        for lock in locks:
+            pipeline_type = {v: k for k, v in _PIPELINE_LOCK_KEYS.items()}.get(lock.key)
+            run_id_key = f"current_run_id_{pipeline_type}" if pipeline_type else None
+            if run_id_key:
+                run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == run_id_key).first()
+                run_id = run_id_conf.value if run_id_conf else None
+                if run_id:
+                    run_row = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+                    if run_row and run_row.step in ("done", "error"):
+                        lock.value = "0"
+                        continue
+                    last_evt = db.query(models.PipelineEvent).filter(
+                        models.PipelineEvent.run_id == run_id
+                    ).order_by(models.PipelineEvent.created_at.desc()).first()
+                    if last_evt:
+                        age = (datetime.utcnow() - last_evt.created_at.replace(tzinfo=None)).total_seconds()
+                        if age > 90:
+                            lock.value = "0"
+        db.commit()
+        is_running = _is_pipeline_running(db)
+
+    # Return most recent active run per type
+    configs = db.query(models.AppConfig).filter(
+        models.AppConfig.key.in_([
+            "current_run_id_research", "current_run_id_trade", "current_run_id_eval"
+        ] + list(_PIPELINE_LOCK_KEYS.values()))
+    ).all()
+    cfg = {c.key: c.value for c in configs}
+
+    run_id = cfg.get("current_run_id_trade") or cfg.get("current_run_id_research") or cfg.get("current_run_id_eval")
     run_step = None
     events = []
     if run_id:
         run_row = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
         run_step = run_row.step if run_row else None
-
-        if is_running and run_step in ("done", "error"):
-            is_running = False
-            # Clear all active locks
-            locks = db.query(models.AppConfig).filter(
-                models.AppConfig.key.in_(list(_PIPELINE_LOCK_KEYS.values()))
-            ).all()
-            for l in locks:
-                l.value = "0"
-            db.commit()
-
         rows = (
             db.query(models.PipelineEvent)
             .filter(models.PipelineEvent.run_id == run_id)
@@ -452,35 +481,10 @@ def get_pipeline_events(db: Session = Depends(get_db)):
             .all()
         )
         events = [
-            {
-                "id":         e.id,
-                "step":       e.step,
-                "agent_name": e.agent_name,
-                "status":     e.status,
-                "detail":     e.detail,
-                "created_at": e.created_at.isoformat(),
-            }
+            {"id": e.id, "step": e.step, "agent_name": e.agent_name,
+             "status": e.status, "detail": e.detail, "created_at": e.created_at.isoformat() + "Z"}
             for e in rows
         ]
-
-        # Stale thread guard: lock held but no new events for >90s → thread died
-        if is_running and rows:
-            from datetime import timezone
-            last_event_time = rows[-1].created_at
-            # Handle both naive and tz-aware datetimes
-            now_naive = datetime.utcnow()
-            try:
-                age = (now_naive - last_event_time.replace(tzinfo=None)).total_seconds()
-            except Exception:
-                age = 0
-            if age > 90:
-                is_running = False
-                locks = db.query(models.AppConfig).filter(
-                    models.AppConfig.key.in_(list(_PIPELINE_LOCK_KEYS.values()))
-                ).all()
-                for l in locks:
-                    l.value = "0"
-                db.commit()
 
     return {"run_id": run_id, "is_running": is_running, "run_step": run_step, "events": events}
 
@@ -554,17 +558,17 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
     # ── 1 query: current run id + is_running ─────────────────────────────────
     configs = db.query(models.AppConfig).filter(
         models.AppConfig.key.in_([
-            "current_run_id", "current_run_id_research", "current_run_id_trade", "current_run_id_eval"
+            "current_run_id_research", "current_run_id_trade", "current_run_id_eval"
         ] + list(_PIPELINE_LOCK_KEYS.values()))
     ).all()
     cfg = {c.key: c.value for c in configs}
-    current_run_ids = {
-        cfg.get("current_run_id"),
-        cfg.get("current_run_id_research"),
-        cfg.get("current_run_id_trade"),
-        cfg.get("current_run_id_eval"),
+    # Map each run_id → whether its specific pipeline lock is currently held
+    _run_id_to_lock_running = {
+        cfg.get("current_run_id_research"): cfg.get("research_running") == "1",
+        cfg.get("current_run_id_trade"):    cfg.get("trade_running") == "1",
+        cfg.get("current_run_id_eval"):     cfg.get("eval_running") == "1",
     }
-    is_running = any(cfg.get(k) == "1" for k in _PIPELINE_LOCK_KEYS.values())
+    current_run_ids = set(_run_id_to_lock_running.keys()) - {None}
 
     # ── 1 query: pipeline run rows (step + params) ───────────────────────────
     pipeline_run_rows = {
@@ -573,6 +577,18 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
         .filter(models.PipelineRun.run_id.in_(run_ids)).all()
     }
     run_steps = {rid: r.step for rid, r in pipeline_run_rows.items()}
+
+    # ── 1 query: last-event timestamp per run (used for "recently active = still running" heuristic) ──
+    from sqlalchemy import func as _func
+    from datetime import timedelta as _td
+    _recent_threshold = datetime.utcnow() - _td(minutes=3)
+    _last_evt_rows = (
+        db.query(models.PipelineEvent.run_id, _func.max(models.PipelineEvent.created_at).label("last_at"))
+        .filter(models.PipelineEvent.run_id.in_(run_ids))
+        .group_by(models.PipelineEvent.run_id)
+        .all()
+    )
+    _last_evt_by_run = {r.run_id: r.last_at for r in _last_evt_rows}
 
     # ── 1 query: all strategies that fall within any run's time window ────────
     min_start = min(r.started_at for r in rows)
@@ -607,12 +623,18 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
         pr_row = pipeline_run_rows.get(row.run_id)
         is_eval = pr_row and getattr(pr_row, "run_type", "debate") == "eval"
         is_current_run = row.run_id in current_run_ids
+        # Use the specific lock for this run's pipeline type, not a global "any running" flag.
+        this_run_lock_held = _run_id_to_lock_running.get(row.run_id, False)
+        # A run with recent activity (last event < 3 min ago) and an intermediate step
+        # is still running — even if the lock was transiently cleared (engine mid-step).
+        last_evt_at = _last_evt_by_run.get(row.run_id)
+        recently_active = last_evt_at is not None and last_evt_at >= _recent_threshold
         # MEMORY_WRITE DONE is the most authoritative "complete" signal.
         # Even if there are intermediate ERROR events (e.g. KG_INGEST failed but
         # pipeline recovered), the run is "done" if MEMORY_WRITE completed.
         if row.run_id in complete_by_run or step == "done" or row.run_id in deploy_by_run:
             status = "done"
-        elif is_current_run and is_running:
+        elif (is_current_run and this_run_lock_held) or (step in _INTERMEDIATE_STEPS and recently_active):
             status = "running"
         elif step in _INTERMEDIATE_STEPS:
             status = "error"
@@ -621,10 +643,12 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
         else:
             status = "error"  # unknown/incomplete (None step, no deploy)
 
-        # All strategies created within this run's time window (may be multiple)
+        # Only trade/debate runs deploy strategies — skip for research/eval runs
+        run_type_val = pipeline_run_rows.get(row.run_id)
+        _is_trade_run = not run_type_val or run_type_val.run_type in ("trade", "debate", None)
         run_strategies = [
             s for s in strategies_in_window
-            if row.started_at <= s.timestamp <= row.ended_at
+            if _is_trade_run and row.started_at <= s.timestamp <= row.ended_at
         ]
         # Use the first strategy's debate round as the canonical one
         first_strategy = run_strategies[0] if run_strategies else None
@@ -700,8 +724,8 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
         result.append({
             "run_id":        row.run_id,
             "run_type":      (run_type.run_type if run_type and hasattr(run_type, "run_type") else "debate") or "debate",
-            "started_at":    row.started_at.isoformat(),
-            "ended_at":      row.ended_at.isoformat(),
+            "started_at":    row.started_at.isoformat() + "Z",
+            "ended_at":      row.ended_at.isoformat() + "Z",
             "event_count":   row.event_count,
             "status":        status,
             "run_step":      run_steps.get(row.run_id),
@@ -722,9 +746,19 @@ def get_pipeline_runs(type: str = None, db: Session = Depends(get_db)):
 def get_pipeline_run_events(run_id: str, db: Session = Depends(get_db)):
     """Returns all events for a specific pipeline run."""
     cache_key = f"run_events:{run_id}"
+    run_row = db.query(models.PipelineRun).filter(models.PipelineRun.run_id == run_id).first()
+    run_is_done = run_row is not None and run_row.step in ("done", "error")
     cached = cache_get(cache_key)
     if cached is not None:
-        return cached
+        # If the run is done but we have a stale mid-run snapshot cached, bust it.
+        if run_is_done:
+            cached_events = cached.get("events", []) if isinstance(cached, dict) else []
+            has_terminal = any(e.get("status") in ("DONE", "ERROR") for e in cached_events[-3:]) if cached_events else False
+            if not has_terminal:
+                cache_invalidate_prefix(cache_key)
+                cached = None
+        if cached is not None:
+            return cached
     rows = (
         db.query(models.PipelineEvent)
         .filter(models.PipelineEvent.run_id == run_id)
@@ -738,16 +772,79 @@ def get_pipeline_run_events(run_id: str, db: Session = Depends(get_db)):
             "agent_name": e.agent_name,
             "status":     e.status,
             "detail":     e.detail,
-            "created_at": e.created_at.isoformat(),
+            "created_at": e.created_at.isoformat() + "Z",
         }
         for e in rows
     ]
     result = {"run_id": run_id, "events": events}
-    # Only cache if this run is complete (has a DONE or ERROR terminal event)
-    is_current_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-    if not (is_current_conf and is_current_conf.value == run_id):
+    # Only cache once the run is fully complete to avoid storing a partial event list.
+    if run_is_done:
         cache_set(cache_key, result, _TTL_RUN_EVENTS)
     return result
+
+
+@router.get("/pipeline/stream/{run_id}")
+async def stream_pipeline_events(
+    run_id: str,
+    token: Optional[str] = Query(default=None),
+    last_event_id: Optional[int] = Query(default=None, alias="lastEventId"),
+):
+    """SSE stream of PipelineEvents for a run. Auth via ?token= query param."""
+    if not token or not verify_token(token):
+        from fastapi.responses import Response
+        return Response(status_code=401, content="Unauthorized")
+
+    async def event_generator():
+        seen_id = last_event_id or 0
+        # Send a comment immediately so the browser confirms the connection opened
+        yield ": connected\n\n"
+        while True:
+            db = SessionLocal()
+            try:
+                run_row = db.query(models.PipelineRun).filter(
+                    models.PipelineRun.run_id == run_id
+                ).first()
+                if run_row is None:
+                    yield f"event: error\ndata: {json.dumps({'detail': 'run not found'})}\n\n"
+                    return
+
+                rows = (
+                    db.query(models.PipelineEvent)
+                    .filter(
+                        models.PipelineEvent.run_id == run_id,
+                        models.PipelineEvent.id > seen_id,
+                    )
+                    .order_by(models.PipelineEvent.created_at.asc())
+                    .all()
+                )
+                for evt in rows:
+                    data = {
+                        "id":         evt.id,
+                        "step":       evt.step,
+                        "agent_name": evt.agent_name,
+                        "status":     evt.status,
+                        "detail":     evt.detail,
+                        "created_at": evt.created_at.isoformat() + "Z",
+                    }
+                    yield f"id: {evt.id}\ndata: {json.dumps(data)}\n\n"
+                    seen_id = evt.id
+
+                if run_row.step in ("done", "error"):
+                    yield f"event: done\ndata: {json.dumps({'step': run_row.step})}\n\n"
+                    return
+            finally:
+                db.close()
+
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # --- Live Quotes Endpoint ---
@@ -782,15 +879,29 @@ def _fetch_yahoo_chart(symbol: str, range_: str = "5d", interval: str = "1d") ->
 
 
 @protected.get("/quotes")
-def get_live_quotes():
+def get_live_quotes(db: Session = Depends(get_db)):
     """Fetch live quotes for all tickers across all markets (not filtered by debate config)."""
     import math as _math
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     tickers = []
+    seen: set[str] = set()
     for market, syms in MARKET_TICKERS.items():
         for s in syms:
-            tickers.append((market, s))
+            if s not in seen:
+                tickers.append((market, s))
+                seen.add(s)
+
+    # Also include custom tickers saved via Settings / Markets page
+    for mc in db.query(models.MarketConfig).all():
+        if mc.custom_tickers:
+            try:
+                for s in json.loads(mc.custom_tickers):
+                    if s not in seen:
+                        tickers.append((mc.market_name, s))
+                        seen.add(s)
+            except Exception:
+                pass
 
     results = []
 
@@ -984,6 +1095,22 @@ def get_agent_fitness(db: Session = Depends(get_db)):
     result = []
     for a in agents:
         fitness = _compute_fitness(db, a.agent_name)
+        total_all = db.query(models.AgentPrediction).filter(
+            models.AgentPrediction.agent_name == a.agent_name,
+            models.AgentPrediction.score != None,
+        ).count()
+        wins_all = db.query(models.AgentPrediction).filter(
+            models.AgentPrediction.agent_name == a.agent_name,
+            models.AgentPrediction.actual_outcome == "PROFIT",
+        ).count()
+        losses_all = db.query(models.AgentPrediction).filter(
+            models.AgentPrediction.agent_name == a.agent_name,
+            models.AgentPrediction.actual_outcome == "LOSS",
+        ).count()
+        pending_all = db.query(models.AgentPrediction).filter(
+            models.AgentPrediction.agent_name == a.agent_name,
+            models.AgentPrediction.actual_outcome == None,
+        ).count()
         gen = db.query(models.AgentPromptHistory).filter(
             models.AgentPromptHistory.agent_name == a.agent_name
         ).count() + 1
@@ -1010,11 +1137,15 @@ def get_agent_fitness(db: Session = Depends(get_db)):
             "win_rate":      fitness["win_rate"],
             "avg_return":    fitness["avg_return"],
             "total_scored":  fitness["total_scored"],
+            "total_all":     total_all,
+            "wins_all":      wins_all,
+            "losses_all":    losses_all,
+            "pending_all":   pending_all,
             "streak":        streak,
-            "updated_at":    a.updated_at.isoformat() if a.updated_at else None,
+            "updated_at":    a.updated_at.isoformat() + "Z" if a.updated_at else None,
             "last_evolution": {
                 "reason":   last_evo.evolution_reason,
-                "replaced_at": last_evo.replaced_at.isoformat() if last_evo and last_evo.replaced_at else None,
+                "replaced_at": last_evo.replaced_at.isoformat() + "Z" if last_evo and last_evo.replaced_at else None,
                 "fitness_score": last_evo.fitness_score,
             } if last_evo else None,
             "recent_predictions": [
@@ -1023,7 +1154,7 @@ def get_agent_fitness(db: Session = Depends(get_db)):
                     "prediction": p.prediction,
                     "score":    p.score,
                     "actual_outcome": p.actual_outcome,
-                    "timestamp": p.timestamp.isoformat() if p.timestamp else None,
+                    "timestamp": p.timestamp.isoformat() + "Z" if p.timestamp else None,
                 }
                 for p in recent_preds
             ],
@@ -1055,8 +1186,8 @@ def get_agent_evolution(agent_name: str, db: Session = Depends(get_db)):
             "total_scored":    h.total_scored,
             "evolution_reason": h.evolution_reason,
             "system_prompt":   h.system_prompt,
-            "replaced_at":     h.replaced_at.isoformat() if h.replaced_at else None,
-            "created_at":      h.created_at.isoformat() if h.created_at else None,
+            "replaced_at":     h.replaced_at.isoformat() + "Z" if h.replaced_at else None,
+            "created_at":      h.created_at.isoformat() + "Z" if h.created_at else None,
         }
         for h in history
     ]
@@ -1082,7 +1213,7 @@ def get_agent_predictions(agent_name: str, db: Session = Depends(get_db)):
             "reasoning":      p.reasoning,
             "actual_outcome": p.actual_outcome,
             "score":          p.score,
-            "timestamp":      p.timestamp.isoformat() if p.timestamp else None,
+            "timestamp":      p.timestamp.isoformat() + "Z" if p.timestamp else None,
         }
         for p in preds
     ]
@@ -1100,7 +1231,7 @@ def get_agents(db: Session = Depends(get_db)):
             "agent_name": a.agent_name,
             "description": a.description,
             "system_prompt": a.system_prompt,
-            "updated_at": a.updated_at.isoformat() if a.updated_at else None,
+            "updated_at": a.updated_at.isoformat() + "Z" if a.updated_at else None,
         }
         for a in agents
     ]
@@ -1260,7 +1391,7 @@ def get_all_memory(db: Session = Depends(get_db)):
             "note_type": m.note_type,
             "content": m.content,
             "source_debate_id": m.source_debate_id,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "created_at": m.created_at.isoformat() + "Z" if m.created_at else None,
         }
         for m in memories
     ]
@@ -1284,7 +1415,7 @@ def get_agent_memory(agent_name: str, db: Session = Depends(get_db)):
             "note_type": m.note_type,
             "content": m.content,
             "source_debate_id": m.source_debate_id,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
+            "created_at": m.created_at.isoformat() + "Z" if m.created_at else None,
         }
         for m in memories
     ]
@@ -1342,7 +1473,7 @@ def get_research(db: Session = Depends(get_db)):
             "title": r.title,
             "snippet": r.snippet,
             "source_url": r.source_url,
-            "fetched_at": r.fetched_at.isoformat() if r.fetched_at else None,
+            "fetched_at": r.fetched_at.isoformat() + "Z" if r.fetched_at else None,
         }
         for r in research
     ]
@@ -1400,10 +1531,28 @@ def add_market_ticker(market_name: str, body: TickerAction, db: Session = Depend
     if conf.custom_tickers:
         try: custom = json.loads(conf.custom_tickers)
         except Exception: pass
-    if symbol not in custom:
+    is_new = symbol not in custom
+    if is_new:
         custom.append(symbol)
         conf.custom_tickers = json.dumps(custom)
         db.commit()
+
+    # Kick off a background price + news prefetch so the card isn't empty
+    if is_new:
+        import threading
+        def _prefetch(sym: str, mkt: str):
+            try:
+                from data.market import fetch_market_data
+                fetch_market_data(sym)
+            except Exception as e:
+                print(f"[AddTicker] price prefetch failed for {sym}: {e}")
+            try:
+                from data.research import fetch_web_research
+                fetch_web_research(enabled_tickers={mkt: [sym]})
+            except Exception as e:
+                print(f"[AddTicker] research prefetch failed for {sym}: {e}")
+        threading.Thread(target=_prefetch, args=(symbol, market_name), daemon=True).start()
+
     return {"market": market_name, "custom_tickers": custom}
 
 @protected.delete("/config/markets/{market_name}/tickers/{symbol}")
@@ -1497,6 +1646,18 @@ def approve_strategy(action: ApprovalAction, db: Session = Depends(get_db)):
     if strategy.status != "PENDING":
         return {"error": f"Strategy is already {strategy.status}"}
     if action.action == "approve":
+        # Ensure we have a valid entry price before approving
+        if not strategy.entry_price or strategy.entry_price <= 0:
+            from data.market import fetch_market_data
+            sig = fetch_market_data(strategy.symbol)
+            if sig and sig.price and sig.price > 0:
+                strategy.entry_price = sig.price
+            else:
+                # Cannot approve without a valid entry price — auto-reject
+                strategy.status = "REJECTED"
+                strategy.close_reason = "NO_PRICE"
+                db.commit()
+                return {"error": f"Rejected: could not fetch a live price for {strategy.symbol}. Strategy has been marked REJECTED."}
         strategy.status = "ACTIVE"
     elif action.action == "reject":
         strategy.status = "REJECTED"
@@ -1535,49 +1696,6 @@ def cleanup_duplicate_strategies(db: Session = Depends(get_db)):
 
 import json as _json
 import uuid as _uuid
-
-class TriggerRequest(BaseModel):
-    tickers: List[str] | None = None
-
-@protected.post("/trigger")
-def manual_trigger(body: TriggerRequest = TriggerRequest(), db: Session = Depends(get_db)):
-    """Manually triggers a new debate round via the pipeline chain. Optionally pass {"tickers": ["AAPL", "NVDA"]} to focus the run."""
-    if _is_type_running(db, "trade"):
-        return {"status": "error", "message": "A data extraction is already running. Please wait."}
-
-    focus = [t.strip().upper() for t in body.tickers if t.strip()] if body.tickers else None
-
-    _acquire_lock(db, "trade")
-    run_id = str(_uuid.uuid4())
-
-    focus_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "investment_focus").first()
-    investment_focus = focus_conf.value.strip() if focus_conf and focus_conf.value else ""
-
-    run = models.PipelineRun(
-        run_id=run_id,
-        run_type="trade",
-        step="pending",
-        investment_focus=investment_focus,
-        focus_tickers=_json.dumps(focus) if focus else None,
-    )
-    db.add(run)
-    _upsert_config(db, "current_run_id_trade", run_id)
-    db.commit()
-
-    # Invalidate all caches that are affected by a pipeline run completing
-    cache_invalidate_prefix("pipeline_runs_")
-    cache_invalidate("debates")
-    cache_invalidate("research")
-    cache_invalidate("memory_all")
-    cache_invalidate("agents_fitness")
-    cache_invalidate("kg_full")
-    cache_invalidate_prefix("kg_ticker:")
-
-    from pipeline.runner import run_full_pipeline
-    run_full_pipeline(run_id)
-
-    msg = f"Focused pipeline run on: {', '.join(focus)}" if focus else "Full pipeline started."
-    return {"status": "success", "message": msg, "run_id": run_id}
 
 class ResearchTriggerBody(BaseModel):
     investment_focus: str = ""
@@ -1626,8 +1744,9 @@ def trigger_research(body: ResearchTriggerBody = ResearchTriggerBody(), db: Sess
     cache_invalidate("kg_full")
     cache_invalidate_prefix("kg_ticker:")
 
+    import threading as _threading
     from pipeline.runner import run_research_pipeline
-    run_research_pipeline(run_id)
+    _threading.Thread(target=run_research_pipeline, args=(run_id,), daemon=False).start()
 
     msg = f"Research scoped to: {', '.join(resolved_tickers)}" if resolved_tickers else "Research pipeline started."
     return {"status": "success", "message": msg, "run_id": run_id, "resolved_tickers": resolved_tickers}
@@ -1679,8 +1798,9 @@ def trigger_trade(body: TradeTriggerBody = TradeTriggerBody(), db: Session = Dep
     cache_invalidate("memory_all")
     cache_invalidate("agents_fitness")
 
+    import threading as _threading
     from pipeline.runner import run_trade_pipeline
-    run_trade_pipeline(run_id)
+    _threading.Thread(target=run_trade_pipeline, args=(run_id,), daemon=False).start()
 
     msg = f"Trade generation scoped to: {', '.join(resolved_tickers)}" if resolved_tickers else "Trade pipeline started."
     return {"status": "success", "message": msg, "run_id": run_id, "resolved_tickers": resolved_tickers}
@@ -1792,7 +1912,7 @@ def get_system_status(db: Session = Depends(get_db)):
             .first()
         )
         if last_evt:
-            last_research_at = last_evt.created_at.isoformat()
+            last_research_at = last_evt.created_at.isoformat() + "Z"
 
     active_positions = db.query(models.DeployedStrategy).filter(
         models.DeployedStrategy.status.in_(["ACTIVE", "PENDING"])
@@ -1932,39 +2052,13 @@ def resume_pipeline_run(run_id: str, db: Session = Depends(get_db)):
     db.commit()
 
     cache_invalidate_prefix("pipeline_runs_")
+    import threading as _threading
     from pipeline.runner import resume_pipeline
-    resume_pipeline(run_id)
+    _threading.Thread(target=resume_pipeline, args=(run_id,), daemon=False).start()
     return {"status": "resuming", "run_id": run_id, "from_step": run.step}
-
-def _get_schedule_interval(db: Session) -> int:
-    """Helper: returns schedule interval in minutes. Defaults to 60."""
-    conf = db.query(models.AppConfig).filter(models.AppConfig.key == "schedule_interval_minutes").first()
-    if not conf:
-        conf = models.AppConfig(key="schedule_interval_minutes", value="60")
-        db.add(conf)
-        db.commit()
-    return int(conf.value)
-
-@protected.get("/config/schedule")
-def get_schedule(db: Session = Depends(get_db)):
-    return {"interval_minutes": _get_schedule_interval(db)}
 
 class ScheduleUpdate(BaseModel):
     interval_minutes: int
-
-@protected.post("/config/schedule")
-def set_schedule(update: ScheduleUpdate, db: Session = Depends(get_db)):
-    if update.interval_minutes < 1:
-        return {"error": "Interval must be at least 1 minute."}
-
-    conf = db.query(models.AppConfig).filter(models.AppConfig.key == "schedule_interval_minutes").first()
-    if conf:
-        conf.value = str(update.interval_minutes)
-    else:
-        db.add(models.AppConfig(key="schedule_interval_minutes", value=str(update.interval_minutes)))
-    db.commit()
-    return {"status": "success", "interval_minutes": update.interval_minutes}
-
 
 # ── Per-pipeline schedule endpoints ─────────────────────────────────────────
 
@@ -2087,13 +2181,21 @@ def set_investment_focus(body: dict, db: Session = Depends(get_db)):
 
 class ResolveFocusBody(BaseModel):
     focus: str
+    candidates: list[dict] = []  # pre-fetched ticker search results from frontend
 
 
 @protected.post("/focus/resolve")
 def resolve_focus(body: ResolveFocusBody):
-    """Resolve a free-text focus description into specific ticker symbols via LLM."""
-    from pipeline.orchestrator import resolve_focus_to_tickers
-    tickers = resolve_focus_to_tickers(body.focus.strip())
+    """Resolve a free-text focus description into specific ticker symbols via LLM.
+
+    If `candidates` are provided (pre-fetched via /search/tickers), skips the
+    web-search + extraction steps and goes straight to the picker LLM call.
+    """
+    from pipeline.orchestrator import resolve_focus_to_tickers, resolve_focus_from_candidates
+    if body.candidates:
+        tickers = resolve_focus_from_candidates(body.focus.strip(), body.candidates)
+    else:
+        tickers = resolve_focus_to_tickers(body.focus.strip())
     return {"tickers": tickers}
 
 
