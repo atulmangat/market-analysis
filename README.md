@@ -33,10 +33,11 @@ Deployed strategies are tracked against live prices. A validator loop closes pos
 | 🧬 **Prompt Evolution** | Fitness scored on win rate + avg return; underperforming agents are mutated or receive crossover from elite agents |
 | 🕸️ **Knowledge Graph** | LLM extracts EVENT nodes and relationships from news articles; agents query a 2-hop subgraph as context |
 | 📊 **Strategy Reports** | Each deployed trade generates a price chart + fundamentals report cached at pipeline time |
-| 📰 **Live Research** | Real-time news via Google News RSS + Yahoo Finance; cached 30 min to avoid redundant fetches |
+| 📰 **Live Research** | Real-time news via Google News RSS + Yahoo Finance; deduped by article hash and cached 30 min |
 | 📈 **Live P&L Tracking** | Active positions tracked against real market prices with auto stop-loss / take-profit |
 | 🌍 **4 Markets** | US Equities, India NSE, Crypto, MCX Futures — per-market enable/disable from settings |
-| ⚡ **Live Pipeline View** | Watch every step in real-time with per-step status, agent pills, and event logs |
+| ⚡ **Real-time Pipeline View** | Pipeline events streamed via SSE — no polling, updates appear within ~1s |
+| 💡 **LLM Usage Tracking** | Per-model token counts and cost breakdown across all pipeline runs |
 | 🔁 **Auto + Manual Modes** | Strategies deploy immediately (auto) or queue for manual approval |
 | ↻ **Pipeline Resume** | Failed or stopped runs can be resumed from their last checkpoint |
 
@@ -50,6 +51,7 @@ Deployed strategies are tracked against live prices. A validator loop closes pos
 │                                                              │
 │  1. WEB_RESEARCH                                             │
 │     Google News RSS + Yahoo Finance for all enabled tickers  │
+│     Articles deduped by hash — already-seen items skipped    │
 │     Cached 30 min. Falls back to DB cache if fetch fails.    │
 │                                                              │
 │  2. KG_INGEST                                                │
@@ -84,6 +86,10 @@ Background: Validator scores strategies vs live prices
   → agents below fitness 55/100 trigger prompt mutation
   → agents on 3+ loss streak trigger aggressive rewrite
   → elite agents (fitness > 70) donate strategy patterns via crossover
+
+Live view: Frontend subscribes to SSE stream per run_id
+  → events pushed within ~1s of being written to DB
+  → no polling; connection closes automatically on run done/error
 ```
 
 ---
@@ -182,7 +188,6 @@ npm run dev
 
 ```bash
 # Frontend → market-analysis.space (deploy from repo ROOT)
-cd market-analysis
 npx vercel --prod --yes
 
 # Backend → backend-jet-nine-93.vercel.app
@@ -212,34 +217,73 @@ npx vercel --prod --yes
 ```
 market-analysis/
 ├── backend/
-│   ├── main.py                   # FastAPI app + APScheduler cron setup
-│   ├── api/routes.py             # All REST endpoints under /api
+│   ├── main.py                    # FastAPI app + APScheduler / Vercel cron setup
+│   ├── api/routes.py              # All REST + SSE endpoints under /api
 │   ├── pipeline/
-│   │   ├── runner.py             # Full pipeline run (research → KG → agents → judge → deploy)
-│   │   ├── orchestrator.py       # Agent prompts, debate logic, judge, market config
-│   │   └── validator.py          # P&L scoring, fitness computation, prompt evolution
+│   │   ├── engine.py              # PipelineEngine — step runner, lock management, resume logic
+│   │   ├── runner.py              # Pipeline entry points (research, trade, eval)
+│   │   ├── orchestrator.py        # Agent prompts, debate logic, judge, market config
+│   │   ├── validator.py           # P&L scoring, fitness computation, prompt evolution
+│   │   ├── steps/                 # Discrete pipeline step classes (BaseStep ABC)
+│   │   │   ├── research.py        # WebResearchStep — fetches + dedupes news
+│   │   │   ├── agents.py          # AgentDebateStep — parallel LLM agent queries
+│   │   │   ├── consensus.py       # JudgeConsensusStep — judge LLM selects best trade
+│   │   │   └── deploy.py          # DeployStep — saves strategy + generates report
+│   │   └── sources/               # Data source adapters
+│   │       ├── web.py             # Google News RSS + Yahoo Finance fetcher
+│   │       └── graph.py           # Knowledge graph source adapter
 │   ├── agents/
-│   │   ├── llm.py                # OpenRouter wrapper (primary + fallback model retry)
-│   │   └── memory.py             # Per-agent persistent notes (max 200, tiered retrieval)
-│   ├── graph/knowledge.py        # KG ingest + 2-hop BFS retrieval
+│   │   ├── llm.py                 # OpenRouter wrapper (primary + fallback model retry)
+│   │   └── memory.py              # Per-agent persistent notes (max 200, tiered retrieval)
+│   ├── graph/knowledge.py         # KG ingest (LLM → EVENT nodes/edges) + 2-hop BFS retrieval
 │   ├── data/
-│   │   ├── research.py           # Google News RSS + Yahoo Finance fetcher
-│   │   ├── market.py             # Live price + news via yfinance
-│   │   ├── fundamentals.py       # Alpha Vantage / Finnhub enrichment
-│   │   └── macro.py              # FRED macro data
+│   │   ├── research.py            # Article fetch + seen-article dedup
+│   │   └── market.py              # Live price + news via yfinance
 │   └── core/
-│       ├── models.py             # SQLAlchemy models
-│       ├── database.py           # Neon PostgreSQL session factory
-│       ├── cache.py              # DB-backed cache with per-key TTL
-│       └── auth.py               # JWT auth
+│       ├── models.py              # SQLAlchemy models (incl. SeenArticle for dedup)
+│       ├── database.py            # Neon PostgreSQL session factory
+│       ├── cache.py               # DB-backed cache with per-key TTL
+│       └── auth.py                # JWT auth + rate limiting
 ├── frontend/
 │   └── src/
-│       ├── App.tsx               # Main orchestrator — all state, effects, handlers
-│       ├── pages/                # Dashboard, Markets, Portfolio, Pipeline, KnowledgeGraph, Settings, Agents
-│       ├── components/           # Badge, StatusChip, StatPill, KnowledgeGraphViewer, …
-│       └── templates/            # Stock/Crypto/Commodity report panels
-└── CLAUDE.md                     # AI coding instructions
+│       ├── App.tsx                # Main orchestrator — state, SSE connections, handlers
+│       ├── pages/
+│       │   ├── DashboardPage.tsx  # Overview — active strategies, agent fitness, recent runs
+│       │   ├── PipelinePage.tsx   # Live pipeline view with real-time SSE event stream
+│       │   ├── MarketsPage.tsx    # Live quotes + market enable/disable
+│       │   ├── PortfolioPage.tsx  # Open/closed positions, P&L
+│       │   ├── AgentPage.tsx      # Agent memory, prompts, fitness history
+│       │   ├── LLMUsagePage.tsx   # Token counts + cost breakdown per model
+│       │   └── SettingsPage.tsx   # Schedule, approval mode, focus tickers
+│       ├── components/            # Badge, StatusChip, StatPill, KnowledgeGraphViewer, …
+│       └── templates/             # Stock / Crypto / Commodity report panels
+└── docker-compose.yml             # Local dev stack (backend + postgres)
 ```
+
+---
+
+## API Reference
+
+Key endpoints under `/api`:
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/auth/login` | Get JWT token |
+| `POST` | `/trigger` | Start a pipeline run |
+| `GET` | `/system/status` | Running state + current run IDs |
+| `POST` | `/system/stop` | Force-stop a running pipeline |
+| `GET` | `/pipeline/runs` | List all runs (paginated, filterable by type) |
+| `GET` | `/pipeline/runs/{run_id}` | Full event log for a run |
+| `GET` | `/pipeline/stream/{run_id}` | **SSE** — live event stream for a run |
+| `GET` | `/strategies` | All deployed strategies |
+| `POST` | `/strategies/{id}/approve` | Approve a pending strategy |
+| `GET` | `/debates` | Debate round history |
+| `GET` | `/graph` | Knowledge graph nodes + edges |
+| `GET` | `/agents/memory` | Agent memory notes |
+| `GET` | `/agents/fitness` | Agent fitness scores + history |
+| `GET` | `/llm/usage` | LLM token + cost stats |
+
+Full interactive docs at `http://localhost:8000/docs`.
 
 ---
 
