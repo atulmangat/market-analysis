@@ -43,6 +43,221 @@ MARKET_TICKERS = {
 }
 
 
+FOCUS_EXTRACTOR_PROMPT = """You are a financial data analyst. The user wants to find stocks matching their query.
+You have been given web search results about this query.
+
+Step 1 — Extract company names mentioned in the search results that match the user's query.
+Step 2 — For each company, output a line: SEARCH: <company name as it would appear on a stock exchange>
+
+Rules:
+- Only extract real publicly traded companies directly relevant to the query
+- Output 3 to 8 SEARCH lines, one per company
+- Use the most recognisable English name (e.g. "Infosys" not "Infosys Limited BDR")
+- If the query names a specific company (e.g. "Atlassian"), output just that one
+- If no relevant companies are found in the results, output SEARCH: lines based on your knowledge
+- Output ONLY the SEARCH: lines, nothing else"""
+
+FOCUS_PICKER_PROMPT = """You are a financial data analyst. Given a user query and a list of verified stock symbols with their details, select the most relevant tickers.
+
+Rules:
+- Return ONLY a JSON array of ticker symbols. Example: ["NVDA", "INFY.NS", "TEAM"]
+- Pick between 1 and 8 tickers — the most directly relevant to the user's query
+- Prefer the primary exchange listing (NASDAQ/NYSE for US, .NS for India, -USD for crypto)
+- Do not include ETFs unless explicitly requested
+- Do not include any explanation or text outside the JSON array"""
+
+
+def _yf_search(company_name: str) -> list[dict]:
+    """Search yfinance for a company name, return top equity quotes."""
+    try:
+        import yfinance as yf
+        results = yf.Search(company_name, max_results=3).quotes
+        # Only keep primary exchange equities (filter out foreign ADRs and OTC pink sheets)
+        preferred = [
+            q for q in results
+            if q.get("quoteType") == "EQUITY"
+            and q.get("exchange", "") in ("NMS", "NYQ", "NGM", "NSI", "BSE", "CCC", "CMC")
+        ]
+        return preferred or [q for q in results if q.get("quoteType") == "EQUITY"]
+    except Exception:
+        return []
+
+
+def resolve_focus_from_candidates(investment_focus: str, candidates: list[dict], run_id: str | None = None) -> list[str]:
+    """
+    Fast path: skip web search + extraction, go straight to picker LLM call.
+    `candidates` is a list of dicts with keys: symbol, name, exchange, sector.
+    """
+    if not investment_focus or not candidates:
+        return []
+    try:
+        candidates_text = "\n".join(
+            f"  {c.get('symbol', '')} — {c.get('name', '')} ({c.get('exchange', '')}, {c.get('sector', '')})"
+            for c in candidates[:20]
+        )
+        picker_context = (
+            f'User query: "{investment_focus}"\n\n'
+            f"Verified stock candidates (from yfinance):\n{candidates_text}"
+        )
+        pick_response = query_agent(
+            FOCUS_PICKER_PROMPT,
+            picker_context,
+            caller="focus_resolver",
+            run_id=run_id,
+        )
+        if not pick_response:
+            return [c["symbol"] for c in candidates[:8] if c.get("symbol")]
+
+        match = re.search(r'\[.*?\]', pick_response.strip(), re.DOTALL)
+        if not match:
+            return [c["symbol"] for c in candidates[:8] if c.get("symbol")]
+
+        picked = json.loads(match.group(0))
+        valid = [
+            t.strip().upper() for t in picked
+            if isinstance(t, str) and re.match(r'^[A-Z0-9]{1,10}([.\-=][A-Z0-9]{1,5})?$', t.strip().upper())
+        ]
+        print(f"[focus_resolver] Fast-path tickers: {valid}")
+        return valid[:8]
+    except Exception as e:
+        print(f"[focus_resolver] Fast-path failed: {e}")
+        return [c["symbol"] for c in candidates[:8] if c.get("symbol")]
+
+
+def resolve_focus_to_tickers(investment_focus: str, run_id: str | None = None) -> list[str]:
+    """
+    Resolve a free-text investment focus into verified ticker symbols.
+
+    Flow:
+      1. Search Google News for the query to get real-world context
+      2. LLM extracts company names from the search results
+      3. yfinance Search verifies each company name → real ticker symbols
+      4. LLM picks the best tickers from the verified candidates
+    """
+    if not investment_focus or not investment_focus.strip():
+        return []
+
+    # Strip common noise words so bare company names are extracted correctly
+    _NOISE_RE = re.compile(r'\b(stock|stocks|share|shares|price|equity|ticker|invest(?:ing|ment)?|buy|sell|trade)\b', re.IGNORECASE)
+    focus = _NOISE_RE.sub('', investment_focus.strip()).strip()
+    if not focus:
+        focus = investment_focus.strip()
+    print(f"[focus_resolver] Resolving: '{focus}'")
+
+    try:
+        # ── Fast path: if query is short (≤3 words), try direct yfinance lookup first ──
+        words = focus.split()
+        if len(words) <= 3:
+            direct = _yf_search(focus)
+            if direct:
+                print(f"[focus_resolver] Direct yfinance hit for '{focus}': {[q.get('symbol') for q in direct]}")
+                verified_candidates = []
+                seen_symbols: set[str] = set()
+                for q in direct[:5]:
+                    sym = q.get("symbol", "")
+                    if sym and sym not in seen_symbols:
+                        seen_symbols.add(sym)
+                        verified_candidates.append({
+                            "symbol": sym,
+                            "name": q.get("longname") or q.get("shortname", sym),
+                            "exchange": q.get("exchDisp", ""),
+                            "sector": q.get("sectorDisp", ""),
+                        })
+                if verified_candidates:
+                    return resolve_focus_from_candidates(investment_focus.strip(), verified_candidates, run_id)
+
+        # ── Step 1: Web search for real-world context ─────────────────────
+        from data.research import _tavily_search
+        search_results = _tavily_search(f"{focus} stocks", max_results=10, topic="general")
+
+        search_text = "\n".join(
+            f"- {r['title']}: {r['snippet'][:150]}"
+            for r in search_results
+        ) or "(no search results)"
+
+        # ── Step 2: LLM extracts company names from search results ────────
+        extractor_context = (
+            f'User query: "{focus}"\n\n'
+            f"Web search results:\n{search_text}"
+        )
+        extraction = query_agent(
+            FOCUS_EXTRACTOR_PROMPT,
+            extractor_context,
+            caller="focus_resolver",
+            run_id=run_id,
+        )
+        if not extraction:
+            return []
+
+        # Parse SEARCH: lines
+        company_names = []
+        for line in extraction.strip().splitlines():
+            m = re.match(r"SEARCH:\s*(.+)", line.strip(), re.IGNORECASE)
+            if m:
+                company_names.append(m.group(1).strip())
+
+        print(f"[focus_resolver] Companies to search: {company_names}")
+
+        if not company_names:
+            return []
+
+        # ── Step 3: yfinance verifies each company → real symbols ─────────
+        verified_candidates = []
+        seen_symbols: set[str] = set()
+        for name in company_names[:10]:
+            quotes = _yf_search(name)
+            for q in quotes[:2]:
+                sym = q.get("symbol", "")
+                if sym and sym not in seen_symbols:
+                    seen_symbols.add(sym)
+                    verified_candidates.append({
+                        "symbol": sym,
+                        "name": q.get("longname") or q.get("shortname", sym),
+                        "exchange": q.get("exchDisp", ""),
+                        "sector": q.get("sectorDisp", ""),
+                    })
+
+        print(f"[focus_resolver] Verified candidates: {[c['symbol'] for c in verified_candidates]}")
+
+        if not verified_candidates:
+            return []
+
+        # ── Step 4: LLM picks best tickers from verified list ─────────────
+        candidates_text = "\n".join(
+            f"  {c['symbol']} — {c['name']} ({c['exchange']}, {c['sector']})"
+            for c in verified_candidates
+        )
+        picker_context = (
+            f'User query: "{focus}"\n\n'
+            f"Verified stock candidates (from yfinance):\n{candidates_text}"
+        )
+        pick_response = query_agent(
+            FOCUS_PICKER_PROMPT,
+            picker_context,
+            caller="focus_resolver",
+            run_id=run_id,
+        )
+        if not pick_response:
+            # Fallback: return all verified candidates up to 8
+            return [c["symbol"] for c in verified_candidates[:8]]
+
+        match = re.search(r'\[.*?\]', pick_response.strip(), re.DOTALL)
+        if not match:
+            return [c["symbol"] for c in verified_candidates[:8]]
+
+        picked = json.loads(match.group(0))
+        valid = [
+            t.strip().upper() for t in picked
+            if isinstance(t, str) and re.match(r'^[A-Z0-9]{1,10}([.\-=][A-Z0-9]{1,5})?$', t.strip().upper())
+        ]
+        print(f"[focus_resolver] Final tickers: {valid}")
+        return valid[:8]
+
+    except Exception as e:
+        print(f"[focus_resolver] Failed: {e}")
+        return []
+
+
 def get_enabled_markets(db: Session) -> dict:
     configs = db.query(models.MarketConfig).all()
     if not configs:
@@ -50,13 +265,34 @@ def get_enabled_markets(db: Session) -> dict:
             db.add(models.MarketConfig(market_name=market, is_enabled=1))
         db.commit()
         configs = db.query(models.MarketConfig).all()
-    return {c.market_name: MARKET_TICKERS[c.market_name]
-            for c in configs if c.is_enabled and c.market_name in MARKET_TICKERS}
+    result = {}
+    for c in configs:
+        if not c.is_enabled or c.market_name not in MARKET_TICKERS:
+            continue
+        base = list(MARKET_TICKERS[c.market_name])
+        if c.custom_tickers:
+            try:
+                extra = json.loads(c.custom_tickers)
+                for t in extra:
+                    if t not in base:
+                        base.append(t)
+            except Exception:
+                pass
+        result[c.market_name] = base
+    return result
 
 
 def build_market_constraint(enabled_markets: dict) -> str:
     if not enabled_markets:
         return "No markets are currently enabled. Default to US market tickers like AAPL, MSFT."
+    is_focused = list(enabled_markets.keys()) == ["Focused"]
+    if is_focused:
+        tickers = enabled_markets["Focused"]
+        return (
+            "⚠️  FOCUSED RUN — You MUST analyse and propose a trade for ONLY the following ticker(s). "
+            "Do NOT recommend any other asset:\n"
+            + "\n".join(f"  - {t}" for t in tickers)
+        )
     parts = [f"  - **{m}**: {', '.join(t)}" for m, t in enabled_markets.items()]
     return "You MUST pick your ticker from ONLY the following enabled markets:\n" + "\n".join(parts)
 
@@ -80,8 +316,28 @@ DEFAULT_AGENTS = {
         "State the specific catalyst and expected timeframe. State what would invalidate your thesis.\n\n"
         "RULES: Never recommend SPY/QQQ (too broad). Never recommend an asset purely on momentum without a fundamental anchor. "
         "Prefer assets where price has diverged from fundamentals due to short-term panic or irrational exuberance.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your full analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n"
+        "<2-3 sentences: the core mispricing or catalyst argument>\n\n"
+        "## VALUATION ANCHOR\n"
+        "Current P/E: X | Sector median P/E: Y | Forward P/E: Z | EV/EBITDA: W\n"
+        "Price vs analyst consensus target: X% upside/downside\n"
+        "Intrinsic value estimate: $X (method: DCF / comps / asset-based)\n\n"
+        "## CATALYST\n"
+        "Primary catalyst: <specific event + expected date within 2 weeks>\n"
+        "Secondary catalyst: <optional>\n\n"
+        "## SCENARIOS\n"
+        "Bull (30%): <what happens, price target>\n"
+        "Base (50%): <what happens, price target>\n"
+        "Bear (20%): <what happens, price level>\n\n"
+        "## RISK FACTORS\n"
+        "1. <specific risk>\n"
+        "2. <specific risk>\n\n"
+        "## INVALIDATION\n"
+        "Thesis breaks if: <specific condition — price level, event, or data point>\n\n"
+        "Then on a new line:\n"
+        "TICKER: SYMBOL\n"
+        "ACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Perform balanced fundamental analysis across all enabled markets."
     ),
@@ -104,8 +360,26 @@ DEFAULT_AGENTS = {
         "the price level that would invalidate the setup, and expected holding period (hours / days / week).\n\n"
         "RULES: Do not recommend assets with < 3 days of price data. Do not go against a strong trend without a reversal signal. "
         "If no clean setup exists, say so explicitly — but still pick the highest-probability trade available.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your full analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n"
+        "<2-3 sentences: the setup and why now>\n\n"
+        "## TECHNICAL LEVELS\n"
+        "Support: $X | Resistance: $Y\n"
+        "MA position: price vs 50d ($X) and 200d ($Y)\n"
+        "Volume trend: <accumulation / distribution / neutral>\n"
+        "RSI / momentum: <overbought / oversold / neutral>\n\n"
+        "## CATALYST\n"
+        "Setup trigger: <specific price event, pattern completion, or news catalyst>\n"
+        "Expected timing: <hours / days / this week>\n\n"
+        "## SCENARIOS\n"
+        "Bull (35%): breaks resistance at $X → target $Y\n"
+        "Base (45%): consolidates between $X–$Y, gradual trend\n"
+        "Bear (20%): breaks support at $X → stop at $Y\n\n"
+        "## INVALIDATION\n"
+        "Setup fails if: <price level or volume condition>\n\n"
+        "Then on a new line:\n"
+        "TICKER: SYMBOL\n"
+        "ACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Perform balanced technical analysis across all enabled markets."
     ),
@@ -131,8 +405,28 @@ DEFAULT_AGENTS = {
         "E.g. 'Fed signalled pause → risk-on → BTC and tech outperform → LONG BTC-USD for 1–2 weeks.'\n\n"
         "RULES: Never trade a macro theme that is more than 1 week old without fresh confirmation. "
         "Always specify which asset class the macro driver most directly benefits/hurts.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your full analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n"
+        "<2-3 sentences: macro regime + asset transmission mechanism>\n\n"
+        "## MACRO REGIME\n"
+        "Current regime: <RISK-ON / RISK-OFF / STAGFLATION / REFLATION>\n"
+        "Key driver: <Fed policy / geopolitics / growth data / inflation>\n"
+        "Regime age: <days since regime shift — younger = more tradeable>\n\n"
+        "## ASSET TRANSMISSION\n"
+        "Driver → impact chain: <e.g. Fed pause → lower real yields → gold LONG>\n"
+        "Cross-asset confirmation: <what other assets confirm this regime>\n\n"
+        "## CATALYST\n"
+        "Macro event: <specific release, decision, or speech + date>\n"
+        "Expected market reaction: <direction + magnitude>\n\n"
+        "## SCENARIOS\n"
+        "Bull (X%): <macro condition + asset target>\n"
+        "Base (X%): <macro condition + asset target>\n"
+        "Bear (X%): <regime reversal trigger + impact>\n\n"
+        "## INVALIDATION\n"
+        "Thesis breaks if: <specific macro data or event contradicts the regime>\n\n"
+        "Then on a new line:\n"
+        "TICKER: SYMBOL\n"
+        "ACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Perform balanced macro analysis considering all asset classes."
     ),
@@ -158,8 +452,26 @@ DEFAULT_AGENTS = {
         "and the price level that would prove the sentiment thesis wrong.\n\n"
         "RULES: Never trade sentiment alone on a stock with upcoming earnings — fundamentals override sentiment near catalysts. "
         "Always ask: 'who is on the wrong side of this trade and when will they capitulate?'\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your full analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n"
+        "<2-3 sentences: the sentiment signal and expected crowd behaviour>\n\n"
+        "## SENTIMENT SNAPSHOT\n"
+        "Signal: <PEAK GREED / PEAK FEAR / DIVERGENCE / QUIET ACCUMULATION>\n"
+        "Price move (5d): <+/- X%>\n"
+        "News volume: <high / normal / low>\n"
+        "Retail vs smart money: <who is buying, who is selling>\n\n"
+        "## CATALYST\n"
+        "Sentiment trigger: <specific headline, social signal, or flow data>\n"
+        "Expected mean-reversion window: <hours / 1-3 days / this week>\n\n"
+        "## SCENARIOS\n"
+        "Bull (X%): <crowd capitulates / sentiment reverses → target>\n"
+        "Base (X%): <sentiment fades gradually → modest move>\n"
+        "Bear (X%): <sentiment continues in current direction → stop>\n\n"
+        "## INVALIDATION\n"
+        "Thesis breaks if: <fundamental news overrides sentiment / price action>\n\n"
+        "Then on a new line:\n"
+        "TICKER: SYMBOL\n"
+        "ACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Perform balanced sentiment analysis across all enabled markets."
     ),
@@ -189,8 +501,13 @@ SPECIALIST_AGENTS = {
         "RULES: Never trade a token with < $500M market cap unless there is an extraordinary specific catalyst. "
         "Always account for BTC market regime — most altcoins fail when BTC is in a downtrend. "
         "DO NOT recommend tokens not in the enabled markets list.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n<2-3 sentences>\n\n"
+        "## ON-CHAIN / MARKET STRUCTURE\nKey signal: <metric + value>\nBTC regime: <bullish / bearish / neutral>\n\n"
+        "## CATALYST\nEvent: <specific catalyst + date>\n\n"
+        "## SCENARIOS\nBull (X%): <condition + target>\nBase (X%): <condition + target>\nBear (X%): <condition + stop>\n\n"
+        "## INVALIDATION\nThesis breaks if: <condition>\n\n"
+        "TICKER: SYMBOL\nACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Specialise in Crypto market analysis only."
     ),
@@ -218,8 +535,13 @@ SPECIALIST_AGENTS = {
         "7. MEMORY INTEGRATION: Which India calls played out? Which sector bets were right?\n\n"
         "RULES: Only trade .NS suffix tickers. Never recommend a stock based solely on index movement without a stock-specific thesis. "
         "Verify the stock is in the enabled India market list.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n<2-3 sentences>\n\n"
+        "## VALUATION ANCHOR\nP/E: X | Sector median: Y | Analyst target: ₹Z (X% upside)\n\n"
+        "## CATALYST\nEvent: <FII flow / earnings / RBI decision / sector trigger + date>\n\n"
+        "## SCENARIOS\nBull (X%): <condition + target>\nBase (X%): <condition + target>\nBear (X%): <condition + stop>\n\n"
+        "## INVALIDATION\nThesis breaks if: <condition>\n\n"
+        "TICKER: SYMBOL\nACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Specialise in India (NSE) market analysis only."
     ),
@@ -246,8 +568,13 @@ SPECIALIST_AGENTS = {
         "7. MEMORY REVIEW: Which commodity calls worked? What seasonal patterns held?\n\n"
         "RULES: Only trade =F suffix futures tickers in the enabled MCX/Commodities list. "
         "Always state the supply/demand driver clearly — do not trade on sentiment alone for commodities.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n<2-3 sentences: supply/demand or macro driver>\n\n"
+        "## SUPPLY/DEMAND PICTURE\nInventory: <draw / build / neutral>\nKey driver: <OPEC / Fed / China / weather / geopolitics>\nDXY impact: <tailwind / headwind>\n\n"
+        "## CATALYST\nEvent: <EIA report / OPEC meeting / macro release + date>\n\n"
+        "## SCENARIOS\nBull (X%): <condition + target>\nBase (X%): <condition + target>\nBear (X%): <condition + stop>\n\n"
+        "## INVALIDATION\nThesis breaks if: <condition>\n\n"
+        "TICKER: SYMBOL\nACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Specialise in MCX/Commodities analysis only."
     ),
@@ -262,8 +589,13 @@ SPECIALIST_AGENTS = {
         "3. TECHNOLOGY SHIFTS: Are we moving to a new node? Is Advanced Packaging a bottleneck? Pick the companies that supply the picks and shovels.\n"
         "4. GEOPOLITICS: US/China export restrictions can immediately impact revenue. Assess any recent trade actions.\n"
         "5. RULE: Only trade Semiconductor stocks, primarily in the US market.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n<2-3 sentences>\n\n"
+        "## VALUATION ANCHOR\nP/E: X | EV/EBITDA: Y | Forward estimates vs consensus: <beat / miss / in-line>\n\n"
+        "## CATALYST\nEvent: <earnings / guidance / product launch / export ruling + date>\n\n"
+        "## SCENARIOS\nBull (X%): <condition + target>\nBase (X%): <condition + target>\nBear (X%): <condition + stop>\n\n"
+        "## INVALIDATION\nThesis breaks if: <condition>\n\n"
+        "TICKER: SYMBOL\nACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Specialise in Semiconductor analysis only."
     ),
@@ -276,8 +608,13 @@ SPECIALIST_AGENTS = {
         "2. CAPEX vs ROI: Are hyperscalers seeing ROI on their AI capex? If yes, buy the software layer. If no, short the software layer.\n"
         "3. AUTOMATION TRENDS: Look for industrial companies deploying robotics to offset labor shortages.\n"
         "4. RULE: Only trade AI, Software, and Robotics companies, primarily in the US market.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n<2-3 sentences>\n\n"
+        "## VALUATION ANCHOR\nP/E: X | P/S: Y | Rule of 40 score: Z | Analyst target: $W (X% upside)\n\n"
+        "## CATALYST\nEvent: <product launch / earnings / enterprise deal + date>\n\n"
+        "## SCENARIOS\nBull (X%): <condition + target>\nBase (X%): <condition + target>\nBear (X%): <condition + stop>\n\n"
+        "## INVALIDATION\nThesis breaks if: <condition>\n\n"
+        "TICKER: SYMBOL\nACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Specialise in AI & Robotics analysis only."
     ),
@@ -289,8 +626,13 @@ SPECIALIST_AGENTS = {
         "1. RATE SENSITIVITY: REITs are highly sensitive to the 10-year yield. Falling yields = tailwind for real estate.\n"
         "2. SECULAR THEMES: Are people moving to suburbs? Are offices empty? Pick winners (Data Center REITs, Residential) and losers (Commercial Office).\n"
         "3. RULE: Only trade Real Estate and REIT stocks.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n<2-3 sentences>\n\n"
+        "## VALUATION ANCHOR\nP/FFO: X | Dividend yield: Y% | NAV discount/premium: Z%\n\n"
+        "## CATALYST\nEvent: <rate decision / earnings / occupancy data + date>\n\n"
+        "## SCENARIOS\nBull (X%): <condition + target>\nBase (X%): <condition + target>\nBear (X%): <condition + stop>\n\n"
+        "## INVALIDATION\nThesis breaks if: <condition>\n\n"
+        "TICKER: SYMBOL\nACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Specialise in Real Estate analysis only."
     ),
@@ -302,14 +644,23 @@ SPECIALIST_AGENTS = {
         "1. CLINICAL CATALYSTS: Is there a Phase 2 or Phase 3 readout coming? Is an FDA PDUFA date near?\n"
         "2. RISK REWARD: Biotech is binary. Base trades on the probability of success vs the implied market move.\n"
         "3. RULE: Only trade Healthcare, Biotech, and Pharmaceutical stocks.\n\n"
-        "Write your full structured analysis, then output on a new line:\n"
-        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT\n\n"
+        "Write your analysis using EXACTLY this structure:\n\n"
+        "## INVESTMENT THESIS\n<2-3 sentences: the binary event or thesis>\n\n"
+        "## VALUATION ANCHOR\nMarket cap: $X | Cash runway: Y months | Peak sales estimate: $Z\n\n"
+        "## CATALYST\nEvent: <FDA PDUFA date / Phase trial readout / earnings + exact date>\n\n"
+        "## SCENARIOS\nBull (X%): <approval / positive data + price target>\nBase (X%): <partial success + price>\nBear (X%): <failure + stop>\n\n"
+        "## INVALIDATION\nThesis breaks if: <condition>\n\n"
+        "TICKER: SYMBOL\nACTION: LONG or SHORT\n\n"
         "=== EVOLVED_GUIDELINES ===\n"
         "No evolved guidelines yet. Specialise in Biotech & Pharma analysis only."
     ),
 }
 
 # SPECIALIST_MARKET_MAP removed — dispatcher LLM now selects agents dynamically based on context.
+
+
+_OLD_OUTPUT_MARKER = "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT"
+_NEW_OUTPUT_MARKER = "TICKER: SYMBOL\nACTION: LONG or SHORT"
 
 
 def setup_agent_prompts(db: Session):
@@ -323,14 +674,24 @@ def setup_agent_prompts(db: Session):
         else:
             if existing.description != desc and desc:
                 existing.description = desc
-            
-            # Only reset to default if NOT already evolved (generation 1 = seed prompt)
+
             if existing.system_prompt != prompt:
                 history_count = db.query(models.AgentPromptHistory).filter(
                     models.AgentPromptHistory.agent_name == name
                 ).count()
                 if history_count == 0:
+                    # Not yet evolved — reset to new seed
                     existing.system_prompt = prompt
+                elif _OLD_OUTPUT_MARKER in existing.system_prompt:
+                    # Evolved prompt still uses old unstructured output format — upgrade it
+                    # Replace old output instruction with new structured sections format
+                    existing.system_prompt = existing.system_prompt.replace(
+                        "Write your full structured analysis, then output on a new line:\n"
+                        "TICKER:SYMBOL, ACTION:LONG or ACTION:SHORT",
+                        "Write your analysis using the structured sections format "
+                        "(INVESTMENT THESIS / VALUATION ANCHOR or relevant sections / CATALYST / SCENARIOS / INVALIDATION), "
+                        "then on new lines:\nTICKER: SYMBOL\nACTION: LONG or SHORT"
+                    )
     db.commit()
 
 
@@ -527,19 +888,63 @@ def _annotate_research_with_dates(research_items: list[dict], now: datetime) -> 
 # ── Extraction helpers ────────────────────────────────────────────────────────
 
 def extract_proposal(text: str):
-    """Regex extraction of TICKER and ACTION from agent response."""
-    ticker_match = re.search(r"TICKER:\s*([A-Za-z0-9.\-=]+)", text, re.IGNORECASE)
-    action_match = re.search(r"ACTION:\s*([A-Za-z]+)", text, re.IGNORECASE)
+    """
+    Extract TICKER and ACTION from agent response.
 
-    ticker = ticker_match.group(1).upper().replace('*', '').replace(',', '').strip() if ticker_match else None
-    action = action_match.group(1).upper().replace('*', '').replace(',', '').strip() if action_match else None
+    Tries multiple patterns in priority order:
+      1. Explicit TICKER: / ACTION: labels
+      2. Inline "LONG AAPL" or "SHORT BTC-USD" phrases
+      3. Bold/markdown variants like **LONG** **AAPL**
+    Falls back to AAPL/LONG only as a last resort.
+    """
+    VALID_ACTIONS = {"LONG", "SHORT", "UPDATE_LONG", "UPDATE_SHORT"}
+    TICKER_RE = r"[A-Z]{1,6}(?:[.\-=][A-Z0-9]{1,4})?"
+
+    ticker: str | None = None
+    action: str | None = None
+
+    # Pattern 1: explicit labels
+    tm = re.search(r"TICKER:\s*\*{0,2}([A-Za-z0-9.\-=]+)\*{0,2}", text, re.IGNORECASE)
+    am = re.search(r"ACTION:\s*\*{0,2}([A-Za-z_]+)\*{0,2}", text, re.IGNORECASE)
+    if tm:
+        ticker = tm.group(1).upper().strip("*,. ")
+    if am:
+        action = am.group(1).upper().strip("*,. ")
+
+    # Pattern 2: inline phrases "LONG AAPL" / "SHORT BTC-USD"
+    if not ticker or not action:
+        inline = re.search(
+            rf"\b(LONG|SHORT|UPDATE_LONG|UPDATE_SHORT)\s+({TICKER_RE})\b",
+            text, re.IGNORECASE
+        )
+        if inline:
+            if not action:
+                action = inline.group(1).upper()
+            if not ticker:
+                ticker = inline.group(2).upper()
+
+    # Pattern 3: reversed "AAPL LONG"
+    if not ticker or not action:
+        rev = re.search(
+            rf"\b({TICKER_RE})\s+(LONG|SHORT|UPDATE_LONG|UPDATE_SHORT)\b",
+            text, re.IGNORECASE
+        )
+        if rev:
+            if not ticker:
+                ticker = rev.group(1).upper()
+            if not action:
+                action = rev.group(2).upper()
+
+    # Validate action
+    if action and action not in VALID_ACTIONS:
+        action = None
 
     if not ticker:
-        ticker = "AAPL"
         print("[Extraction] Failed to find TICKER — falling back to AAPL.")
-    if not action or action not in ("LONG", "SHORT"):
-        action = "LONG"
+        ticker = "AAPL"
+    if not action:
         print("[Extraction] Failed to find ACTION — falling back to LONG.")
+        action = "LONG"
 
     return ticker, action
 
@@ -583,70 +988,55 @@ def _fetch_macro_indicators() -> str:
     return "\n".join(lines)
 
 
-def _fetch_per_ticker_news(symbol: str, max_items: int = 5) -> str:
-    """
-    Fetch recent news specifically for one ticker via yfinance.
-    Returns a short markdown block. Non-fatal.
-    """
-    try:
-        import yfinance as yf
-        ticker = yf.Ticker(symbol)
-        news = ticker.news
-        if not news:
-            return ""
-        lines = [f"**{symbol} Recent News:**"]
-        for item in news[:max_items]:
-            title = item.get("title", "")
-            pub = item.get("providerPublishTime", 0)
-            if pub:
-                from datetime import datetime as _dt
-                age_h = (datetime.utcnow() - _dt.utcfromtimestamp(pub)).total_seconds() / 3600
-                if age_h < 1:
-                    age = f"{int(age_h*60)}m ago"
-                elif age_h < 24:
-                    age = f"{int(age_h)}h ago"
-                elif age_h < 168:
-                    age = f"{int(age_h/24)}d ago"
-                else:
-                    age = f"{int(age_h/168)}w ago"
-                lines.append(f"  - [{age}] {title}")
-            else:
-                lines.append(f"  - {title}")
-        return "\n".join(lines)
-    except Exception:
-        return ""
-
 
 def fetch_research_items(db, run_id: str, enabled_markets: dict,
                           investment_focus: str = "") -> list:
     """
     Fetch raw research articles for the given markets/focus.
     Returns research_items list. Called before KG ingest so the graph is built first.
+
+    When a focused ticker set is passed (enabled_markets has a single "Focused" key),
+    all topics are scoped to those tickers only — no broad market-wide queries.
     """
-    dynamic_topics = [
-        "global stock market outlook today",
-        "top market movers gainers losers",
-        "Federal Reserve interest rates policy",
-        "earnings season results surprises",
-        "geopolitical risk markets",
-    ]
-    for market, tickers in enabled_markets.items():
-        dynamic_topics.append(f"{market} market news today")
-        for sym in tickers[:2]:
+    all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
+    is_focused = list(enabled_markets.keys()) == ["Focused"]
+
+    if is_focused:
+        # Focused run: only fetch news for the specific tickers/entity selected
+        dynamic_topics = []
+        for sym in all_tickers:
             clean = sym.replace(".NS", "").replace("-USD", "").replace("=F", "")
-            dynamic_topics.append(f"{clean} stock news analysis")
+            dynamic_topics.append(f"{clean} stock news analysis today")
+            dynamic_topics.append(f"{clean} price forecast catalyst")
+        if investment_focus:
+            dynamic_topics.append(investment_focus[:120])
+    else:
+        # Normal run: broad market context + per-ticker queries
+        dynamic_topics = [
+            "global stock market outlook today",
+            "top market movers gainers losers",
+            "Federal Reserve interest rates policy",
+            "earnings season results surprises",
+            "geopolitical risk markets",
+        ]
+        for market, tickers in enabled_markets.items():
+            dynamic_topics.append(f"{market} market news today")
+            for sym in tickers[:2]:
+                clean = sym.replace(".NS", "").replace("-USD", "").replace("=F", "")
+                dynamic_topics.append(f"{clean} stock news analysis")
 
-    if investment_focus:
-        focus_lower = investment_focus.lower()
-        dynamic_topics.append(investment_focus[:120])
-        for keyword in ["tech", "ai", "semiconductor", "ev", "electric vehicle",
-                        "healthcare", "pharma", "biotech", "energy", "oil", "renewable",
-                        "banking", "finance", "crypto", "bitcoin", "india", "emerging market",
-                        "small cap", "growth", "dividend"]:
-            if keyword in focus_lower:
-                dynamic_topics.append(f"{keyword} sector news catalyst today")
+        if investment_focus:
+            focus_lower = investment_focus.lower()
+            dynamic_topics.append(investment_focus[:120])
+            for keyword in ["tech", "ai", "semiconductor", "ev", "electric vehicle",
+                            "healthcare", "pharma", "biotech", "energy", "oil", "renewable",
+                            "banking", "finance", "crypto", "bitcoin", "india", "emerging market",
+                            "small cap", "growth", "dividend"]:
+                if keyword in focus_lower:
+                    dynamic_topics.append(f"{keyword} sector news catalyst today")
 
-    return fetch_web_research(topics=dynamic_topics, enabled_tickers=enabled_markets)
+    focus_tickers_list = all_tickers if is_focused else None
+    return fetch_web_research(topics=dynamic_topics, enabled_tickers=enabled_markets, focus_tickers=focus_tickers_list)
 
 
 def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
@@ -656,12 +1046,16 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
     Build the full shared context string for agents from pre-fetched research items.
     If research_items is None, fetches them internally (backward-compat).
     Returns (context_string, research_log, research_items).
+
+    When enabled_markets has a single "Focused" key, the context is scoped tightly
+    to only those tickers — broad market headlines are omitted.
     """
     all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
+    is_focused = list(enabled_markets.keys()) == ["Focused"]
 
     now = datetime.utcnow()
 
-    # ── 1. Macro indicators ───────────────────────────────────────────────────
+    # ── 1. Macro indicators — always included for price context ──────────────
     macro_context = _fetch_macro_indicators()
 
     # ── 2. Web research articles ──────────────────────────────────────────────
@@ -676,21 +1070,22 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
         for r in research_items
     ]
 
-    # News headlines
-    news = fetch_news()
-    news_context = "## Additional Market Headlines\n" + "".join(f"- {n}\n" for n in news)
-    for n in news:
-        research_log.append({"title": n, "url": "N/A"})
+    # News headlines — skip for focused runs (would pull unrelated market noise)
+    news = []
+    news_context = ""
+    if not is_focused:
+        news = fetch_news()
+        news_context = "## Additional Market Headlines\n" + "".join(f"- {n}\n" for n in news)
+        for n in news:
+            research_log.append({"title": n, "url": "N/A"})
 
-    # ── 3 & 4 & 5. Per-ticker: price + fundamentals + news (parallelised) ────
+    # ── 3 & 4. Per-ticker: price + fundamentals (parallelised) ───────────────
     price_lines = []
     fundamentals_blocks = []
-    per_ticker_news_blocks = []
 
     def _fetch_one_ticker(sym: str):
         price_line = None
         fund_block = None
-        news_block = None
         try:
             sig = fetch_market_data(sym)
             if sig:
@@ -701,23 +1096,17 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
             fund_block = _fetch_ticker_fundamentals(sym)
         except Exception:
             pass
-        try:
-            news_block = _fetch_per_ticker_news(sym)
-        except Exception:
-            pass
-        return sym, price_line, fund_block, news_block
+        return sym, price_line, fund_block
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         futs = {ex.submit(_fetch_one_ticker, sym): sym for sym in all_tickers}
-        for fut in as_completed(futs):
+        for fut in as_completed(futs, timeout=60):
             try:
-                sym, price_line, fund_block, news_block = fut.result()
+                sym, price_line, fund_block = fut.result()
                 if price_line:
                     price_lines.append(price_line)
                 if fund_block:
                     fundamentals_blocks.append(fund_block)
-                if news_block:
-                    per_ticker_news_blocks.append(news_block)
             except Exception:
                 pass
 
@@ -731,9 +1120,6 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
     if fundamentals_blocks:
         fundamentals_context = "\n## Per-Ticker Deep Fundamentals\n" + "\n\n".join(fundamentals_blocks) + "\n"
 
-    per_ticker_news_context = ""
-    if per_ticker_news_blocks:
-        per_ticker_news_context = "\n## Per-Ticker Recent News\n" + "\n\n".join(per_ticker_news_blocks) + "\n"
 
     # ── 6. Enriched macro context: FRED yield curve + Finnhub calendars ─────
     enriched_macro_context = ""
@@ -748,11 +1134,18 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
     try:
         from data.fundamentals import enrich_tickers_parallel
         # Only enrich US + India equities (options/insiders not available for crypto/futures)
-        equity_tickers = [
-            sym for market, tickers in enabled_markets.items()
-            if market in ("US", "India")
-            for sym in tickers
-        ]
+        if is_focused:
+            # Focused run: enrich all focused tickers regardless of market key
+            equity_tickers = [
+                sym for sym in all_tickers
+                if not sym.endswith("-USD") and not sym.endswith("=F")
+            ]
+        else:
+            equity_tickers = [
+                sym for market, tickers in enabled_markets.items()
+                if market in ("US", "India")
+                for sym in tickers
+            ]
         if equity_tickers:
             enrichments = enrich_tickers_parallel(equity_tickers[:8])  # cap at 8 to stay fast
             for sym, block in enrichments.items():
@@ -772,15 +1165,13 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
         + f"{research_context}\n\n"
         f"{news_context}\n"
         f"{price_context}\n"
-        f"{per_ticker_news_context}\n"
         f"{fundamentals_context}"
         + (f"\n{enrichment_context}" if enrichment_context else "")
     )
 
     _log(db, run_id, "WEB_RESEARCH", "DONE",
-         f"Research complete — {len(research_items)} articles, {len(news)} headlines, "
-         f"{len(price_lines)} prices, {len(fundamentals_blocks)} fundamentals, "
-         f"{len(per_ticker_news_blocks)} ticker news blocks"
+         f"Research complete — {len(research_items)} articles, "
+         f"{len(price_lines)} prices, {len(fundamentals_blocks)} fundamentals"
          + (f", {len(enrichment_blocks)} enrichment blocks" if enrichment_blocks else ""))
 
     return full_context, research_log, research_items
@@ -788,63 +1179,17 @@ def build_shared_retrieval_context(db, run_id: str, enabled_markets: dict,
 
 # ── Layer 2: 4-Agent Debate Panel ────────────────────────────────────────────
 
-def _get_interesting_stocks_from_graph(db) -> tuple[list[str], str]:
-    """
-    Query the knowledge graph for the most "interesting" ASSET nodes:
-    - Most edges (highly connected = most events affecting this asset)
-    - Most recently seen
-    Returns (list_of_symbols, formatted_context_string).
-    """
-    try:
-        from sqlalchemy import func, or_
-        # Count edges per asset node
-        edge_counts = {}
-        asset_nodes = db.query(models.KGNode).filter(
-            models.KGNode.node_type == "ASSET"
-        ).order_by(models.KGNode.last_seen_at.desc()).all()
-
-        if not asset_nodes:
-            return [], ""
-
-        now = datetime.utcnow()
-        for node in asset_nodes:
-            cnt = db.query(models.KGEdge).filter(
-                or_(
-                    models.KGEdge.source_node_id == node.node_id,
-                    models.KGEdge.target_node_id == node.node_id,
-                ),
-                or_(
-                    models.KGEdge.expires_at.is_(None),
-                    models.KGEdge.expires_at > now,
-                )
-            ).count()
-            edge_counts[node.node_id] = cnt
-
-        # Sort by edge count desc, take top 8
-        top_nodes = sorted(asset_nodes, key=lambda n: edge_counts.get(n.node_id, 0), reverse=True)[:8]
-        symbols = [n.symbol or n.node_id.replace("asset:", "") for n in top_nodes]
-
-        lines = ["## Most Active Assets in Knowledge Graph (by market event connections)"]
-        for node in top_nodes:
-            sym = node.symbol or node.node_id.replace("asset:", "")
-            cnt = edge_counts.get(node.node_id, 0)
-            lines.append(f"  - **{sym}** ({node.label}): {cnt} active event connections")
-        return symbols, "\n".join(lines)
-    except Exception as e:
-        print(f"[KG] interesting stocks query failed: {e}")
-        return [], ""
-
 
 def _agent_web_search(agent_name: str, run_id: str, queries: list[str]) -> str:
     """
     Execute targeted web searches on behalf of an agent.
     Returns formatted search results as a context block.
     """
-    from data.research import _fetch_google_news
+    from data.research import _tavily_search
     results = []
     for q in queries[:2]:  # max 2 searches per agent
         try:
-            items = _fetch_google_news(q.strip(), max_items=4)
+            items = _tavily_search(q.strip(), max_results=4, search_depth="advanced")
             for item in items:
                 results.append(f"[Search: {q}] {item.get('title', '')} — {item.get('snippet', '')[:150]}")
         except Exception:
@@ -914,7 +1259,8 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
                         investment_focus: str = "",
                         portfolio_context: str = "",
                         kg_context: str = "",
-                        fitness_map: dict | None = None) -> dict:
+                        fitness_map: dict | None = None,
+                        run_lessons: list | None = None) -> dict:
     """
     Two-pass agent query:
     Pass 1: Agent sees portfolio + KG + interesting stocks → requests web searches
@@ -946,8 +1292,14 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
                 f"Prioritise assets aligned with this focus.\n\n"
             )
 
+        # ── Intra-run lesson overlay (from earlier pipeline stages this run) ─
+        lessons_block = ""
+        if run_lessons:
+            lessons_block = "## This-Run Pipeline Observations\n" + "\n".join(f"- {l}" for l in run_lessons) + "\n\n"
+
         # ── Pass 1: Request targeted searches ────────────────────────────────
         pass1_context = (
+            f"{lessons_block}"
             f"{focus_block}"
             f"{leaderboard_context}"
             f"{portfolio_context}\n\n"
@@ -957,7 +1309,9 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
         )
         search_response = query_agent(
             AGENT_SEARCH_REQUEST_PROMPT,
-            pass1_context
+            pass1_context,
+            caller=f"agent:{agent_name}:search",
+            run_id=run_id,
         )
 
         # Parse search queries
@@ -985,6 +1339,7 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
             if search_results_block.strip() else ""
         )
         pass2_context = (
+            f"{lessons_block}"
             f"{focus_block}"
             f"{leaderboard_context}"
             f"{portfolio_context}\n\n"
@@ -994,7 +1349,8 @@ def _query_single_agent(agent_name: str, system_prompt: str, run_id: str,
             f"ALLOWED MARKETS:\n{market_constraint}\n\n"
             f"---\n{memory_context}\n---\n{performance_context}\n"
         )
-        response = query_agent(system_prompt, pass2_context)
+        response = query_agent(system_prompt, pass2_context,
+                               caller=f"agent:{agent_name}", run_id=run_id)
         if not response:
             raise Exception("LLM returned no response after all retries")
         ticker, action = extract_proposal(response)
@@ -1113,7 +1469,7 @@ def _dispatch_agents(run_id: str, shared_context: str, market_constraint: str,
     context = f"MARKET CONTEXT:\n{market_constraint}\n\nSUMMARY OF RESEARCH:\n{shared_context[:2000]}"
 
     try:
-        response = query_agent(prompt, context)
+        response = query_agent(prompt, context, caller="dispatcher", run_id=run_id)
         if not response:
             raise ValueError("empty response")
         selected = [n.strip() for n in response.strip().split(",")]
@@ -1130,13 +1486,14 @@ def _dispatch_agents(run_id: str, shared_context: str, market_constraint: str,
 
 
 def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: str,
-                     investment_focus: str = "", enabled_markets: dict | None = None) -> list:
+                     investment_focus: str = "", enabled_markets: dict | None = None,
+                     run_lessons: list | None = None) -> list:
     """
     Dispatcher → LLM selects which specialist agents to invoke based on context.
     Core agents always run. Specialist selection is decided by the LLM.
     Returns proposals_log: [{agent_name, ticker, action, reasoning}]
     """
-    from graph.knowledge import build_kg_context_for_ticker
+    from graph.knowledge import llm_traverse_graph
 
     agent_prompts = db.query(models.AgentPrompt).all()
     all_agent_names = [ap.agent_name for ap in agent_prompts]
@@ -1156,19 +1513,13 @@ def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: st
     # Build portfolio context once — all agents see the same open positions
     portfolio_context = _build_portfolio_context(db)
 
-    # Build KG context: interesting stocks + their subgraphs
-    interesting_symbols, interesting_summary = _get_interesting_stocks_from_graph(db)
-    kg_parts = []
-    if interesting_summary:
-        kg_parts.append(interesting_summary)
-    for sym in interesting_symbols[:6]:  # cap at 6 subgraphs to keep context manageable
-        subgraph_ctx = build_kg_context_for_ticker(db, sym)
-        if subgraph_ctx:
-            kg_parts.append(subgraph_ctx)
-    kg_context = "\n\n".join(kg_parts) if kg_parts else ""
+    # LLM-driven graph traversal: iteratively expand the most relevant nodes
+    all_tickers = [sym for tickers in (enabled_markets or {}).values() for sym in tickers]
+    _log(db, run_id, "DEBATE_PANEL", "IN_PROGRESS", "Traversing knowledge graph…")
+    ranked_tickers, kg_context = llm_traverse_graph(db, all_tickers, run_id=run_id)
     if kg_context:
         _log(db, run_id, "DEBATE_PANEL", "IN_PROGRESS",
-             f"KG context built for {len(interesting_symbols)} assets — passing to agents")
+             f"Graph traversal complete — top signals: {', '.join(ranked_tickers[:5])}")
 
     # Build fitness_map for all selected agents (for leaderboard injection into each agent's context)
     from pipeline.validator import _compute_fitness as _cv_fitness
@@ -1185,7 +1536,8 @@ def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: st
             executor.submit(
                 _query_single_agent,
                 name, prompt, run_id, shared_context, market_constraint,
-                investment_focus, portfolio_context, kg_context, fitness_map
+                investment_focus, portfolio_context, kg_context, fitness_map,
+                run_lessons or [],
             ): name
             for name, prompt in agents_snapshot
         }
@@ -1203,65 +1555,72 @@ def run_debate_panel(db, run_id: str, shared_context: str, market_constraint: st
 
 # ── Layer 3: Judge ────────────────────────────────────────────────────────────
 
-JUDGE_SYSTEM_PROMPT = """You are the Chief Investment Officer of a quantitative hedge fund, acting as the final decision-maker in a multi-agent trading committee. You have reviewed thousands of trade proposals over your career and you know exactly how to separate signal from noise.
+JUDGE_SYSTEM_PROMPT = """You are the Chief Investment Officer of a quantitative hedge fund, acting as the final decision-maker in a multi-agent trading committee. You write analyst-grade research reports and have reviewed thousands of trade proposals.
 
 You will receive:
 - A full market intelligence report (macro environment, news, live prices, fundamentals)
-- Structured proposals from multiple specialist agents (core: Value Investor, Technical Analyst, Macro Economist, Sentiment Analyst; plus any market-specific specialists such as Crypto Specialist, India Market Specialist, Commodities Specialist, Semiconductor Specialist, AI & Robotics Specialist, Real Estate Specialist, Biotech & Pharma Specialist — only those relevant to the enabled markets will be present)
+- Structured proposals from specialist agents — each proposal now includes Investment Thesis, Valuation Anchor, Catalyst, Bull/Base/Bear Scenarios, and Invalidation conditions
 - The current portfolio budget and open positions
 
 ## YOUR SCORING FRAMEWORK
 
-For each agent proposal, evaluate it on these 5 dimensions (score each 1–10):
+For each agent proposal, score on 6 dimensions (1–10 each, max 60):
 
-1. **THESIS QUALITY** — Is the core argument specific, data-backed, and non-obvious? (Generic "bullish on AI" = 2; Specific "NVDA P/E contracted 30% while forward estimates held — mispricing" = 9)
-2. **CATALYST SPECIFICITY** — Is there a clear, near-term (< 2 weeks) catalyst? Earnings, product launch, regulatory event, macro release? (No catalyst = 2; Named catalyst with date = 9)
-3. **NEWS FRESHNESS** — Is the thesis supported by news from the last 48 hours? (Only stale news = 2; Multiple fresh headlines directly supporting the thesis = 9)
-4. **RISK/REWARD CLARITY** — Does the agent define what would invalidate the thesis? Is there a stated stop level or timeframe? (Vague = 2; Clear invalidation + timeframe = 9)
-5. **CROSS-AGENT CONFIRMATION** — Do other agents' analyses corroborate this pick directionally? (All disagree = 1; 2+ agents aligned = 8; unanimous = 10)
+1. **THESIS QUALITY** — Specific, data-backed, non-obvious? ("NVDA P/E contracted 30% while estimates held" = 9; "bullish on AI" = 2)
+2. **VALUATION ANCHOR** — Does the agent cite actual multiples (P/E, EV/EBITDA, P/S) vs sector or consensus? (No numbers = 1; explicit mispricing vs peers = 9)
+3. **CATALYST SPECIFICITY** — Named near-term catalyst with a date (< 2 weeks)? (No catalyst = 2; named event + date = 9)
+4. **NEWS FRESHNESS** — Supported by news from last 48h? (Only stale news = 2; fresh headlines supporting thesis = 9)
+5. **RISK/REWARD STRUCTURE** — Are bull/base/bear scenarios stated with probabilities? Is invalidation condition explicit? (Vague = 2; full scenario matrix = 9)
+6. **CROSS-AGENT CONFIRMATION** — Other agents corroborate directionally? (All disagree = 1; 2+ aligned = 8; unanimous = 10)
 
 ## DECISION RULES
 
-- **DO NOT** pick a trade with a composite score below 25/50
-- **DO NOT** duplicate an existing open position as a new trade. If you want to modify an open position, use **UPDATE_LONG** or **UPDATE_SHORT**.
-- **DO** specify POSITION SIZE as an explicit DOLLAR AMOUNT (e.g. $2500) based on the Available Capital.
-- **DO** prefer high-conviction single-agent picks over weak consensus if the thesis is tight
-- **DO** consider macro regime: in risk-off environments, short candidates score higher
-- **DO** flag if no proposal meets the quality bar — output HOLD instead
+- **DO NOT** pick a trade with composite score below 30/60
+- **DO NOT** duplicate an open position — use UPDATE_LONG / UPDATE_SHORT instead
+- **DO** size positions explicitly in dollars based on available capital
+- **DO** prefer high-conviction single picks over weak consensus
+- **DO** output HOLD if nothing meets the quality bar
 
-## OUTPUT FORMAT (exact format required)
+## OUTPUT FORMAT (exact format — do not deviate)
 
 PROPOSAL_SCORES:
-- Value Investor: [score]/50 — [1 sentence rationale]
-- Technical Analyst: [score]/50 — [1 sentence rationale]
-- Macro Economist: [score]/50 — [1 sentence rationale]
-- Sentiment Analyst: [score]/50 — [1 sentence rationale]
+- [Agent Name]: [score]/60 — [1 sentence rationale]
+(repeat for each agent)
 
-Output up to 3 positions ranked by conviction (only include positions with score ≥ 25/50):
+Output up to 3 positions ranked by conviction (score ≥ 30/60 only):
 
 POSITION_1_TICKER: <SYMBOL or HOLD>
 POSITION_1_ACTION: LONG or SHORT or UPDATE_LONG or UPDATE_SHORT (omit if HOLD)
-POSITION_1_HORIZON: <time horizon: intraday / swing-1-3d / positional-1-2w / trend-1-3m>
-POSITION_1_SIZE: <exact dollar value to invest, e.g. $2500>
-POSITION_1_TARGET: <price target or % move expected>
-POSITION_1_STOP: <stop-loss level or % below/above entry>
-POSITION_1_REASONING: <2-3 sentences: specific edge, catalyst, key risk>
+POSITION_1_HORIZON: <intraday / swing-1-3d / positional-1-2w / trend-1-3m>
+POSITION_1_SIZE: <dollar amount, e.g. $2500>
+POSITION_1_TARGET: <price target with % upside>
+POSITION_1_STOP: <stop-loss price or % from entry>
+POSITION_1_BULL_CASE: <what happens + probability, e.g. "Earnings beat drives +15% — 35% probability">
+POSITION_1_BASE_CASE: <expected outcome + probability>
+POSITION_1_BEAR_CASE: <downside scenario + probability>
+POSITION_1_REASONING: <3-4 sentences: valuation edge, catalyst, cross-agent confirmation, key risk>
 
 POSITION_2_TICKER: <SYMBOL> (omit entire block if no second qualifying position)
 POSITION_2_ACTION: LONG or SHORT or UPDATE_LONG or UPDATE_SHORT
 POSITION_2_HORIZON: <time horizon>
 POSITION_2_SIZE: <dollar value>
-POSITION_2_TARGET: <target>
-POSITION_2_STOP: <stop>
-POSITION_2_REASONING: <2-3 sentences>
+POSITION_2_TARGET: <price target with % upside>
+POSITION_2_STOP: <stop-loss price or %>
+POSITION_2_BULL_CASE: <outcome + probability>
+POSITION_2_BASE_CASE: <outcome + probability>
+POSITION_2_BEAR_CASE: <outcome + probability>
+POSITION_2_REASONING: <3-4 sentences: valuation edge, catalyst, confirmation, key risk>
 
 POSITION_3_TICKER: <SYMBOL> (omit entire block if no third qualifying position)
 POSITION_3_ACTION: LONG or SHORT or UPDATE_LONG or UPDATE_SHORT
 POSITION_3_HORIZON: <time horizon>
 POSITION_3_SIZE: <dollar value>
-POSITION_3_TARGET: <target>
-POSITION_3_STOP: <stop>
-POSITION_3_REASONING: <2-3 sentences>
+POSITION_3_TARGET: <price target with % upside>
+POSITION_3_STOP: <stop-loss price or %>
+POSITION_3_BULL_CASE: <outcome + probability>
+POSITION_3_BASE_CASE: <outcome + probability>
+POSITION_3_BEAR_CASE: <outcome + probability>
+POSITION_3_REASONING: <3-4 sentences: valuation edge, catalyst, confirmation, key risk>
 
 Be decisive. Rank by conviction. No duplicate tickers across positions."""
 
@@ -1323,7 +1682,8 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
         f"Now score each proposal and deliver your verdict."
     )
 
-    response = query_agent(JUDGE_SYSTEM_PROMPT, judge_input)
+    response = query_agent(JUDGE_SYSTEM_PROMPT, judge_input,
+                           caller="judge", run_id=run_id)
     if not response:
         response = ""  # fall through to plurality vote fallback
 
@@ -1365,6 +1725,9 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
         size_m    = re.search(rf"POSITION_{n}_SIZE:\s*([^\n]+)", response, re.IGNORECASE)
         target_m  = re.search(rf"POSITION_{n}_TARGET:\s*([^\n]+)", response, re.IGNORECASE)
         stop_m    = re.search(rf"POSITION_{n}_STOP:\s*([^\n]+)", response, re.IGNORECASE)
+        bull_m    = re.search(rf"POSITION_{n}_BULL_CASE:\s*([^\n]+)", response, re.IGNORECASE)
+        base_m    = re.search(rf"POSITION_{n}_BASE_CASE:\s*([^\n]+)", response, re.IGNORECASE)
+        bear_m    = re.search(rf"POSITION_{n}_BEAR_CASE:\s*([^\n]+)", response, re.IGNORECASE)
         reason_m  = re.search(rf"POSITION_{n}_REASONING:\s*(.+?)(?=POSITION_\d|$)", response, re.IGNORECASE | re.DOTALL)
         if not ticker_m:
             break
@@ -1372,13 +1735,16 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
         ticker = _validate_ticker(ticker_m.group(1) if ticker_m else None, action)
         if ticker and action and ticker not in seen_tickers:
             verdicts.append({
-                "ticker":    ticker,
-                "action":    action,
-                "horizon":   horizon_m.group(1).strip() if horizon_m else "",
-                "size":      size_m.group(1).strip() if size_m else "",
-                "target":    target_m.group(1).strip() if target_m else "",
-                "stop":      stop_m.group(1).strip() if stop_m else "",
-                "reasoning": reason_m.group(1).strip()[:1000] if reason_m else "",
+                "ticker":     ticker,
+                "action":     action,
+                "horizon":    horizon_m.group(1).strip() if horizon_m else "",
+                "size":       size_m.group(1).strip() if size_m else "",
+                "target":     target_m.group(1).strip() if target_m else "",
+                "stop":       stop_m.group(1).strip() if stop_m else "",
+                "bull_case":  bull_m.group(1).strip() if bull_m else "",
+                "base_case":  base_m.group(1).strip() if base_m else "",
+                "bear_case":  bear_m.group(1).strip() if bear_m else "",
+                "reasoning":  reason_m.group(1).strip()[:1000] if reason_m else "",
             })
             seen_tickers.add(ticker)
 
@@ -1406,280 +1772,3 @@ def run_judge(db, run_id: str, proposals_log: list, shared_context: str,
     _log(db, run_id, "JUDGE", "DONE", f"Plurality fallback: {fa} {ft}")
     return [{"ticker": ft, "action": fa, "reasoning": fallback_reason}]
 
-
-# ── Main entry point ──────────────────────────────────────────────────────────
-
-def run_debate(focus_tickers: list[str] | None = None):
-    """
-    Full pipeline:
-      1. Shared Retrieval Layer  — fetch market data + news once
-      2. 4-Agent Debate Panel    — each agent gets shared context + own memory
-      3. Judge                   — independent LLM picks the best proposal
-      4. Deploy                  — save strategy with judge reasoning
-      5. Memory Write            — update all agent memories
-
-    focus_tickers: if provided, agents are constrained to only these tickers
-                   (ignores market enable/disable settings for this run).
-    """
-    db = SessionLocal()
-
-    # Concurrency lock
-    is_running_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-    if is_running_conf and is_running_conf.value == "1":
-        print("[Debate] Already running. Skipping.")
-        db.close()
-        return None
-
-    run_id = str(_uuid.uuid4())
-    run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-    if run_id_conf:
-        run_id_conf.value = run_id
-    else:
-        db.add(models.AppConfig(key="current_run_id", value=run_id))
-
-    if not is_running_conf:
-        db.add(models.AppConfig(key="debate_running", value="1"))
-    else:
-        is_running_conf.value = "1"
-    db.commit()
-
-    print(f"--- Starting Debate Pipeline (run_id={run_id}) ---")
-    _log(db, run_id, "START", "DONE", "Pipeline initialised — lock acquired")
-
-    try:
-        setup_agent_prompts(db)
-
-        if focus_tickers:
-            # Override: build a synthetic single-bucket market from the pinned tickers
-            enabled_markets = {"Focused": focus_tickers}
-            _log(db, run_id, "START", "DONE",
-                 f"Focused run on: {', '.join(focus_tickers)}")
-        else:
-            enabled_markets = get_enabled_markets(db)
-
-        market_constraint = build_market_constraint(enabled_markets)
-
-        # Load investment focus directive
-        focus_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "investment_focus").first()
-        investment_focus = focus_conf.value.strip() if focus_conf and focus_conf.value else ""
-        if investment_focus:
-            _log(db, run_id, "START", "DONE", f"Investment focus: {investment_focus[:100]}")
-
-        # ── 1a. Fetch raw research articles ──────────────────────────────────
-        all_tickers = [sym for tickers in enabled_markets.values() for sym in tickers]
-        research_items = fetch_research_items(db, run_id, enabled_markets, investment_focus)
-
-        # ── 1b. Build Knowledge Graph from those articles ─────────────────────
-        try:
-            from graph.knowledge import upsert_asset_nodes, ingest_retrieval_to_graph
-            upsert_asset_nodes(db, all_tickers)
-            _log(db, run_id, "KG_INGEST", "IN_PROGRESS",
-                 f"Extracting graph facts from {len(research_items)} research items…")
-            edges_added = ingest_retrieval_to_graph(db, research_items, run_id)
-            _log(db, run_id, "KG_INGEST", "DONE",
-                 f"Knowledge graph updated — {edges_added} new edges (semantic dedup applied)")
-        except Exception as kg_err:
-            import traceback as _tb
-            _log(db, run_id, "KG_INGEST", "ERROR",
-                 f"KG ingest failed: {str(kg_err)[:300]} | {_tb.format_exc()[-300:]}")
-
-        # ── 1c. Build shared context using fresh graph ────────────────────────
-        shared_context, research_log, _ = build_shared_retrieval_context(
-            db, run_id, enabled_markets, investment_focus=investment_focus,
-            research_items=research_items)
-
-        # ── 2. 4-Agent Debate Panel ───────────────────────────────────────────
-        _log(db, run_id, "DEBATE_PANEL", "IN_PROGRESS",
-             f"Starting debate panel with {len(DEFAULT_AGENTS)} agents…")
-        proposals_log = run_debate_panel(db, run_id, shared_context, market_constraint,
-                                         investment_focus=investment_focus)
-
-        if not proposals_log:
-            _log(db, run_id, "DEBATE_PANEL", "ERROR", "No proposals — aborting")
-            return None
-        _log(db, run_id, "DEBATE_PANEL", "DONE",
-             f"{len(proposals_log)} proposals received: " +
-             ", ".join(f"{p['action']} {p['ticker']}" for p in proposals_log))
-
-        # ── 3. Judge ──────────────────────────────────────────────────────────
-        # Build budget context for the judge
-        budget_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "trading_budget").first()
-        total_budget = float(budget_conf.value) if budget_conf else 10000.0
-        active_strats = db.query(models.DeployedStrategy).filter(models.DeployedStrategy.status == "ACTIVE").all()
-        allocated = sum(s.position_size or 0.0 for s in active_strats)
-        available = total_budget - allocated
-        open_positions = ", ".join(f"{s.strategy_type} {s.symbol}" for s in active_strats) or "none"
-        budget_context = (
-            f"## Portfolio Budget Context\n"
-            f"- Total budget: ${total_budget:,.2f}\n"
-            f"- Allocated to open positions: ${allocated:,.2f}\n"
-            f"- Available capital: ${available:,.2f}\n"
-            f"- Open positions: {open_positions}\n"
-            f"Only recommend a new trade if sufficient capital is available. "
-            f"If budget is low, prefer closing an underperforming position over opening a new one."
-        )
-        verdicts = run_judge(
-            db, run_id, proposals_log, shared_context, budget_context,
-            market_constraint=market_constraint
-        )
-        if not verdicts:
-            _log(db, run_id, "DEPLOY", "ERROR", "Judge failed to return any valid verdicts.")
-            return None
-
-        # ── 4. Deploy ─────────────────────────────────────────────────────────
-        approval_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "approval_mode").first()
-        approval_mode = approval_conf.value if approval_conf else "auto"
-        initial_status = "ACTIVE" if approval_mode == "auto" else "PENDING"
-
-        judge_reasoning = "\n\n".join(f"[{v['ticker']}] {v['reasoning']}" for v in verdicts)
-        deployed_strategies = []
-
-        for v in verdicts:
-            ticker = v["ticker"]
-            action = v["action"]
-            reasoning = v["reasoning"]
-            size_str = v.get("size", "")
-            
-            # Parse size (e.g. "$2500" -> 2500.0)
-            parsed_size = 0.0
-            if size_str:
-                raw_size = re.sub(r'[^\d.]', '', size_str)
-                try: parsed_size = float(raw_size)
-                except: pass
-
-            signal = fetch_market_data(ticker)
-            entry_price = signal.price if signal else 0.0
-
-            agreeing = sum(1 for p in proposals_log if p["ticker"] == ticker and p["action"].split("_")[-1] == action.split("_")[-1])
-            votes_str = f"{agreeing}/{len(proposals_log)}"
-
-            summary_text = (
-                f"Judge selected {action} {ticker} at ${entry_price:.4f} (Size: ${parsed_size:,.2f}). "
-                f"{agreeing}/{len(proposals_log)} agents agreed. "
-                f"Rationale: {reasoning[:200]}"
-            )
-
-            is_update = action.startswith("UPDATE_")
-            base_action = action.split("_")[-1]  # LONG or SHORT
-
-            if is_update:
-                _log(db, run_id, "DEPLOY", "IN_PROGRESS", f"Updating {initial_status} strategy: {base_action} {ticker} @ ${entry_price:.2f} (Size: ${parsed_size:,.2f})")
-                existing = db.query(models.DeployedStrategy).filter(
-                    models.DeployedStrategy.symbol == ticker,
-                    models.DeployedStrategy.status == "ACTIVE"
-                ).first()
-                if existing:
-                    existing.position_size = parsed_size
-                    existing.reasoning_summary = f"[UPDATED] {summary_text}"
-                    strategy = existing
-                else:
-                    # Fallback if there's no active strategy to update
-                    strategy = models.DeployedStrategy(
-                        symbol=ticker,
-                        strategy_type=base_action,
-                        entry_price=entry_price,
-                        position_size=parsed_size,
-                        reasoning_summary=summary_text,
-                        status=initial_status,
-                    )
-                    db.add(strategy)
-            else:
-                _log(db, run_id, "DEPLOY", "IN_PROGRESS", f"Creating {initial_status} strategy: {base_action} {ticker} @ ${entry_price:.2f} (Size: ${parsed_size:,.2f})")
-                strategy = models.DeployedStrategy(
-                    symbol=ticker,
-                    strategy_type=base_action,
-                    entry_price=entry_price,
-                    position_size=parsed_size,
-                    reasoning_summary=summary_text,
-                    status=initial_status,
-                )
-                db.add(strategy)
-            
-            deployed_strategies.append(strategy)
-
-        # We take the first consensus for DebateRound to keep the schema simple for now
-        main_best_ticker = verdicts[0]["ticker"]
-        main_best_action = verdicts[0]["action"].split("_")[-1]
-        agreeing_main = sum(1 for p in proposals_log if p["ticker"] == main_best_ticker and p["action"].split("_")[-1] == main_best_action)
-        main_votes_str = f"{agreeing_main}/{len(proposals_log)}"
-
-        debate_round = models.DebateRound(
-            consensus_ticker=main_best_ticker,
-            consensus_action=main_best_action,
-            consensus_votes=main_votes_str,
-            proposals_json=json.dumps(proposals_log),
-            enabled_markets=", ".join(enabled_markets.keys()) if enabled_markets else "None",
-            research_context=json.dumps(research_log),
-            judge_reasoning=judge_reasoning,
-        )
-        db.add(debate_round)
-        db.commit()
-        db.refresh(debate_round)
-
-        # Link strategies if they were newly added
-        for s in deployed_strategies:
-            if not getattr(s, "debate_round_id", None):
-                s.debate_round_id = debate_round.id
-        db.commit()
-
-        _log(db, run_id, "DEPLOY", "DONE",
-             f"{len(verdicts)} Strategies processed (status={initial_status}) — Debate round #{debate_round.id}")
-
-        # ── 5. Memory Write ───────────────────────────────────────────────────
-        _log(db, run_id, "MEMORY_WRITE", "IN_PROGRESS",
-             f"Writing memory notes for {len(proposals_log)} agents…")
-
-        for proposal in proposals_log:
-            agent_name   = proposal["agent_name"]
-            their_ticker = proposal["ticker"]
-            their_action = proposal["action"].split("_")[-1]
-            
-            # Check if this agent's pick made it to the final verdicts
-            agreed = any((v["ticker"] == their_ticker and v["action"].split("_")[-1] == their_action) for v in verdicts)
-
-            if agreed:
-                note = (
-                    f"Round {debate_round.id}: Your {their_action} {their_ticker} call was selected. "
-                    f"Watch this position — you'll get a P&L update when it closes. "
-                    f"Reflect on why this analysis was strong."
-                )
-                note_type = "INSIGHT"
-            else:
-                note = (
-                    f"Round {debate_round.id}: You proposed {their_action} {their_ticker} but judge "
-                    f"deployed other ideas. Track how the judge's picks perform vs your pick {their_ticker} — "
-                    f"compare outcomes to sharpen your edge."
-                )
-                note_type = "OBSERVATION"
-
-            write_agent_memory(db, agent_name, note_type, note, debate_round.id)
-            pruned = prune_old_memory(db, agent_name, keep=200)
-            if pruned:
-                print(f"[Memory] Pruned {pruned} old notes for {agent_name}")
-
-        db.commit()
-        _log(db, run_id, "MEMORY_WRITE", "DONE", "Agent memories updated — pipeline complete")
-
-        print(summary_text)
-        return strategy
-
-    except Exception as e:
-        print(f"[Debate] Critical error: {e}")
-        try:
-            _log(db, run_id, "ERROR", "ERROR", str(e)[:300])
-        except Exception:
-            pass
-        db.rollback()
-        return None
-
-    finally:
-        lock = db.query(models.AppConfig).filter(models.AppConfig.key == "debate_running").first()
-        if lock:
-            lock.value = "0"
-            db.commit()
-        print("[Debate] Lock released.")
-        db.close()
-
-
-if __name__ == "__main__":
-    run_debate()

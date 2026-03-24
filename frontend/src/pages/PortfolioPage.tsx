@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { PortfolioPnl } from '../types';
 import { Badge } from '../components/Badge';
+import { getCurrencySymbol, getMarketForTicker } from '../utils';
 
 interface PortfolioPageProps {
   portfolio: PortfolioPnl | null;
@@ -300,21 +301,21 @@ export function PortfolioPage({
                     <div className="text-right">
                       <p className="text-[10px] text-textDim">Invested</p>
                       <p className="text-xs font-mono text-textMain">
-                        {pos.position_size ? `$${pos.position_size.toLocaleString()}` : <span className="text-textDim">—</span>}
+                        {pos.position_size ? `${getCurrencySymbol(getMarketForTicker(pos.symbol))}${pos.position_size.toLocaleString()}` : <span className="text-textDim">—</span>}
                       </p>
                     </div>
 
                     {/* Entry */}
                     <div className="text-right">
                       <p className="text-[10px] text-textDim">Entry</p>
-                      <p className="text-xs font-mono text-textMain">${pos.entry_price.toFixed(4)}</p>
+                      <p className="text-xs font-mono text-textMain">{getCurrencySymbol(getMarketForTicker(pos.symbol))}{pos.entry_price.toFixed(4)}</p>
                     </div>
 
                     {/* Live price */}
                     <div className="text-right">
                       <p className="text-[10px] text-textDim">Live</p>
                       <p className={`text-xs font-mono font-semibold ${pnlUp ? 'text-up' : 'text-down'}`}>
-                        {pos.current_price != null ? `$${pos.current_price.toFixed(4)}` : '—'}
+                        {pos.current_price != null ? `${getCurrencySymbol(getMarketForTicker(pos.symbol))}${pos.current_price.toFixed(4)}` : '—'}
                       </p>
                     </div>
 
@@ -377,7 +378,7 @@ export function PortfolioPage({
                       {/* Position size info */}
                       {pos.position_size && (
                         <p className="text-[10px] text-textDim">
-                          Position size: <span className="text-textMuted font-mono">${pos.position_size.toLocaleString()}</span>
+                          Position size: <span className="text-textMuted font-mono">{getCurrencySymbol(getMarketForTicker(pos.symbol))}{pos.position_size.toLocaleString()}</span>
                           {p && p.total_budget > 0 && <span className="ml-1">({((pos.position_size / p.total_budget) * 100).toFixed(1)}% of budget)</span>}
                         </p>
                       )}
@@ -456,9 +457,9 @@ export function PortfolioPage({
                       )}
                     </div>
                     <div className="flex items-center gap-3 mt-0.5 text-[10px] text-textDim font-mono flex-wrap">
-                      <span>in ${pos.entry_price.toFixed(4)}</span>
-                      {pos.exit_price && <span>out ${pos.exit_price.toFixed(4)}</span>}
-                      {pos.position_size && <span>${pos.position_size.toLocaleString()} size</span>}
+                      <span>in {getCurrencySymbol(getMarketForTicker(pos.symbol))}{pos.entry_price.toFixed(4)}</span>
+                      {pos.exit_price && <span>out {getCurrencySymbol(getMarketForTicker(pos.symbol))}{pos.exit_price.toFixed(4)}</span>}
+                      {pos.position_size && <span>{getCurrencySymbol(getMarketForTicker(pos.symbol))}{pos.position_size.toLocaleString()} size</span>}
                       {pos.closed_at && <span>{new Date(pos.closed_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span>}
                     </div>
                   </div>

@@ -16,7 +16,8 @@
       "Bash(vercel inspect:*)",
       "WebFetch(domain:kite.trade)",
       "WebFetch(domain:api.groww.in)",
-      "WebFetch(domain:groww.in)"
+      "WebFetch(domain:groww.in)",
+      "Bash(df:*)"
     ]
   }
 }

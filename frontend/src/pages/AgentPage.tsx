@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import type { AgentMemory, AgentPrompt, AgentFitness, AgentEvolution } from '../types';
 import { NOTE_COLORS } from '../constants';
 import { Card } from '../components/Card';
@@ -6,6 +7,12 @@ import { Toggle } from '../components/Toggle';
 import { AgentManager } from '../components/AgentManager';
 import { apiFetch } from '../utils';
 import { useToast } from '../hooks/useToast';
+
+// Elo rating derived from fitness_score (0–100) → 800–1600 range, centred at 1200
+function fitnessToElo(fitness: number | null): number | null {
+  if (fitness === null) return null;
+  return Math.round(800 + fitness * 8);
+}
 
 // Agent metadata: type labels and market specializations
 const AGENT_META: Record<string, { type: 'core' | 'specialist'; market?: string; icon: string; desc: string }> = {
@@ -50,6 +57,20 @@ export function AgentPage({
   const [agentTrades, setAgentTrades] = useState<Record<string, { id: number; symbol: string; prediction: string; confidence: number; reasoning: string; actual_outcome: string | null; score: number | null; timestamp: string | null }[]>>({});
   const [tradesLoading, setTradesLoading] = useState<string | null>(null);
   const [expandedTradeId, setExpandedTradeId] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!tradesModal) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setTradesModal(null); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tradesModal]);
+
+  useEffect(() => {
+    if (expandedAgents.length === 0) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setExpandedAgents([]); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [expandedAgents]);
 
   const toggleExpandedAgent = (agentName: string) => {
     const willExpand = !expandedAgents.includes(agentName);
@@ -96,6 +117,8 @@ export function AgentPage({
     const prompt = agents.find(a => a.agent_name === agentName);
     const isExpanded = expandedAgents.includes(agentName);
     const isEditingPrompt = editingPromptAgent === agentName;
+    const af = agentFitness.find(f => f.agent_name === agentName);
+    const elo = fitnessToElo(af?.fitness_score ?? null);
 
     const handleDelete = async (e: React.MouseEvent) => {
       e.stopPropagation();
@@ -108,7 +131,7 @@ export function AgentPage({
         } else {
           toast('Delete failed', 'err');
         }
-      } catch (err) {
+      } catch {
         toast('Network error', 'err');
       }
     };
@@ -134,6 +157,15 @@ export function AgentPage({
               {meta?.type === 'core' && (
                 <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-surface3 text-textDim border border-borderLight uppercase tracking-wide">
                   Core
+                </span>
+              )}
+              {elo !== null && (
+                <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded border tabular-nums ${
+                  elo >= 1400 ? 'bg-up/10 text-up border-up/30' :
+                  elo >= 1200 ? 'bg-amber-500/10 text-amber-400 border-amber-500/30' :
+                  'bg-down/10 text-down border-down/30'
+                }`}>
+                  ELO {elo}
                 </span>
               )}
             </div>
@@ -350,13 +382,13 @@ export function AgentPage({
     const { agentName } = tradesModal;
     const trades = agentTrades[agentName] ?? [];
     const loading = tradesLoading === agentName;
-    return (
+    return createPortal(
       <div
-        className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
+        className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm"
         onClick={() => setTradesModal(null)}
       >
         <div
-          className="relative bg-surface border border-borderMid rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col mx-4"
+          className="relative bg-surface border border-borderMid rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col"
           onClick={e => e.stopPropagation()}
         >
           {/* Header */}
@@ -447,7 +479,8 @@ export function AgentPage({
             </div>
           )}
         </div>
-      </div>
+      </div>,
+      document.body
     );
   })();
 
@@ -498,18 +531,18 @@ export function AgentPage({
                     <tr className="border-b border-borderLight bg-surface2/60">
                       <th className="text-left px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider w-6">#</th>
                       <th className="text-left px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Agent</th>
+                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">ELO</th>
                       <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Trades</th>
-                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Profit</th>
-                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Loss</th>
-                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Score</th>
+                      <th className="text-right px-4 py-2.5 text-[10px] font-semibold text-textDim uppercase tracking-wider">Win / Loss</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-borderLight">
                     {sorted.map((af, rank) => {
                       const fitness = af.fitness_score;
-                      const hasData = af.total_scored >= 1;
-                      const profitable = Math.round((af.win_rate ?? 0) * af.total_scored);
-                      const loss = af.total_scored - profitable;
+                      const elo = fitnessToElo(fitness);
+                      const totalAll = af.total_all ?? af.total_scored;
+                      const wins = af.wins_all ?? 0;
+                      const losses = af.losses_all ?? 0;
                       const rankLabel = rank === 0 ? '🥇' : rank === 1 ? '🥈' : rank === 2 ? '🥉' : `${rank + 1}`;
                       return (
                         <tr key={af.agent_name} className="hover:bg-surface2/40 transition-colors">
@@ -523,29 +556,30 @@ export function AgentPage({
                             </div>
                           </td>
                           <td className="px-4 py-3 text-right font-mono">
-                            {hasData ? (
-                              <button
-                                onClick={() => openTradesModal(af.agent_name, af.total_scored)}
-                                className="tabular-nums font-mono text-brand-400 hover:text-brand-300 underline decoration-dotted underline-offset-2 transition-colors"
-                              >
-                                {af.total_scored}
-                              </button>
+                            {elo !== null ? (
+                              <span className={`font-bold tabular-nums ${elo >= 1400 ? 'text-up' : elo >= 1200 ? 'text-amber-400' : 'text-down'}`}>
+                                {elo}
+                              </span>
                             ) : <span className="text-textDim">—</span>}
                           </td>
                           <td className="px-4 py-3 text-right font-mono">
-                            {hasData ? <span className="text-up">{profitable}</span> : <span className="text-textDim">—</span>}
+                            {totalAll > 0 ? (
+                              <button
+                                onClick={() => openTradesModal(af.agent_name, totalAll)}
+                                className="tabular-nums font-mono text-brand-400 hover:text-brand-300 underline decoration-dotted underline-offset-2 transition-colors"
+                              >
+                                {totalAll}
+                              </button>
+                            ) : <span className="text-textDim">—</span>}
                           </td>
-                          <td className="px-4 py-3 text-right font-mono">
-                            {hasData ? <span className="text-down">{loss}</span> : <span className="text-textDim">—</span>}
-                          </td>
-                          <td className="px-4 py-3 text-right">
-                            {fitness !== null ? (
-                              <span className={`font-semibold tabular-nums ${fitness >= 65 ? 'text-up' : fitness >= 45 ? 'text-amber-400' : 'text-down'}`}>
-                                {fitness.toFixed(1)}
+                          <td className="px-4 py-3 text-right font-mono tabular-nums">
+                            {(wins + losses) > 0 ? (
+                              <span className="flex items-center justify-end gap-1">
+                                <span className="text-up">{wins}</span>
+                                <span className="text-textDim">/</span>
+                                <span className="text-down">{losses}</span>
                               </span>
-                            ) : (
-                              <span className="text-textDim">—</span>
-                            )}
+                            ) : <span className="text-textDim">—</span>}
                           </td>
                         </tr>
                       );

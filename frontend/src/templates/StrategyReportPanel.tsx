@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import type { StrategyReport, AssetClass } from '../types';
 import { detectAssetClass } from '../utils';
 import { CryptoReportTemplate } from './CryptoReportTemplate';
@@ -7,6 +8,12 @@ import { CommodityReportTemplate } from './CommodityReportTemplate';
 export function StrategyReportPanel({ report, loading, error, onClose }: { report: StrategyReport | null; loading: boolean; error?: string | null; onClose: () => void }) {
   const s = report?.strategy;
   const assetClass = s ? detectAssetClass(s.symbol, report?.fundamentals?.quote_type) : 'stock';
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
   const assetLabel: Record<AssetClass, string> = {
     crypto:    'CRYPTO',

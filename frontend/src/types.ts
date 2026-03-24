@@ -22,7 +22,7 @@ export interface StrategyReport {
   };
 }
 export interface PortfolioPnl { total_budget: number; allocated: number; available: number; realized_pnl: number; unrealized_pnl: number; total_pnl: number; total_pnl_pct: number; using_assumed_sizes?: boolean; positions: (Strategy & { pnl_usd: number | null; pnl_pct: number | null; is_open: boolean; current_price?: number | null; assumed_size?: number | null })[]; }
-export interface MarketConfig { id: number; market_name: string; is_enabled: number; }
+export interface MarketConfig { id: number; market_name: string; is_enabled: number; base_tickers?: string[]; custom_tickers?: string[]; }
 export interface DebateRound { id: number; timestamp: string; consensus_ticker: string; consensus_action: string; consensus_votes: string; proposals_json: string; enabled_markets: string; research_context?: string; judge_reasoning?: string; }
 export interface Proposal { agent_name: string; ticker: string; action: string; reasoning: string; }
 export interface AgentMemory { id: number; agent_name: string; note_type: string; content: string; created_at: string; }
@@ -34,6 +34,10 @@ export interface AgentFitness {
   win_rate: number | null;
   avg_return: number | null;
   total_scored: number;
+  total_all: number;
+  wins_all: number;
+  losses_all: number;
+  pending_all: number;
   streak: number;
   updated_at: string | null;
   last_evolution: { reason: string | null; replaced_at: string | null; fitness_score: number | null } | null;
@@ -55,6 +59,16 @@ export interface LiveQuote { market: string; symbol: string; name: string; price
 export interface MarketEvent { market: string; symbol: string; name: string; event_type: string; date: string; detail: string | null; url?: string | null; title?: string | null; }
 
 export type AssetClass = 'crypto' | 'stock' | 'commodity';
-export type Page = 'dashboard' | 'markets' | 'graph' | 'portfolio' | 'memory' | 'pipeline' | 'settings';
+export type Page = 'dashboard' | 'markets' | 'graph' | 'portfolio' | 'memory' | 'pipeline' | 'llm' | 'settings';
 export interface Toast { id: number; msg: string; type: 'ok' | 'err' | 'info'; }
 export interface TickerMeta { symbol: string; name: string; market: string; sector: string; }
+
+export interface LLMDailyUsage { date: string; prompt_tokens: number; completion_tokens: number; reasoning_tokens: number; total_tokens: number; cost: number; calls: number; }
+export interface LLMModelUsage { model: string; prompt_tokens: number; completion_tokens: number; reasoning_tokens: number; total_tokens: number; cost: number; calls: number; }
+export interface LLMCallerUsage { caller: string; total_tokens: number; reasoning_tokens: number; cost: number; calls: number; }
+export interface LLMUsageStats {
+  daily: LLMDailyUsage[];
+  by_model: LLMModelUsage[];
+  by_caller: LLMCallerUsage[];
+  totals: { prompt_tokens: number; completion_tokens: number; reasoning_tokens: number; total_tokens: number; cost: number; calls: number };
+}

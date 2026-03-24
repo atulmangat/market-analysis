@@ -19,6 +19,13 @@ from contextlib import asynccontextmanager
 # On Railway/local, use APScheduler for automatic background jobs.
 VERCEL = os.getenv("VERCEL", "") == "1"
 
+def _upsert_config(db, key: str, value: str):
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+    if conf:
+        conf.value = value
+    else:
+        db.add(models.AppConfig(key=key, value=value))
+
 scheduler = None
 
 def _get_schedule_minutes(pipeline: str) -> int:
@@ -27,10 +34,9 @@ def _get_schedule_minutes(pipeline: str) -> int:
         "research": "schedule_research_minutes",
         "trade":    "schedule_trade_minutes",
         "eval":     "schedule_eval_minutes",
-        "debate":   "schedule_interval_minutes",  # legacy
     }
     db = SessionLocal()
-    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key_map.get(pipeline, "schedule_interval_minutes")).first()
+    conf = db.query(models.AppConfig).filter(models.AppConfig.key == key_map.get(pipeline, "schedule_trade_minutes")).first()
     db.close()
     default = 120 if pipeline == "eval" else 60
     return int(conf.value) if conf else default
@@ -42,9 +48,8 @@ def _run_research_scheduled():
     from core.database import SessionLocal
     db = SessionLocal()
     try:
-        # Skip if any pipeline is already running (debate_running = legacy key; research_running = manual trigger key)
         any_running = db.query(models.AppConfig).filter(
-            models.AppConfig.key.in_(["debate_running", "research_running", "trade_running"]),
+            models.AppConfig.key.in_(["research_running", "trade_running"]),
             models.AppConfig.value == "1",
         ).first()
         if any_running:
@@ -56,13 +61,8 @@ def _run_research_scheduled():
         else:
             research_lock.value = "1"
         run_id = str(_uuid.uuid4())
-        run = models.PipelineRun(run_id=run_id, run_type="research", step="pending")
-        db.add(run)
-        run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-        if run_id_conf:
-            run_id_conf.value = run_id
-        else:
-            db.add(models.AppConfig(key="current_run_id", value=run_id))
+        db.add(models.PipelineRun(run_id=run_id, run_type="research", step="pending"))
+        _upsert_config(db, "current_run_id_research", run_id)
         db.commit()
         db.close()
     except Exception:
@@ -78,9 +78,8 @@ def _run_trade_scheduled():
     from core.database import SessionLocal
     db = SessionLocal()
     try:
-        # Skip if any pipeline is already running (debate_running = legacy key; trade_running = manual trigger key)
         any_running = db.query(models.AppConfig).filter(
-            models.AppConfig.key.in_(["debate_running", "research_running", "trade_running"]),
+            models.AppConfig.key.in_(["research_running", "trade_running"]),
             models.AppConfig.value == "1",
         ).first()
         if any_running:
@@ -92,13 +91,8 @@ def _run_trade_scheduled():
         else:
             trade_lock.value = "1"
         run_id = str(_uuid.uuid4())
-        run = models.PipelineRun(run_id=run_id, run_type="trade", step="pending")
-        db.add(run)
-        run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-        if run_id_conf:
-            run_id_conf.value = run_id
-        else:
-            db.add(models.AppConfig(key="current_run_id", value=run_id))
+        db.add(models.PipelineRun(run_id=run_id, run_type="trade", step="pending"))
+        _upsert_config(db, "current_run_id_trade", run_id)
         db.commit()
         db.close()
     except Exception:
@@ -108,9 +102,51 @@ def _run_trade_scheduled():
     run_trade_pipeline(run_id)
 
 
+def _cleanup_stuck_runs():
+    """On startup, mark any runs stuck in a non-terminal step as errored and release locks.
+    Only marks runs that had no activity in the last 2 minutes — this avoids falsely failing
+    runs that were interrupted by a uvicorn --reload during active development.
+    """
+    from core.database import SessionLocal
+    from datetime import datetime, timedelta
+    db = SessionLocal()
+    try:
+        TERMINAL_STEPS = {"done", "error"}
+        # Only clean up runs that haven't had activity recently
+        recent_threshold = datetime.utcnow() - timedelta(minutes=2)
+        stuck = db.query(models.PipelineRun).filter(
+            models.PipelineRun.step.notin_(TERMINAL_STEPS)
+        ).all()
+        actually_stuck = []
+        for run in stuck:
+            # Check when the last event was logged for this run
+            last_evt = (
+                db.query(models.PipelineEvent)
+                .filter(models.PipelineEvent.run_id == run.run_id)
+                .order_by(models.PipelineEvent.created_at.desc())
+                .first()
+            )
+            if not last_evt or last_evt.created_at < recent_threshold:
+                run.step = "error"
+                actually_stuck.append(run.run_id[:8])
+        # Release locks only for runs we actually marked as error
+        for key in ["research_running", "trade_running", "eval_running"]:
+            lock = db.query(models.AppConfig).filter(models.AppConfig.key == key).first()
+            if lock and lock.value == "1":
+                lock.value = "0"
+        if actually_stuck:
+            print(f"[Startup] Cleaned up {len(actually_stuck)} stuck pipeline run(s): {actually_stuck}")
+        db.commit()
+    except Exception as e:
+        print(f"[Startup] Cleanup error (non-fatal): {e}")
+    finally:
+        db.close()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler
+    _cleanup_stuck_runs()
     if not VERCEL:
         from apscheduler.schedulers.background import BackgroundScheduler
         from apscheduler.triggers.interval import IntervalTrigger
@@ -177,77 +213,26 @@ def _verify_cron(x_vercel_cron_signature: str = Header(default="")):
     if secret and x_vercel_cron_signature != secret:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-@app.post("/api/cron/debate", dependencies=[Depends(_verify_cron)])
-def cron_debate(focus_tickers: list[str] | None = None):
-    """Kick off the lambda chain pipeline."""
-    import uuid as _uuid
-    from core.database import SessionLocal
-    db = SessionLocal()
-    try:
-        # Concurrency lock
-        any_running = db.query(models.AppConfig).filter(
-            models.AppConfig.key.in_(["research_running", "trade_running", "eval_running"]),
-            models.AppConfig.value == "1"
-        ).first()
-
-        if any_running:
-            db.close()
-            return {"status": "already_running"}
-            
-        trade_lock = db.query(models.AppConfig).filter(models.AppConfig.key == "trade_running").first()
-        if not trade_lock:
-            db.add(models.AppConfig(key="trade_running", value="1"))
-        else:
-            trade_lock.value = "1"
-
-        run_id = str(_uuid.uuid4())
-        # Load investment focus
-        focus_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "investment_focus").first()
-        investment_focus = focus_conf.value.strip() if focus_conf and focus_conf.value else ""
-
-        run = models.PipelineRun(
-            run_id=run_id,
-            step="pending",
-            investment_focus=investment_focus,
-            focus_tickers=json.dumps(focus_tickers) if focus_tickers else None,
-        )
-        db.add(run)
-
-        # Set current_run_id
-        run_id_conf = db.query(models.AppConfig).filter(models.AppConfig.key == "current_run_id").first()
-        if run_id_conf:
-            run_id_conf.value = run_id
-        else:
-            db.add(models.AppConfig(key="current_run_id", value=run_id))
-        db.commit()
-        db.close()
-    except Exception as e:
-        db.close()
-        raise
-
-    from pipeline.runner import run_full_pipeline
-    run_full_pipeline(run_id)
-    return {"status": "pipeline_started", "run_id": run_id}
-
-
 @app.post("/api/cron/evaluate", dependencies=[Depends(_verify_cron)])
 def cron_evaluate():
     """Vercel Cron endpoint: runs the prediction evaluator."""
+    import threading as _threading
     from pipeline.validator import evaluate_predictions
-    evaluate_predictions()
+    _threading.Thread(target=evaluate_predictions, daemon=False).start()
     return {"status": "triggered"}
 
 
 @app.post("/api/system/sync_schedule")
 def sync_schedule(db: Session = Depends(get_db)):
-    """Sync APScheduler interval with the database setting (no-op on Vercel)."""
+    """Sync APScheduler intervals with the database settings (no-op on Vercel)."""
     if VERCEL or scheduler is None:
         return {"status": "skipped", "reason": "APScheduler not running (Vercel mode)"}
 
     from apscheduler.triggers.interval import IntervalTrigger
-    conf = db.query(models.AppConfig).filter(models.AppConfig.key == "schedule_interval_minutes").first()
-    new_interval = int(conf.value) if conf else 60
-    print(f"[Scheduler] Rescheduling jobs to run every {new_interval} minutes.")
-    scheduler.reschedule_job('debate_job', trigger=IntervalTrigger(minutes=new_interval))
-    scheduler.reschedule_job('eval_job', trigger=IntervalTrigger(minutes=new_interval))
-    return {"status": "success", "new_interval_minutes": new_interval}
+    r_mins = _get_schedule_minutes("research")
+    t_mins = _get_schedule_minutes("trade")
+    e_mins = _get_schedule_minutes("eval")
+    scheduler.reschedule_job('research_job', trigger=IntervalTrigger(minutes=r_mins))
+    scheduler.reschedule_job('trade_job',    trigger=IntervalTrigger(minutes=t_mins))
+    scheduler.reschedule_job('eval_job',     trigger=IntervalTrigger(minutes=e_mins))
+    return {"status": "success", "research_minutes": r_mins, "trade_minutes": t_mins, "eval_minutes": e_mins}

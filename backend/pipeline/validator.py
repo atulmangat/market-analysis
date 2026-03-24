@@ -8,6 +8,7 @@ from datetime import datetime
 from agents.llm import query_agent
 from data.market import fetch_market_data
 from agents.memory import write_agent_memory, prune_old_memory
+from data.research import _tavily_search
 
 # ── Thresholds ──────────────────────────────────────────────────────────────
 STOP_LOSS_PCT    = -10.0   # close strategy at this loss
@@ -183,24 +184,45 @@ def _archive_prompt(db: Session, agent_name: str, reason: str, fitness: dict):
     return generation
 
 
+def _fetch_ticker_web_context(symbol: str, max_results: int = 5) -> str:
+    """
+    Fetch recent Tavily news for a symbol to give the analysis LLM real-world context
+    on what happened to this asset since the prediction was made.
+    Returns a formatted string, empty string on failure.
+    """
+    clean = symbol.replace(".NS", "").replace(".BO", "").replace("-USD", "").replace("=F", "")
+    try:
+        results = _tavily_search(f"{clean} stock news recent", max_results=max_results)
+        if not results:
+            return ""
+        lines = ["RECENT NEWS FOR THIS ASSET:"]
+        for r in results:
+            lines.append(f"- {r['title']}")
+            if r.get("snippet"):
+                lines.append(f"  {r['snippet'][:200]}")
+        return "\n".join(lines)
+    except Exception as e:
+        print(f"[validator] Tavily context fetch failed for {symbol}: {e}")
+        return ""
+
+
 def _build_exhaustive_analysis_prompt(
     agent_name: str,
     prediction: models.AgentPrediction,
     strategy: models.DeployedStrategy,
     pct_return: float,
     outcome: str,
+    web_context: str = "",
 ) -> str:
     """
     Build a rich prompt for exhaustive post-mortem analysis of a closed position.
     """
     direction = "LONG" if strategy.strategy_type == "LONG" else "SHORT"
-    was_right = (
-        (direction == "LONG" and pct_return >= 0) or
-        (direction == "SHORT" and pct_return >= 0)
-    )
 
     original_reasoning = prediction.reasoning or "(no reasoning recorded)"
     exit_price_str = f"${strategy.exit_price:.4f}" if strategy.exit_price is not None else "N/A (position still open)"
+
+    web_section = f"\n\n=== WHAT ACTUALLY HAPPENED (RECENT WEB RESEARCH) ===\n{web_context}" if web_context else ""
 
     return f"""You are conducting an exhaustive post-mortem analysis of a market prediction made by the {agent_name} agent.
 
@@ -215,7 +237,7 @@ Outcome: {outcome}
 Prediction timestamp: {prediction.timestamp}
 
 === ORIGINAL REASONING ===
-{original_reasoning}
+{original_reasoning}{web_section}
 
 === YOUR TASK ===
 Perform a thorough forensic analysis of this trade. Structure your output EXACTLY as follows:
@@ -251,16 +273,25 @@ def _exhaustive_agent_analysis(
 ) -> dict:
     """
     Run exhaustive LLM post-mortem on a closed position.
+    Fetches fresh web context for the ticker so the LLM knows what actually happened.
     Returns parsed sections as a dict.
     """
-    prompt = _build_exhaustive_analysis_prompt(agent_name, prediction, strategy, pct_return, outcome)
     _log(db, run_id, "AGENT_ANALYSIS", "IN_PROGRESS",
-         f"Analysing {agent_name}'s {prediction.prediction} call on {prediction.symbol}",
+         f"Analysing {agent_name}'s {prediction.prediction} call on {prediction.symbol} — fetching web context",
+         agent_name=agent_name)
+
+    web_context = _fetch_ticker_web_context(prediction.symbol)
+
+    prompt = _build_exhaustive_analysis_prompt(agent_name, prediction, strategy, pct_return, outcome, web_context)
+    _log(db, run_id, "AGENT_ANALYSIS", "IN_PROGRESS",
+         f"Running post-mortem LLM analysis for {agent_name}/{prediction.symbol}",
          agent_name=agent_name)
 
     response = query_agent(
         "You are an expert trading post-mortem analyst. Be precise, specific, and brutally honest.",
         prompt,
+        caller=f"validator:analysis:{agent_name}",
+        run_id=run_id,
     )
     if not response:
         _log(db, run_id, "AGENT_ANALYSIS", "ERROR",
@@ -342,6 +373,18 @@ def _mutate_prompt_exhaustive(
         if s.get("guidelines_delta"):
             postmortem_text += f"Suggested guidelines update:\n{s['guidelines_delta']}\n"
 
+    # Fetch current web context for the symbols this agent has been trading
+    traded_symbols = list({s.get("symbol") for s in analysis_summaries[:3] if s.get("symbol")})
+    market_context_parts = []
+    for sym in traded_symbols:
+        ctx = _fetch_ticker_web_context(sym, max_results=3)
+        if ctx:
+            market_context_parts.append(f"[{sym}]\n{ctx}")
+    market_context_section = (
+        "\n\nCURRENT MARKET CONTEXT (live web research for the symbols you traded):\n"
+        + "\n\n".join(market_context_parts)
+    ) if market_context_parts else ""
+
     if is_aggressive:
         evolution_context = f"""You are an AI agent optimizer performing AGGRESSIVE Darwinian selection on a chronically underperforming market prediction agent.
 
@@ -355,7 +398,7 @@ RECENT PREDICTION RECORD:
 {pred_summary}
 
 EXHAUSTIVE POST-MORTEM ANALYSIS OF CLOSED POSITIONS:
-{postmortem_text or "(no positions closed this eval run)"}
+{postmortem_text or "(no positions closed this eval run)"}{market_context_section}
 
 CURRENT EVOLVED GUIDELINES:
 {current_guidelines or "(none)"}
@@ -363,10 +406,10 @@ CURRENT EVOLVED GUIDELINES:
 CURRENT STRATEGY BIAS:
 {current_bias}
 
-This agent is on a LOSING STREAK and needs radical surgery. Using the post-mortem analysis above as your primary evidence, rewrite BOTH sections:
+This agent is on a LOSING STREAK and needs radical surgery. Use the post-mortem analysis AND the current market context above as your primary evidence. Rewrite BOTH sections:
 
-1. EVOLVED_GUIDELINES — completely overhaul the analysis rules; reverse any biases that have been causing losses; incorporate the improvement rules from the post-mortem analyses
-2. STRATEGY_BIAS — write 3-5 concrete directional rules that directly address the failure patterns identified in the post-mortems
+1. EVOLVED_GUIDELINES — completely overhaul the analysis rules; reverse any biases that have been causing losses; incorporate the improvement rules from the post-mortem analyses; reference specific market events from the web research where relevant
+2. STRATEGY_BIAS — write 3-5 concrete directional rules that directly address the failure patterns identified in the post-mortems and current market conditions
 
 OUTPUT FORMAT (output BOTH sections, clearly labelled):
 EVOLVED_GUIDELINES:
@@ -379,7 +422,8 @@ Do NOT include section markers (===). Do NOT include the full prompt. Just the t
 """
         response = query_agent(
             "You are an expert AI system designer specialising in financial prediction agents.",
-            evolution_context
+            evolution_context,
+            caller=f"validator:evolve:{agent_name}",
         )
         if not response:
             return None
@@ -406,16 +450,16 @@ RECENT PREDICTION RECORD:
 {pred_summary}
 
 EXHAUSTIVE POST-MORTEM ANALYSIS OF CLOSED POSITIONS:
-{postmortem_text or "(no positions closed this eval run)"}
+{postmortem_text or "(no positions closed this eval run)"}{market_context_section}
 
 CURRENT EVOLVED GUIDELINES (this is the ONLY section you are allowed to change):
 {current_guidelines or "(No evolved guidelines section found — treat entire prompt as guidelines)"}
 
-This agent is UNDERPERFORMING. Using the post-mortem analysis as your primary evidence, rewrite ONLY the evolved guidelines section to:
+This agent is UNDERPERFORMING. Using the post-mortem analysis AND the current market context as your primary evidence, rewrite ONLY the evolved guidelines section to:
 1. Fix the specific weaknesses identified in the post-mortems
 2. Incorporate the improvement rules discovered from closed positions
-3. Add market biases, risk preferences, or sector tilts that address failure patterns
-4. Make it more disciplined about when to go LONG vs SHORT
+3. Reference specific real-world events from the web research that explain why the agent's prior thesis failed
+4. Add market biases, risk preferences, or sector tilts that address failure patterns
 5. Keep guidelines actionable and concise (5-10 bullet points max)
 
 IMPORTANT: Output ONLY the evolved guidelines text. Do NOT include section markers, commentary, or the full prompt.
@@ -423,7 +467,8 @@ Do NOT change the agent's identity, analysis framework, or output format.
 """
         new_guidelines = query_agent(
             "You are an expert AI system designer specialising in financial prediction agents.",
-            evolution_context
+            evolution_context,
+            caller=f"validator:mutate:{agent_name}",
         )
         if not new_guidelines:
             return None
@@ -476,7 +521,8 @@ IMPORTANT: Output ONLY the new evolved guidelines text. Do NOT include section m
 """
     new_guidelines = query_agent(
         "You are an expert AI system designer specialising in financial prediction agents.",
-        crossover_context
+        crossover_context,
+        caller=f"validator:crossover:{agent_name}",
     )
     if not new_guidelines:
         return None
@@ -690,6 +736,7 @@ def evaluate_predictions(run_id: str = None):
 
     _log(db, run_id, "START", "IN_PROGRESS", "Evaluation pipeline started")
     _update_run(db, run, "running")
+    _log(db, run_id, "START", "DONE", "Evaluation pipeline initialised")
 
     try:
         # ── PRICE_FETCH ───────────────────────────────────────────────────────
@@ -738,8 +785,10 @@ def evaluate_predictions(run_id: str = None):
 
             entry_price = strategy.entry_price or 0.0
             if not entry_price:
-                score_lines.append(f"{strategy.symbol}: skipped — entry price is 0")
-                continue
+                # Auto-heal: set entry price to current price so future runs can track returns
+                strategy.entry_price = current_price
+                entry_price = current_price
+                score_lines.append(f"{strategy.symbol}: entry was 0 — reset to current price ${current_price:.4f}")
             if strategy.strategy_type == "LONG":
                 pct_return = ((current_price - entry_price) / entry_price) * 100
             else:
@@ -840,9 +889,6 @@ def evaluate_predictions(run_id: str = None):
         if evolved:
             evolved_summary = f" Evolved: {', '.join(a['agent'] for a in evolved)}."
 
-        _log(db, run_id, "START", "DONE",
-             f"Evaluation complete. {len(active_strategies)} position(s) reviewed, "
-             f"{len(agent_analysis_map)} agent(s) analysed.{evolved_summary}")
         _update_run(db, run, "done")
 
     except Exception as e:

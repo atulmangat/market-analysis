@@ -1,339 +1,165 @@
 """
-Web Research Module — fetches real-time news from curated reliable sources.
+Web Research Module — fetches real-time news via Tavily Search API.
 
-Sources by market:
-  Global / Macro : Reuters, CNBC, MarketWatch, Benzinga, Nasdaq
-  Crypto         : CoinDesk, CoinTelegraph, CryptoSlate
-  India          : Economic Times Markets, Moneycontrol, Livemint
-  Commodities    : Investing.com metals/oil, CNBC commodities
-  Social signals : Stocktwits trending (X/Twitter proxy, no auth needed)
-  Sentiment      : Alpha Vantage News Sentiment (scored, ticker-aware)
-  Social         : Reddit WallStreetBets JSON (unauthenticated)
+All market research is delegated to Tavily (topic=news), which returns clean
+plain-text snippets from authoritative sources. No RSS parsing needed.
 
 Results are cached in the WebResearch table for CACHE_COOLDOWN_MINUTES.
-Staleness filter: items older than NEWS_MAX_AGE_HOURS are excluded.
+Deduplication: articles already seen (by title_key) are filtered out via
+the seen_articles table (30-day expiry) so the KG only ingests new events.
 """
 import os
-import feedparser
 import httpx
-import yfinance as yf
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from core.database import SessionLocal
 import core.models as models
-import random
 import re
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+from dotenv import load_dotenv
 
+load_dotenv()
 
 CACHE_COOLDOWN_MINUTES = 30
-NEWS_MAX_AGE_HOURS     = 48   # drop news older than this to avoid stale signals
-
-ALPHA_VANTAGE_API_KEY  = os.getenv("ALPHA_VANTAGE_API_KEY", "")
-
-
-# ── Curated RSS feed registry ──────────────────────────────────────────────
-
-RSS_GLOBAL = [
-    # MarketWatch (confirmed working)
-    ("https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines", "MarketWatch Real-Time"),
-    ("https://feeds.marketwatch.com/marketwatch/topstories/", "MarketWatch Top Stories"),
-    ("https://feeds.marketwatch.com/marketwatch/marketpulse/", "MarketWatch Pulse"),
-    # WSJ (confirmed working)
-    ("https://feeds.a.dj.com/rss/RSSMarketsMain.xml", "WSJ Markets"),
-    # FT (confirmed working)
-    ("https://www.ft.com/rss/home", "Financial Times"),
-    # NYT Business (confirmed working)
-    ("https://rss.nytimes.com/services/xml/rss/nyt/Business.xml", "NYT Business"),
-    # Washington Post (confirmed working)
-    ("https://feeds.washingtonpost.com/rss/business", "Washington Post Business"),
-    # Seeking Alpha (confirmed working)
-    ("https://seekingalpha.com/market_currents.xml", "Seeking Alpha"),
-    # Investing.com (confirmed working)
-    ("https://www.investing.com/rss/news.rss", "Investing.com"),
-]
-
-RSS_CRYPTO = [
-    ("https://cointelegraph.com/feed", "CoinTelegraph"),
-    ("https://cryptoslate.com/feed/", "CryptoSlate"),
-    ("https://bitcoinmagazine.com/.rss/full/", "Bitcoin Magazine"),
-    ("https://decrypt.co/feed", "Decrypt"),
-]
-
-RSS_INDIA = [
-    ("https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms", "Economic Times Markets"),
-    ("https://www.moneycontrol.com/rss/MCtopnews.xml", "Moneycontrol"),
-    ("https://www.livemint.com/rss/markets", "Livemint Markets"),
-    ("https://www.thehindu.com/business/feeder/default.rss", "The Hindu Business"),
-]
-
-RSS_COMMODITIES = [
-    ("https://www.investing.com/rss/news.rss", "Investing.com"),
-    ("https://feeds.marketwatch.com/marketwatch/marketpulse/", "MarketWatch Pulse"),
-    ("https://feeds.a.dj.com/rss/RSSMarketsMain.xml", "WSJ Markets"),
-]
-
-# Google News RSS — used for targeted ticker / topic queries only
-GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en&gl=US&ceid=US:en"
-
-# Map market name → which RSS groups to include
-MARKET_RSS_MAP = {
-    "US":          RSS_GLOBAL,
-    "Crypto":      RSS_CRYPTO + RSS_GLOBAL[:2],   # crypto feeds + Reuters macro
-    "India":       RSS_INDIA + RSS_GLOBAL[:2],
-    "MCX":         RSS_COMMODITIES + RSS_GLOBAL[:2],
-    "Focused":     RSS_GLOBAL,
-}
-
-# Stocktwits trending — free JSON, no auth, acts as X/social signal proxy
-STOCKTWITS_TRENDING_URL = "https://api.stocktwits.com/api/2/trending/symbols.json"
-STOCKTWITS_STREAM_URL   = "https://api.stocktwits.com/api/2/streams/symbol/{symbol}.json?limit=10"
+NEWS_MAX_AGE_HOURS     = 168  # 7 days — Tavily results can be up to a week old for niche tickers
+SEEN_ARTICLE_TTL_DAYS  = 30
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
-def _strip_html(text: str) -> str:
-    import html
-    text = re.sub(r'<[^>]+>', ' ', text)
-    text = html.unescape(text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def _title_key(title: str) -> str:
+    words = title.lower().split()
+    return " ".join(words[:20])
 
 
-def _extract_google_url(entry) -> str:
-    src = getattr(entry, 'source', None)
-    if src:
-        href = getattr(src, 'href', None) or src.get('href', '')
-        if href and 'news.google.com' not in href:
-            return href
-    summary = entry.get('summary', '')
-    match = re.search(r'<a href="([^"]+)"', summary)
-    if match:
-        url = match.group(1)
-        if 'news.google.com' not in url:
-            return url
-    return entry.get('link', '')
-
-
-# ── Fetchers ──────────────────────────────────────────────────────────────
-
-def _fetch_rss(url: str, label: str, max_items: int = 4) -> list[dict]:
-    """Parse an RSS/Atom feed and return normalised article dicts."""
+def _source_domain(url: str) -> str:
     try:
-        feed = feedparser.parse(url)
+        return urllib.parse.urlparse(url).netloc.lstrip("www.") or "unknown"
+    except Exception:
+        return "unknown"
+
+
+# ── Tavily fetcher ─────────────────────────────────────────────────────────
+
+def _tavily_search(query: str, max_results: int = 5, search_depth: str = "basic", topic: str = "news") -> list[dict]:
+    """
+    Search via Tavily SDK.
+    topic="news"    → recent news articles (use days=7 filter)
+    topic="general" → broad web search (no days filter, good for stock discovery)
+    Returns normalised {title, snippet, source_url, query, published} dicts.
+    Falls back gracefully on any error.
+    """
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        print("[WebResearch] TAVILY_API_KEY not set — skipping Tavily search")
+        return []
+    try:
+        from tavily import TavilyClient
+        client = TavilyClient(api_key=api_key)
+        params = dict(
+            query=query,
+            topic=topic,
+            search_depth=search_depth,
+            max_results=max_results,
+            include_answer=True,
+        )
+        if topic == "news":
+            params["days"] = 7      # last 7 days — Tavily filters server-side
+        response = client.search(**params)
         results = []
-        for entry in feed.entries[:max_items]:
-            title = _strip_html(entry.get("title", ""))
-            snippet = _strip_html(entry.get("summary", ""))[:300]
-            source_url = entry.get("link", "")
-            if title:
-                results.append({
-                    "title": title,
-                    "snippet": snippet,
-                    "source_url": source_url,
-                    "query": label,
-                })
-        return results
-    except Exception as e:
-        print(f"[WebResearch] RSS fetch failed ({label}): {e}")
-        return []
-
-
-def _fetch_google_news(query: str, max_items: int = 3) -> list[dict]:
-    """Fetch headlines from Google News RSS for a targeted query."""
-    url = GOOGLE_NEWS_RSS.format(query=urllib.parse.quote(query))
-    try:
-        feed = feedparser.parse(url)
-        results = []
-        for entry in feed.entries[:max_items]:
-            title = _strip_html(entry.get("title", ""))
-            snippet = _strip_html(entry.get("summary", ""))[:300]
-            source_url = _extract_google_url(entry)
-            if title:
-                results.append({
-                    "title": title,
-                    "snippet": snippet,
-                    "source_url": source_url,
-                    "query": f"google:{query}",
-                })
-        return results
-    except Exception as e:
-        print(f"[WebResearch] Google News fetch failed for '{query}': {e}")
-        return []
-
-
-def _fetch_stocktwits(tickers: list[str], max_items: int = 2) -> list[dict]:
-    """
-    Fetch recent Stocktwits messages for given tickers.
-    Stocktwits is the best free X/social signal proxy — aggregates
-    bullish/bearish sentiment from traders (many of whom cross-post from X).
-    No API key required.
-    """
-    results = []
-    sample = random.sample(tickers, min(3, len(tickers))) if tickers else []
-    for symbol in sample:
-        # Stocktwits uses ticker without exchange suffix (e.g. RELIANCE.NS → RELIANCE)
-        clean = symbol.split('.')[0].replace('-USD', '').replace('=F', '')
-        try:
-            with httpx.Client(timeout=10) as client:
-                resp = client.get(
-                    STOCKTWITS_STREAM_URL.format(symbol=clean),
-                    headers={"User-Agent": "MarketAnalysis/1.0"},
-                )
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
-                messages = data.get("messages", [])
-                for msg in messages[:max_items]:
-                    body = msg.get("body", "")[:300]
-                    sentiment = msg.get("entities", {}).get("sentiment", {})
-                    sentiment_label = sentiment.get("basic", "") if sentiment else ""
-                    title = f"[Stocktwits/{clean}] {sentiment_label}: {body[:80]}..." if len(body) > 80 else f"[Stocktwits/{clean}] {body}"
-                    results.append({
-                        "title": title,
-                        "snippet": body,
-                        "source_url": f"https://stocktwits.com/symbol/{clean}",
-                        "query": f"stocktwits:{clean}",
-                    })
-        except Exception as e:
-            print(f"[WebResearch] Stocktwits fetch failed for {clean}: {e}")
-    return results
-
-
-def _fetch_yfinance_news(tickers: list[str], max_items: int = 3) -> list[dict]:
-    """Fetch ticker-specific news from Yahoo Finance (yfinance)."""
-    results = []
-    random.shuffle(tickers)
-    for symbol in tickers[:4]:
-        try:
-            ticker = yf.Ticker(symbol)
-            news = getattr(ticker, 'news', None)
-            if news:
-                for item in news[:max_items]:
-                    title = item.get("title", "")
-                    if title:
-                        results.append({
-                            "title": title,
-                            "snippet": item.get("summary", title)[:300],
-                            "source_url": item.get("link", ""),
-                            "query": f"yfinance:{symbol}",
-                        })
-        except Exception as e:
-            print(f"[WebResearch] YFinance news failed for {symbol}: {e}")
-    return results
-
-
-def _fetch_alpha_vantage_sentiment(tickers: list[str], max_items: int = 5) -> list[dict]:
-    """
-    Fetch pre-scored news sentiment from Alpha Vantage News Sentiment API.
-    Each article comes with an overall sentiment label + per-ticker relevance/sentiment scores.
-    Requires ALPHA_VANTAGE_API_KEY env var — degrades gracefully if missing.
-    """
-    if not ALPHA_VANTAGE_API_KEY:
-        return []
-
-    results = []
-    clean_tickers = [
-        t.replace(".NS", "").replace("-USD", "").replace("=F", "")
-        for t in tickers[:5]
-    ]
-    tickers_str = ",".join(clean_tickers)
-
-    try:
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(
-                "https://www.alphavantage.co/query",
-                params={
-                    "function": "NEWS_SENTIMENT",
-                    "tickers":  tickers_str,
-                    "limit":    max_items * 2,
-                    "sort":     "LATEST",
-                    "apikey":   ALPHA_VANTAGE_API_KEY,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-
-        feed = data.get("feed", [])
-        for item in feed[:max_items]:
-            title         = item.get("title", "")
-            summary       = item.get("summary", "")[:300]
-            url           = item.get("url", "")
-            overall_sent  = item.get("overall_sentiment_label", "")
-
-            ticker_sentiments = []
-            for ts in item.get("ticker_sentiment", []):
-                sym = ts.get("ticker", "")
-                rel = float(ts.get("relevance_score", 0))
-                label = ts.get("ticker_sentiment_label", "")
-                if rel >= 0.3 and label:
-                    ticker_sentiments.append(f"{sym}: {label}")
-
-            sentiment_tag = ""
-            if overall_sent:
-                sentiment_tag = f" [{overall_sent}"
-                if ticker_sentiments:
-                    sentiment_tag += " | " + ", ".join(ticker_sentiments[:3])
-                sentiment_tag += "]"
-
-            if title:
-                results.append({
-                    "title":      f"{title}{sentiment_tag}",
-                    "snippet":    summary,
-                    "source_url": url,
-                    "query":      f"alphavantage:{tickers_str}",
-                })
-    except Exception as e:
-        print(f"[WebResearch] Alpha Vantage sentiment failed: {e}")
-
-    return results
-
-
-def _fetch_reddit_wsb(max_items: int = 5) -> list[dict]:
-    """
-    Fetch top posts from r/WallStreetBets using the unauthenticated JSON API.
-    No API key required. Acts as a retail sentiment signal.
-    """
-    results = []
-    try:
-        with httpx.Client(
-            timeout=10,
-            headers={"User-Agent": "MarketAnalysis/1.0 (research bot)"},
-            follow_redirects=True,
-        ) as client:
-            resp = client.get(
-                "https://www.reddit.com/r/wallstreetbets/hot.json",
-                params={"limit": max_items * 2},
-            )
-            if resp.status_code != 200:
-                return []
-            data = resp.json()
-
-        posts = data.get("data", {}).get("children", [])
-        for post in posts[:max_items]:
-            p = post.get("data", {})
-            title = p.get("title", "")
-            score = p.get("score", 0)
-            if not title or p.get("stickied") or score < 50:
-                continue
-            selftext = (p.get("selftext", "") or "")[:200]
+        # Include the AI answer as a synthetic first result if present
+        answer = (response.get("answer") or "").strip()
+        if answer:
             results.append({
-                "title":      f"[WSB] {title} ({score:,} upvotes)",
-                "snippet":    selftext,
-                "source_url": f"https://reddit.com{p.get('permalink', '')}",
-                "query":      "reddit:wsb",
+                "title":      f"[Summary] {query}",
+                "snippet":    answer[:500],
+                "source_url": "",
+                "query":      f"tavily:{query}",
+                "published":  "",
             })
+        for r in response.get("results", []):
+            title = (r.get("title") or "").strip()
+            if not title:
+                continue
+            results.append({
+                "title":      title,
+                "snippet":    (r.get("content") or "")[:500].strip(),
+                "source_url": r.get("url", ""),
+                "query":      f"tavily:{query}",
+                "published":  r.get("published_date", ""),
+            })
+        return results
     except Exception as e:
-        print(f"[WebResearch] Reddit WSB fetch failed: {e}")
+        print(f"[WebResearch] Tavily search failed for '{query}': {e}")
+        return []
 
-    return results
+
+# ── Dedup / staleness helpers ──────────────────────────────────────────────
+
+def _expire_seen_articles(db: Session) -> None:
+    try:
+        db.query(models.SeenArticle).filter(
+            models.SeenArticle.expires_at < datetime.utcnow()
+        ).delete(synchronize_session=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+
+
+def filter_and_record_new_articles(db: Session, articles: list[dict]) -> list[dict]:
+    if not articles:
+        return []
+
+    _expire_seen_articles(db)
+
+    candidate_keys = [_title_key(a.get("title", "")) for a in articles]
+    candidate_keys = [k for k in candidate_keys if k]
+
+    existing_keys: set[str] = set()
+    try:
+        rows = db.query(models.SeenArticle.title_key).filter(
+            models.SeenArticle.title_key.in_(candidate_keys)
+        ).all()
+        existing_keys = {r.title_key for r in rows}
+    except Exception:
+        pass
+
+    new_articles: list[dict] = []
+    to_insert: list[dict] = []
+    expires = datetime.utcnow() + timedelta(days=SEEN_ARTICLE_TTL_DAYS)
+
+    for article in articles:
+        key = _title_key(article.get("title", ""))
+        if not key or key in existing_keys:
+            continue
+        existing_keys.add(key)
+        new_articles.append(article)
+        to_insert.append({
+            "title_key":     key,
+            "source_domain": _source_domain(article.get("source_url", "")),
+            "first_seen_at": datetime.utcnow(),
+            "expires_at":    expires,
+        })
+
+    if to_insert:
+        try:
+            db.bulk_insert_mappings(models.SeenArticle, to_insert)
+            db.commit()
+        except Exception:
+            db.rollback()
+            for row in to_insert:
+                try:
+                    db.add(models.SeenArticle(**row))
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
+    return new_articles
 
 
 def _filter_stale(items: list[dict], max_age_hours: int = NEWS_MAX_AGE_HOURS) -> list[dict]:
-    """
-    Remove news items older than max_age_hours.
-    Items without a 'published' field are kept (can't determine their age).
-    """
+    """Drop items with a published_date older than max_age_hours. Items with no date are kept."""
     if max_age_hours <= 0:
         return items
 
@@ -345,19 +171,19 @@ def _filter_stale(items: list[dict], max_age_hours: int = NEWS_MAX_AGE_HOURS) ->
             kept.append(item)
             continue
         try:
-            import email.utils
-            pub_dt = email.utils.parsedate_to_datetime(published)
+            from email.utils import parsedate_to_datetime
+            import datetime as _dt_mod
+            pub_dt = parsedate_to_datetime(published)
             if pub_dt.tzinfo is not None:
-                import datetime as _dt_mod
                 pub_dt = pub_dt.astimezone(_dt_mod.timezone.utc).replace(tzinfo=None)
             if pub_dt >= cutoff:
                 kept.append(item)
         except Exception:
             kept.append(item)
 
-    filtered_count = len(items) - len(kept)
-    if filtered_count > 0:
-        print(f"[WebResearch] Staleness filter: dropped {filtered_count} items older than {max_age_hours}h")
+    dropped = len(items) - len(kept)
+    if dropped:
+        print(f"[WebResearch] Staleness filter: dropped {dropped} items older than {max_age_hours}h")
     return kept
 
 
@@ -367,18 +193,19 @@ def fetch_web_research(
     topics: list[str] = None,
     use_cache: bool = False,
     enabled_tickers: dict = None,
+    focus_tickers: list[str] = None,
 ) -> list[dict]:
     """
-    Fetch web research from curated reliable sources.
+    Fetch market news via Tavily Search API.
     Returns list of {title, snippet, source_url, query}.
-    Results are cached in the DB for CACHE_COOLDOWN_MINUTES.
 
-    Source priority:
-      1. Curated RSS by market (Reuters, CNBC, CoinDesk, ET, etc.)
-      2. Google News RSS for specific ticker / macro queries
-      3. Stocktwits social sentiment (X proxy, no auth)
-      4. Yahoo Finance ticker news
+    Builds queries from enabled markets and tickers, runs them in parallel,
+    then deduplicates and filters stale results.
     """
+    if not os.getenv("TAVILY_API_KEY", ""):
+        print("[WebResearch] WARNING: TAVILY_API_KEY not set — no research will be fetched")
+        return []
+
     db = SessionLocal()
 
     # ── Cache check ────────────────────────────────────────────────────────
@@ -395,121 +222,87 @@ def fetch_web_research(
                 for r in cached
             ]
 
-    print("[WebResearch] Fetching fresh research from curated sources...")
-    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    print("[WebResearch] Fetching research via Tavily...")
 
+    active_markets = list(enabled_tickers.keys()) if enabled_tickers else ["US"]
+    ticker_pool: list[str] = []
     if enabled_tickers:
-        active_markets = list(enabled_tickers.keys())
+        for tickers in enabled_tickers.values():
+            ticker_pool.extend(tickers)
+
+    # ── Build query list ───────────────────────────────────────────────────
+    queries: list[str] = []
+
+    if focus_tickers:
+        # Focused run: only search for the specific tickers
+        for sym in focus_tickers:
+            clean = sym.replace(".NS", "").replace(".BO", "").replace("-USD", "").replace("=F", "")
+            queries.append(f"{clean} stock news")
+            queries.append(f"{clean} price forecast analysis")
     else:
-        active_markets = ["US"]
+        # Broad run: macro + per-market + per-ticker queries
+        queries += ["stock market news today", "global economy outlook"]
+        if "Crypto" in active_markets:
+            queries.append("Bitcoin Ethereum crypto market")
+        if "India" in active_markets:
+            queries.append("Nifty Sensex Indian stock market")
+        if "MCX" in active_markets:
+            queries.append("gold oil commodity prices")
+        if "US" in active_markets:
+            queries.append("Federal Reserve interest rates")
+        # Add individual ticker queries (sample to stay within rate limits)
+        import random
+        sample = random.sample(ticker_pool, min(8, len(ticker_pool))) if ticker_pool else []
+        for sym in sample:
+            clean = sym.replace(".NS", "").replace(".BO", "").replace("-USD", "").replace("=F", "")
+            queries.append(f"{clean} stock news")
 
-    ticker_pool = []
-    if enabled_tickers:
-        for market_tickers in enabled_tickers.values():
-            ticker_pool.extend(market_tickers)
-
-    macro_queries = ["Federal Reserve interest rates", "global economy outlook"]
-    if "Crypto" in active_markets:
-        macro_queries.append("Bitcoin Ethereum price")
-    if "India" in active_markets:
-        macro_queries.append("Nifty Sensex today")
-    if "MCX" in active_markets:
-        macro_queries.append("gold oil prices today")
-
-    # Build all fetch tasks upfront
-    fetch_tasks = []
-
-    # RSS feeds — merge hardcoded + user-managed DB feeds (deduplicated)
-    seen_rss: set[str] = set()
-
-    # Load enabled DB feeds
-    try:
-        db_feeds = db.query(models.RssFeed).filter(models.RssFeed.is_enabled == 1).all()
-        db_feed_map: dict[str, list[tuple[str, str]]] = {}
-        for f in db_feeds:
-            db_feed_map.setdefault(f.market, []).append((f.url, f.label))
-    except Exception:
-        db_feed_map = {}
-
-    # Collect feeds per active market from DB (replaces hardcoded lists)
-    for market in active_markets:
-        feeds_for_market = db_feed_map.get(market, []) or MARKET_RSS_MAP.get(market, RSS_GLOBAL)
-        for feed_url, label in feeds_for_market:
-            if feed_url not in seen_rss:
-                seen_rss.add(feed_url)
-                fetch_tasks.append(("rss", feed_url, label))
-
-    # Also include any "All" market feeds
-    for feed_url, label in db_feed_map.get("All", []):
-        if feed_url not in seen_rss:
-            seen_rss.add(feed_url)
-            fetch_tasks.append(("rss", feed_url, label))
-
-    # Google News macro queries
-    for q in macro_queries[:4]:
-        fetch_tasks.append(("gnews", q, None))
-
-    # Run all HTTP fetches in parallel
-    all_results = []
-    def _run_task(task):
-        kind, arg, label = task
-        if kind == "rss":
-            return _fetch_rss(arg, label, max_items=10)
-        else:
-            return _fetch_google_news(arg, max_items=5)
-
-    with ThreadPoolExecutor(max_workers=min(len(fetch_tasks), 12)) as pool:
-        futures = [pool.submit(_run_task, t) for t in fetch_tasks]
-        for f in _as_completed(futures):
+    # ── Parallel Tavily calls ──────────────────────────────────────────────
+    all_results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(len(queries), 10)) as pool:
+        futures = {pool.submit(_tavily_search, q, 5): q for q in queries}
+        for future in _as_completed(futures):
             try:
-                all_results.extend(f.result())
+                all_results.extend(future.result())
             except Exception:
                 pass
 
-    # Stocktwits and YFinance (batch calls, already fast)
-    if ticker_pool:
-        all_results.extend(_fetch_stocktwits(ticker_pool, max_items=5))
-    yf_tickers = ticker_pool if ticker_pool else ["SPY", "BTC-USD", "GC=F"]
-    all_results.extend(_fetch_yfinance_news(yf_tickers, max_items=8))
+    # ── URL dedup — same article often appears across parallel queries ──────
+    seen_urls: set[str] = set()
+    url_deduped: list[dict] = []
+    for r in all_results:
+        url = r.get("source_url", "")
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+        url_deduped.append(r)
+    all_results = url_deduped
 
-    # Alpha Vantage scored sentiment (if API key available)
-    if ticker_pool:
-        all_results.extend(_fetch_alpha_vantage_sentiment(ticker_pool[:5], max_items=10))
-
-    # Reddit WallStreetBets retail sentiment (unauthenticated)
-    if "US" in active_markets or "Crypto" in active_markets:
-        all_results.extend(_fetch_reddit_wsb(max_items=8))
-
-    # ── Staleness filter — drop items older than NEWS_MAX_AGE_HOURS ────────
-    all_results = _filter_stale(all_results)
-
-    # ── De-duplicate by title (fuzzy: first 60 chars) ──────────────────────
+    # ── Title dedup — catches same story at different URLs ──────────────────
     seen_titles: set[str] = set()
     unique_results: list[dict] = []
     for r in all_results:
-        t = r.get("title", "")
-        key = t[:60].lower().strip()
-        if t and key not in seen_titles:
+        key = _title_key(r.get("title", ""))
+        if key and key not in seen_titles:
             seen_titles.add(key)
             unique_results.append(r)
 
-    # ── Cache to DB ────────────────────────────────────────────────────────
+    # ── Persistent dedup — mark new vs already-seen, but return ALL articles
+    # Articles are marked is_new=True only on first appearance (for KG ingest).
+    # The full list is always returned so agents always have context.
+    new_articles = filter_and_record_new_articles(db, unique_results)
+    new_keys = {_title_key(a.get("title", "")) for a in new_articles}
     for r in unique_results:
-        db.add(models.WebResearch(
-            query=r.get("query", ""),
-            source_url=r.get("source_url", ""),
-            title=r.get("title", ""),
-            snippet=r.get("snippet", ""),
-        ))
-    try:
-        db.commit()
-        print(f"[WebResearch] Cached {len(unique_results)} fresh research items")
-    except Exception as e:
-        print(f"[WebResearch] DB cache write failed: {e}")
-        db.rollback()
-    finally:
-        db.close()
+        r["is_new"] = _title_key(r.get("title", "")) in new_keys
 
+    already_seen = len(unique_results) - len(new_articles)
+    if already_seen:
+        print(f"[WebResearch] {len(unique_results)} articles ({len(new_articles)} new, {already_seen} already seen — all passed to agents)")
+    else:
+        print(f"[WebResearch] {len(unique_results)} new articles fetched via Tavily")
+
+    db.close()
     return unique_results
 
 

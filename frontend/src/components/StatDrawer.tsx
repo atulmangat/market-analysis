@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import type { Strategy, DebateRound, AgentMemory, Proposal } from '../types';
 import { NOTE_COLORS } from '../constants';
+import { getCurrencySymbol, getMarketForTicker } from '../utils';
 import { Badge } from './Badge';
 import { StatusChip } from './StatusChip';
 
@@ -48,7 +49,7 @@ export function StatDrawer({
                       <StatusChip status={strat.status} />
                     </div>
                     <p className="text-[11px] text-textMuted">
-                      Entry <span className="font-mono text-textMain">${strat.entry_price.toFixed(2)}</span>
+                      Entry <span className="font-mono text-textMain">{getCurrencySymbol(getMarketForTicker(strat.symbol))}{strat.entry_price.toFixed(2)}</span>
                       <span className="mx-1.5 opacity-40">·</span>
                       {new Date(strat.timestamp).toLocaleString()}
                     </p>

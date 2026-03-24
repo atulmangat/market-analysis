@@ -12,6 +12,7 @@ class PipelineContext:
         self.enabled_markets = {}
         self.focus_tickers = None
         self.investment_focus = ""
+        self.lessons: list[str] = []  # intra-run lesson layer (not persisted)
 
         self._load_from_db()
 
@@ -109,6 +110,8 @@ class PipelineEngine:
         if current_db_step == "pending":
             resume_found = True
 
+        last_error_msg: str | None = None
+        last_error_step: str | None = None
         try:
             for step in self.steps:
                 if not resume_found:
@@ -122,14 +125,30 @@ class PipelineEngine:
                 run_record.step = step.name
                 self.db.commit()
                 log_event(self.db, self.run_id, step.get_log_step(), "IN_PROGRESS", f"Starting {step.name} step")
-                
+
                 try:
                     step.execute(context)
                     log_event(self.db, self.run_id, step.get_log_step(), "DONE", f"Finished {step.name} step")
                 except Exception as e:
                     import traceback
-                    log_event(self.db, self.run_id, step.get_log_step(), "ERROR", f"Error in {step.name}: {str(e)[:300]}")
+                    err_detail = f"Error in {step.name}: {str(e)[:300]}"
+                    last_error_msg = err_detail
+                    last_error_step = step.get_log_step()
                     print(f"Pipeline error in {step.name}: {traceback.format_exc()}")
+                    # Try to log the error — if DB session is poisoned, use a fresh one
+                    try:
+                        self.db.rollback()
+                        log_event(self.db, self.run_id, step.get_log_step(), "ERROR", err_detail)
+                    except Exception:
+                        from core.database import SessionLocal as _SL2
+                        _db3 = _SL2()
+                        try:
+                            log_event(_db3, self.run_id, step.get_log_step(), "ERROR", err_detail)
+                            _db3.commit()
+                        except Exception:
+                            pass
+                        finally:
+                            _db3.close()
                     raise e
 
             # If all steps succeed
@@ -137,19 +156,44 @@ class PipelineEngine:
         except Exception as err:
             final_step = "error"
         finally:
-            # Use a direct SQL UPDATE to guarantee step is persisted even if the
-            # ORM session was invalidated by a rollback inside a step (e.g. _upsert_node).
+            # Use a brand-new DB connection to guarantee final step + lock release
+            # are persisted even if self.db session was poisoned by a rollback inside a step.
+            from core.database import SessionLocal as _SL
+            _db2 = _SL()
             try:
-                self.db.rollback()  # clear any dirty/invalid session state first
-                self.db.execute(
+                _db2.execute(
                     models.PipelineRun.__table__.update()
                     .where(models.PipelineRun.__table__.c.run_id == self.run_id)
                     .values(step=final_step)
                 )
-                self.db.commit()
+                lock_conf = _db2.query(models.AppConfig).filter(models.AppConfig.key == self.lock_key).first()
+                if lock_conf:
+                    lock_conf.value = "0"
+                # If run failed, ensure there's at least one ERROR event visible in the UI
+                if final_step == "error":
+                    has_error_evt = _db2.query(models.PipelineEvent).filter(
+                        models.PipelineEvent.run_id == self.run_id,
+                        models.PipelineEvent.status == "ERROR"
+                    ).first()
+                    if not has_error_evt:
+                        msg = last_error_msg or "Pipeline terminated unexpectedly"
+                        step_name = last_error_step or "PIPELINE"
+                        _db2.add(models.PipelineEvent(
+                            run_id=self.run_id,
+                            step=step_name,
+                            status="ERROR",
+                            detail=msg,
+                        ))
+                _db2.commit()
+            except Exception as _fe:
+                print(f"[PipelineEngine] WARNING: failed to write final step '{final_step}': {_fe}")
+            finally:
+                _db2.close()
+            # Also attempt release on original session as fallback
+            try:
+                self._release_lock()
             except Exception:
                 pass
-            self._release_lock()
             
             # Invalidate cache for new runs
             from core.cache import cache_invalidate_prefix

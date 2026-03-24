@@ -349,6 +349,7 @@ def consolidate_memories(db: Session, agent_name: str):
         response = query_agent(
             "You are a memory consolidation system. Output only the distilled principles.",
             consolidation_prompt,
+            caller=f"memory:consolidate:{agent_name}",
         )
     except Exception as e:
         print(f"[Memory] Consolidation LLM call failed for {agent_name}: {e}")

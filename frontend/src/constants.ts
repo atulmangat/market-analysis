@@ -58,13 +58,14 @@ export const MARKET_SECTORS: Record<string, string[]> = TICKER_DB.reduce((acc, t
 }, {} as Record<string, string[]>);
 
 export const NAV: { id: Page; label: string; icon: string }[] = [
-  { id: 'dashboard', label: 'Dashboard',    icon: '▦' },
-  { id: 'markets',   label: 'Markets',      icon: '◈' },
-  { id: 'graph',     label: 'Data',         icon: '◎' },
-  { id: 'portfolio', label: 'Portfolio',    icon: '$' },
-  { id: 'memory',    label: 'Agents', icon: '◉' },
-  { id: 'pipeline',  label: 'Pipeline', icon: '⟳' },
-  { id: 'settings',  label: 'Settings',     icon: '⚙' },
+  { id: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
+  { id: 'markets',   label: 'Markets',   icon: 'markets'   },
+  { id: 'graph',     label: 'Data',      icon: 'graph'     },
+  { id: 'portfolio', label: 'Portfolio', icon: 'portfolio' },
+  { id: 'memory',    label: 'Agents',    icon: 'agents'    },
+  { id: 'pipeline',  label: 'Pipeline',  icon: 'pipeline'  },
+  { id: 'llm',       label: 'LLM Usage', icon: 'llm'       },
+  { id: 'settings',  label: 'Settings',  icon: 'settings'  },
 ];
 
 // Shared note-type color map — works in both light and dark mode

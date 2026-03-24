@@ -1,6 +1,6 @@
 import type { Strategy, DebateRound, AgentMemory } from '../types';
 import { MARKET_ICONS } from '../constants';
-import { parseProposals } from '../utils';
+import { parseProposals, getCurrencySymbol, getMarketForTicker } from '../utils';
 import { Badge } from '../components/Badge';
 import { StatusChip } from '../components/StatusChip';
 import { Card } from '../components/Card';
@@ -56,20 +56,27 @@ export function DashboardPage({
     <div className="space-y-6">
       {/* Stats row — clickable */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        {stats.map(s => (
+        {stats.map((s, i) => (
           <button
             key={s.key}
             onClick={() => setStatFocus(s.key)}
-            className="text-left group"
+            className={`text-left group animate-fade-up delay-${i * 100}`}
           >
-            <Card className="p-5 transition-all hover:border-borderMid hover:shadow-md group-hover:bg-surface2 cursor-pointer">
-              <div className="flex items-start justify-between">
-                <p className="text-xs text-textMuted mb-1 uppercase tracking-wider">{s.label}</p>
-                <span className="text-[10px] text-textDim opacity-0 group-hover:opacity-100 transition-opacity">View →</span>
+            <div
+              className="rounded-2xl p-5 cursor-pointer stat-card"
+              style={{
+                background: 'var(--color-surface)',
+                border: '1px solid var(--color-borderLight)',
+                boxShadow: '0 1px 4px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.025)',
+              }}
+            >
+              <div className="flex items-start justify-between mb-3">
+                <p className="text-[10px] text-textDim uppercase tracking-[0.12em] font-semibold">{s.label}</p>
+                <span className="text-[10px] text-textDim opacity-0 group-hover:opacity-100 transition-opacity duration-150 font-mono">→</span>
               </div>
-              <p className={`text-3xl font-light ${s.color}`}>{s.value}</p>
-              <p className="text-[10px] text-textDim mt-1 opacity-0 group-hover:opacity-100 transition-opacity">{s.hint}</p>
-            </Card>
+              <p className={`text-4xl font-light num tabular ${s.color}`}>{s.value}</p>
+              <p className="text-[10px] text-textDim mt-2 opacity-0 group-hover:opacity-60 transition-opacity duration-150">{s.hint}</p>
+            </div>
           </button>
         ))}
       </div>
@@ -186,8 +193,8 @@ export function DashboardPage({
                                     </div>
                                   </div>
                                   <div className="flex items-center gap-3 text-[11px] text-textMuted mb-3 flex-wrap">
-                                    <span>Entry <span className="text-textMain font-medium font-mono">${strat.entry_price.toFixed(2)}</span></span>
-                                    {strat.position_size && <span>Size <span className="text-textMain font-medium font-mono">${strat.position_size.toLocaleString()}</span></span>}
+                                    <span>Entry <span className="text-textMain font-medium font-mono">{strat.entry_price > 0 ? `${getCurrencySymbol(getMarketForTicker(strat.symbol))}${strat.entry_price.toFixed(2)}` : '—'}</span></span>
+                                    {strat.position_size && <span>Size <span className="text-textMain font-medium font-mono">{getCurrencySymbol(getMarketForTicker(strat.symbol))}{strat.position_size.toLocaleString()}</span></span>}
                                   </div>
                                   {strat.notes && (
                                     <div className="mb-3 px-3 py-2 bg-surface3/50 rounded-lg">
@@ -350,7 +357,7 @@ export function DashboardPage({
                               <Badge type={strat.strategy_type} />
                             </div>
                             <div className="flex items-center gap-2 mt-0.5 text-[11px] text-textDim">
-                              <span>Entry <span className="font-mono text-textMuted">${strat.entry_price.toFixed(2)}</span></span>
+                              <span>Entry <span className="font-mono text-textMuted">{strat.entry_price > 0 ? `${getCurrencySymbol(getMarketForTicker(strat.symbol))}${strat.entry_price.toFixed(2)}` : '—'}</span></span>
                               <span>·</span>
                               <span>{new Date(strat.timestamp).toLocaleString()}</span>
                             </div>

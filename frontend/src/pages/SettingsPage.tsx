@@ -34,10 +34,7 @@ interface SettingsPageProps {
   setMode: (mode: string) => void;
   markets: MarketConfig[];
   toggleMarket: (name: string, enabled: number) => void;
-  scheduleInterval: number;
-  handleScheduleUpdate: (minutes: number) => void;
-  handleManualTrigger: () => void;
-  isTriggering: boolean;
+  reloadMarkets: () => void;
 }
 
 const CATEGORY_ORDER = ['LLM', 'Market Data', 'News', 'Macro', 'Sentiment', 'Social'];
@@ -47,13 +44,10 @@ const CATEGORY_ICON: Record<string, string> = {
 
 const FEED_MARKETS = ['US', 'Crypto', 'India', 'MCX', 'All'];
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 export function SettingsPage({
   darkMode, toggleDarkMode,
   approvalMode, setMode,
-  markets, toggleMarket,
-  scheduleInterval: _scheduleInterval, handleScheduleUpdate: _handleScheduleUpdate,
-  handleManualTrigger: _handleManualTrigger, isTriggering: _isTriggering,
+  markets, toggleMarket, reloadMarkets,
 }: SettingsPageProps) {
   const [sources, setSources] = useState<DataSource[]>([]);
   const [feeds, setFeeds] = useState<RssFeed[]>([]);
@@ -62,6 +56,14 @@ export function SettingsPage({
   const [feedError, setFeedError] = useState('');
   const [feedSaving, setFeedSaving] = useState(false);
   const [feedMarketTab, setFeedMarketTab] = useState('All');
+
+  // Per-market ticker add state: { [marketName]: inputValue }
+  const [tickerInputs, setTickerInputs] = useState<Record<string, string>>({});
+  const [tickerAdding, setTickerAdding] = useState<Record<string, boolean>>({});
+  const [localMarkets, setLocalMarkets] = useState<MarketConfig[]>(markets);
+
+  // Sync localMarkets when markets prop changes
+  useEffect(() => { setLocalMarkets(markets); }, [markets]);
 
   useEffect(() => {
     apiFetch('/config/data-sources')
@@ -111,6 +113,40 @@ export function SettingsPage({
       setAddingFeed(false);
     } finally {
       setFeedSaving(false);
+    }
+  }
+
+  async function addTicker(marketName: string) {
+    const sym = (tickerInputs[marketName] ?? '').trim().toUpperCase();
+    if (!sym) return;
+    setTickerAdding(p => ({ ...p, [marketName]: true }));
+    try {
+      const r = await apiFetch(`/config/markets/${marketName}/tickers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: sym }),
+      });
+      if (r.ok) {
+        const d = await r.json();
+        setLocalMarkets(prev => prev.map(m =>
+          m.market_name === marketName ? { ...m, custom_tickers: d.custom_tickers } : m
+        ));
+        setTickerInputs(p => ({ ...p, [marketName]: '' }));
+        reloadMarkets();
+      }
+    } finally {
+      setTickerAdding(p => ({ ...p, [marketName]: false }));
+    }
+  }
+
+  async function removeTicker(marketName: string, symbol: string) {
+    const r = await apiFetch(`/config/markets/${marketName}/tickers/${symbol}`, { method: 'DELETE' });
+    if (r.ok) {
+      const d = await r.json();
+      setLocalMarkets(prev => prev.map(m =>
+        m.market_name === marketName ? { ...m, custom_tickers: d.custom_tickers } : m
+      ));
+      reloadMarkets();
     }
   }
 
@@ -172,19 +208,69 @@ export function SettingsPage({
         <h2 className="text-xs font-semibold text-textMuted uppercase tracking-widest">Markets</h2>
         <Card>
           <SectionHeader title="Enabled Markets" />
-          <div className="p-5 grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {markets.map(m => (
-              <div key={m.id} className="flex items-center justify-between bg-surface2 rounded-lg px-4 py-3 border border-borderLight">
-                <div className="flex items-center gap-3">
-                  <span className="text-xl leading-none">{MARKET_ICONS[m.market_name] ?? '📊'}</span>
-                  <div>
-                    <p className="text-sm font-medium text-textMain">{m.market_name}</p>
-                    <p className="text-[11px] text-textMuted">{MARKET_TICKERS[m.market_name]?.length ?? 0} tickers</p>
+          <div className="p-5 space-y-3">
+            {localMarkets.map(m => {
+              const baseTickers = m.base_tickers ?? MARKET_TICKERS[m.market_name] ?? [];
+              const customTickers = m.custom_tickers ?? [];
+              const totalCount = baseTickers.length + customTickers.length;
+              return (
+                <div key={m.id} className="border border-borderLight rounded-xl overflow-hidden">
+                  {/* Market header row */}
+                  <div className="flex items-center justify-between bg-surface2 px-4 py-3">
+                    <div className="flex items-center gap-3">
+                      <span className="text-xl leading-none">{MARKET_ICONS[m.market_name] ?? '📊'}</span>
+                      <div>
+                        <p className="text-sm font-medium text-textMain">{m.market_name}</p>
+                        <p className="text-[11px] text-textMuted">{totalCount} ticker{totalCount !== 1 ? 's' : ''}{customTickers.length > 0 ? ` (${customTickers.length} custom)` : ''}</p>
+                      </div>
+                    </div>
+                    <Toggle checked={!!m.is_enabled} onChange={() => toggleMarket(m.market_name, m.is_enabled)} />
+                  </div>
+
+                  {/* Ticker pills */}
+                  <div className="px-4 py-3 flex flex-wrap gap-1.5">
+                    {baseTickers.map(t => (
+                      <span key={t} className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-mono bg-surface3 border border-borderLight text-textMuted">
+                        {t}
+                      </span>
+                    ))}
+                    {customTickers.map(t => (
+                      <span key={t} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-mono bg-brand-500/10 border border-brand-500/30 text-brand-400">
+                        {t}
+                        <button
+                          onClick={() => removeTicker(m.market_name, t)}
+                          className="text-[9px] opacity-60 hover:opacity-100 hover:text-down transition-colors leading-none"
+                          title="Remove"
+                        >✕</button>
+                      </span>
+                    ))}
+
+                    {/* Inline add input */}
+                    <form
+                      onSubmit={e => { e.preventDefault(); addTicker(m.market_name); }}
+                      className="inline-flex items-center gap-1"
+                    >
+                      <input
+                        type="text"
+                        value={tickerInputs[m.market_name] ?? ''}
+                        onChange={e => setTickerInputs(p => ({ ...p, [m.market_name]: e.target.value.toUpperCase() }))}
+                        placeholder="+ Add ticker"
+                        className="w-24 px-2 py-0.5 rounded-full text-[10px] font-mono bg-surface3 border border-borderLight text-textMain placeholder-textDim focus:outline-none focus:border-brand-500 transition-colors"
+                      />
+                      {(tickerInputs[m.market_name] ?? '').trim() && (
+                        <button
+                          type="submit"
+                          disabled={tickerAdding[m.market_name]}
+                          className="text-[10px] px-2 py-0.5 rounded-full bg-brand-500 text-white font-medium disabled:opacity-50"
+                        >
+                          {tickerAdding[m.market_name] ? '…' : 'Add'}
+                        </button>
+                      )}
+                    </form>
                   </div>
                 </div>
-                <Toggle checked={!!m.is_enabled} onChange={() => toggleMarket(m.market_name, m.is_enabled)} />
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
       </section>

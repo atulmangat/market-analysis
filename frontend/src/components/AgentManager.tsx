@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { apiFetch } from '../utils';
 import { Card } from './Card';
 import { useToast } from '../hooks/useToast';
@@ -40,6 +41,14 @@ export function AgentManager({
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatHistory]);
 
+  useEffect(() => {
+    if (!chatOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') handleClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chatOpen]);
+
   const handleClose = () => {
     setChatOpen(false);
     setSuggestedAgent(null);
@@ -75,7 +84,7 @@ export function AgentManager({
       } else {
         toast('Failed to generate prompt', 'err');
       }
-    } catch (err) {
+    } catch {
       toast('Network error', 'err');
     } finally {
       setIsBuilding(false);
@@ -110,13 +119,13 @@ export function AgentManager({
         const d = await res.json();
         toast(d.detail || 'Failed to save agent', 'err');
       }
-    } catch (err) {
+    } catch {
       toast('Network error', 'err');
     }
   };
 
   return (
-    <div className="inline-block">
+    <>
       {!isOpen && !hideButton && (
         <button
           onClick={() => setChatOpen(true)}
@@ -126,7 +135,7 @@ export function AgentManager({
         </button>
       )}
 
-      {chatOpen && (
+      {chatOpen && createPortal(
         <div className="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
           <Card className="w-full max-w-2xl h-[80vh] flex flex-col overflow-hidden shadow-2xl border-brand-500/20">
             {/* Header */}
@@ -233,8 +242,9 @@ export function AgentManager({
               )}
             </div>
           </Card>
-        </div>
+        </div>,
+        document.body
       )}
-    </div>
+    </>
   );
 }

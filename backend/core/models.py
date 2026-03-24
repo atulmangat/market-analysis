@@ -60,6 +60,7 @@ class MarketConfig(Base):
     id = Column(Integer, primary_key=True, index=True)
     market_name = Column(String, unique=True, index=True) # e.g., US, Crypto, India, MCX
     is_enabled = Column(Integer, default=1) # 1 for True, 0 for False
+    custom_tickers = Column(Text, nullable=True)  # JSON list of user-added tickers e.g. ["INTC","PLTR"]
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 class DebateRound(Base):
@@ -196,6 +197,33 @@ class CacheEntry(Base):
     value_json = Column(Text, nullable=False)
     expires_at = Column(DateTime, nullable=True)   # NULL = no expiry
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class LLMUsage(Base):
+    """Per-call token usage and cost tracking for all LLM requests."""
+    __tablename__ = "llm_usage"
+
+    id                = Column(Integer, primary_key=True, index=True)
+    timestamp         = Column(DateTime, default=datetime.utcnow, index=True)
+    model             = Column(String, index=True)
+    caller            = Column(String, nullable=True, index=True)
+    prompt_tokens     = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)  # total output incl. reasoning
+    reasoning_tokens  = Column(Integer, default=0)  # chain-of-thought tokens (subset of completion)
+    total_tokens      = Column(Integer, default=0)
+    cost              = Column(Float, default=0.0)  # USD cost reported by OpenRouter (0 for free models)
+    run_id            = Column(String, nullable=True, index=True)
+
+
+class SeenArticle(Base):
+    """Tracks articles already processed so they are not fed to the KG again."""
+    __tablename__ = "seen_articles"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    title_key     = Column(String, unique=True, index=True)  # first 80 chars, lowercased
+    source_domain = Column(String, index=True)               # e.g. "reuters.com"
+    first_seen_at = Column(DateTime, default=datetime.utcnow, index=True)
+    expires_at    = Column(DateTime, index=True)             # 30 days after first_seen_at
 
 
 class RssFeed(Base):

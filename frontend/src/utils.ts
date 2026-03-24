@@ -25,6 +25,12 @@ export function getMarketForTicker(ticker: string): string {
   return 'US';
 }
 
+/** Returns '₹' for Indian tickers (market = India or .NS suffix), '$' for everything else. */
+export function getCurrencySymbol(tickerOrMarket: string): string {
+  if (tickerOrMarket === 'India' || tickerOrMarket.endsWith('.NS')) return '₹';
+  return '$';
+}
+
 export function parseProposals(jsonStr: string): Proposal[] {
   try { return JSON.parse(jsonStr); } catch { return []; }
 }

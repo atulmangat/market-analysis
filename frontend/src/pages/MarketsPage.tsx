@@ -1,11 +1,12 @@
 import React, { useState, useEffect, useRef } from 'react';
-import type { Strategy, LiveQuote, MarketEvent } from '../types';
+import type { Strategy, LiveQuote, MarketEvent, MarketConfig } from '../types';
 import { MARKET_ICONS, TICKER_DB, TICKER_META } from '../constants';
-import { apiFetch } from '../utils';
+import { apiFetch, getCurrencySymbol } from '../utils';
 import { Card } from '../components/Card';
 
 interface MarketsPageProps {
   enabledMarketNames: string[];
+  markets?: MarketConfig[];
   activeStrategies: Strategy[];
   pendingStrategies: Strategy[];
   liveQuotes: LiveQuote[];
@@ -19,7 +20,6 @@ interface MarketsPageProps {
   marketsSearchResults: { symbol: string; name: string; sector: string; exchange: string; type: string }[];
   marketsSearchLoading: boolean;
   marketsSearchTimer: [ReturnType<typeof setTimeout> | null, (v: ReturnType<typeof setTimeout> | null) => void];
-  isTriggering: boolean;
   setQuotesMarketTab: (m: string) => void;
   setQuotesStockTab: (s: string | null) => void;
   setMarketsSearchOpen: (v: boolean) => void;
@@ -27,9 +27,9 @@ interface MarketsPageProps {
   setMarketsSearchResults: (r: { symbol: string; name: string; sector: string; exchange: string; type: string }[]) => void;
   setMarketsSearchLoading: (v: boolean) => void;
   setWatchlist: (fn: (prev: string[]) => string[]) => void;
+  onMarketsChange: () => void;
   fetchQuotes: () => void;
   openReport: (id: number) => void;
-  onTrigger: (tickers?: string[]) => void;
   onApprove: (id: number, action: string) => void;
 }
 
@@ -196,16 +196,23 @@ function MarketClock({ market }: { market: string }) {
 
 
 export function MarketsPage({
-  enabledMarketNames, activeStrategies, pendingStrategies, liveQuotes, marketEvents,
+  enabledMarketNames, markets = [], activeStrategies, pendingStrategies, liveQuotes, marketEvents,
   quotesLoading, quotesMarketTab, quotesStockTab, watchlist,
   marketsSearchOpen, marketsSearchQuery, marketsSearchResults, marketsSearchLoading,
-  marketsSearchTimer, isTriggering,
+  marketsSearchTimer,
   setQuotesMarketTab, setQuotesStockTab, setMarketsSearchOpen,
   setMarketsSearchQuery, setMarketsSearchResults, setMarketsSearchLoading,
-  setWatchlist, fetchQuotes, openReport, onTrigger, onApprove,
+  setWatchlist, onMarketsChange, fetchQuotes, openReport, onApprove,
 }: MarketsPageProps) {
   const [selectedTickers, setSelectedTickers] = useState<Set<string>>(new Set());
   const [selectMode, setSelectMode] = useState(false);
+
+  useEffect(() => {
+    if (!marketsSearchOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setMarketsSearchOpen(false); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [marketsSearchOpen, setMarketsSearchOpen]);
 
   const fmt = (n: number | null, dec = 2, prefix = '') => {
     if (n === null || n === undefined) return '—';
@@ -220,23 +227,35 @@ export function MarketsPage({
     return String(v);
   };
 
-  // Only tickers from enabled markets
+  // Only tickers from enabled markets (static DB)
   const allDefaultSymbols = TICKER_DB.filter(t => enabledMarketNames.includes(t.market)).map(t => t.symbol);
-  // User-added symbols not in defaults
-  const userAddedSymbols = watchlist.filter(s => !allDefaultSymbols.includes(s));
+  // Custom tickers from MarketConfig (user-persisted via Settings)
+  const customMarketSymbols = markets.flatMap(m =>
+    enabledMarketNames.includes(m.market_name) ? (m.custom_tickers ?? []) : []
+  );
+  // User-added symbols from watchlist (session-only, not in TICKER_DB)
+  const userAddedSymbols = watchlist.filter(s => !allDefaultSymbols.includes(s) && !customMarketSymbols.includes(s));
   // Combined unique symbol list
-  const allSymbols = [...new Set([...allDefaultSymbols, ...userAddedSymbols])];
+  const allSymbols = [...new Set([...allDefaultSymbols, ...customMarketSymbols, ...userAddedSymbols])];
 
   // Resolve active tab — default to first enabled market
   const activeMarketTab = (quotesMarketTab && enabledMarketNames.includes(quotesMarketTab))
     ? quotesMarketTab
     : (enabledMarketNames[0] ?? '');
 
+  // Build a quick lookup: custom symbol → market name
+  const customSymbolMarket: Record<string, string> = {};
+  for (const m of markets) {
+    for (const t of (m.custom_tickers ?? [])) customSymbolMarket[t] = m.market_name;
+  }
+
   // Filter by market tab
   const tabSymbols = allSymbols.filter(sym => {
     const meta = TICKER_META[sym];
     if (meta) return meta.market === activeMarketTab;
-    // For user-added symbols not in TICKER_DB, detect market from quote data
+    // Custom ticker — use market from MarketConfig
+    if (customSymbolMarket[sym]) return customSymbolMarket[sym] === activeMarketTab;
+    // Watchlist / unknown — detect market from live quote data
     const q = liveQuotes.find(q => q.symbol === sym);
     return q?.market === activeMarketTab;
   });
@@ -290,15 +309,27 @@ export function MarketsPage({
     marketsSearchTimer[1](newTimer);
   };
 
-  const toggleWatchlist = (sym: string) => {
-    setWatchlist(prev => {
-      const next = prev.includes(sym) ? prev.filter(s => s !== sym) : [...prev, sym];
-      localStorage.setItem('watchlist', JSON.stringify(next));
-      return next;
-    });
+  const toggleWatchlist = async (sym: string) => {
+    const isAdded = customMarketSymbols.includes(sym) || watchlist.includes(sym);
+    if (isAdded) {
+      // Remove from the market it belongs to
+      const market = customSymbolMarket[sym] ?? activeMarketTab;
+      await apiFetch(`/config/markets/${market}/tickers/${encodeURIComponent(sym)}`, { method: 'DELETE' });
+      setWatchlist(prev => { const next = prev.filter(s => s !== sym); localStorage.setItem('watchlist', JSON.stringify(next)); return next; });
+    } else {
+      // Add to currently active market tab
+      await apiFetch(`/config/markets/${activeMarketTab}/tickers`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol: sym }),
+      });
+      setWatchlist(prev => { const next = [...prev, sym]; localStorage.setItem('watchlist', JSON.stringify(next)); return next; });
+    }
+    onMarketsChange();
+    fetchQuotes();
   };
 
-  const isTracked = (sym: string) => allDefaultSymbols.includes(sym) || watchlist.includes(sym);
+  const isTracked = (sym: string) => allDefaultSymbols.includes(sym) || customMarketSymbols.includes(sym) || watchlist.includes(sym);
 
   const renderStockCard = (sym: string, hasPosition = false) => {
     const q = liveQuotes.find(lq => lq.symbol === sym);
@@ -316,7 +347,7 @@ export function MarketsPage({
       if (selectMode) {
         setSelectedTickers(prev => {
           const next = new Set(prev);
-          next.has(sym) ? next.delete(sym) : next.add(sym);
+          if (next.has(sym)) { next.delete(sym); } else { next.add(sym); }
           return next;
         });
       } else {
@@ -442,25 +473,6 @@ export function MarketsPage({
             {selectMode ? `✓ ${selectedTickers.size} selected` : '⊡ Select'}
           </button>
 
-          {/* Run pipeline on selected */}
-          {selectMode && selectedTickers.size > 0 && (
-            <button
-              onClick={() => { onTrigger(Array.from(selectedTickers)); setSelectMode(false); setSelectedTickers(new Set()); }}
-              disabled={isTriggering}
-              className="text-[11px] px-3 py-1.5 rounded-lg bg-brand-600 hover:bg-brand-500 border border-brand-500 text-white font-semibold transition-all disabled:opacity-50 flex items-center gap-1.5">
-              {isTriggering ? '⟳ Running…' : `▶ Run on ${selectedTickers.size} ticker${selectedTickers.size > 1 ? 's' : ''}`}
-            </button>
-          )}
-
-          {/* Run full pipeline (no selection) */}
-          {!selectMode && (
-            <button
-              onClick={() => onTrigger()}
-              disabled={isTriggering}
-              className="text-[11px] px-3 py-1.5 rounded-lg bg-surface2 border border-borderLight hover:border-brand-500 text-textMuted hover:text-brand-400 transition-all disabled:opacity-40 flex items-center gap-1.5">
-              {isTriggering ? '⟳ Running…' : '▶ Run Pipeline'}
-            </button>
-          )}
 
           <button onClick={() => { setMarketsSearchOpen(true); setMarketsSearchQuery(''); setMarketsSearchResults([]); }}
             className="text-[11px] px-3 py-1.5 rounded-lg bg-surface2 border border-borderLight hover:border-brand-500 text-textMuted hover:text-brand-400 transition-all flex items-center gap-1.5">
@@ -569,7 +581,7 @@ export function MarketsPage({
                                               ? 'bg-up/10 text-up border-up/20'
                                               : 'bg-down/10 text-down border-down/20'
                                           }`}>{s.strategy_type === 'LONG' ? '▲' : '▼'} {s.strategy_type}</span>
-                                          <span className="text-[11px] font-mono text-textMuted">Entry: {s.entry_price != null ? `$${s.entry_price.toFixed(4)}` : '—'}</span>
+                                          <span className="text-[11px] font-mono text-textMuted">Entry: {s.entry_price != null ? `${getCurrencySymbol(s.symbol)}${s.entry_price.toFixed(4)}` : '—'}</span>
                                         </div>
                                         <div className="flex gap-2">
                                           <button
@@ -704,20 +716,24 @@ export function MarketsPage({
               placeholder="Search ticker or company name…"
               className="w-full px-3 py-2 text-sm rounded-lg bg-surface2 border border-borderLight focus:border-brand-500 focus:outline-none text-textMain placeholder-textDim"
             />
-            {/* User-added symbols */}
-            {userAddedSymbols.length > 0 && !marketsSearchQuery && (
-              <div>
-                <p className="text-[10px] text-textDim uppercase tracking-wider mb-2">Currently Added</p>
-                <div className="flex flex-wrap gap-2">
-                  {userAddedSymbols.map(sym => (
-                    <span key={sym} className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg bg-brand-900/40 border border-brand-700/40 text-brand-300">
-                      {sym.replace(/\.(NS)$/, '').replace(/-USD$/, '').replace(/=F$/, '')}
-                      <button onClick={() => toggleWatchlist(sym)} className="hover:text-down-text ml-0.5">×</button>
-                    </span>
-                  ))}
+            {/* Custom tickers for active market tab */}
+            {(() => {
+              const tabCustom = markets.find(m => m.market_name === activeMarketTab)?.custom_tickers ?? [];
+              if (tabCustom.length === 0 || marketsSearchQuery) return null;
+              return (
+                <div>
+                  <p className="text-[10px] text-textDim uppercase tracking-wider mb-2">Currently Added — {activeMarketTab}</p>
+                  <div className="flex flex-wrap gap-2">
+                    {tabCustom.map(sym => (
+                      <span key={sym} className="flex items-center gap-1 px-2 py-1 text-xs rounded-lg bg-brand-900/40 border border-brand-700/40 text-brand-300">
+                        {sym.replace(/\.(NS)$/, '').replace(/-USD$/, '').replace(/=F$/, '')}
+                        <button onClick={() => toggleWatchlist(sym)} className="hover:text-down-text ml-0.5">×</button>
+                      </span>
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
             {marketsSearchLoading && <p className="text-xs text-textDim text-center py-4 animate-pulse">Searching…</p>}
             {!marketsSearchLoading && marketsSearchResults.length > 0 && (
               <div className="space-y-1 max-h-64 overflow-y-auto">

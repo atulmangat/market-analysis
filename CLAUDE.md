@@ -13,7 +13,8 @@ A multi-agent AI stock market analysis system. Four LLM agents (Value Investor, 
 cd backend
 source venv/bin/activate
 pip install -r requirements.txt  # if needed
-uvicorn main:app --reload
+pip install watchfiles             # required for --reload-exclude to work
+uvicorn main:app --reload --reload-exclude "*.db" --reload-exclude "*.pyc" --reload-exclude "__pycache__/*"
 ```
 Backend runs at `http://localhost:8000`. API docs at `/docs`.
 

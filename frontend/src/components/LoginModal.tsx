@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { API } from '../constants';
 import { setToken } from '../utils';
 
@@ -6,6 +6,12 @@ export function LoginModal({ onLogin, onClose }: { onLogin: () => void; onClose:
   const [password, setPassword] = useState('');
   const [error, setError]       = useState('');
   const [loading, setLoading]   = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -37,48 +43,82 @@ export function LoginModal({ onLogin, onClose }: { onLogin: () => void; onClose:
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex items-center justify-center px-4"
+      style={{ background: 'rgba(4,8,14,0.8)', backdropFilter: 'blur(24px)' }}
       onClick={onClose}
     >
       <div
-        className="w-full max-w-sm mx-4 rounded-2xl p-8 shadow-2xl space-y-6"
-        style={{ background: '#161b22', border: '1px solid #374151' }}
+        className="w-full max-w-sm rounded-2xl animate-scale-in"
+        style={{
+          background: '#0d1117',
+          border: '1px solid #1a2535',
+          boxShadow: '0 24px 64px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.04), inset 0 1px 0 rgba(255,255,255,0.04)',
+          padding: '32px',
+        }}
         onClick={e => e.stopPropagation()}
       >
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="text-xl font-bold tracking-tight" style={{ color: '#f1f5f9' }}>
-              market-analysis<span style={{ color: '#60a5fa' }}>.space</span>
+        {/* Header */}
+        <div className="flex items-center justify-between mb-7">
+          <div className="flex items-center gap-3">
+            <div style={{ height: 32, width: 32, borderRadius: 10, background: 'linear-gradient(135deg, #2563eb 0%, #4f46e5 100%)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 0 16px rgba(37,99,235,0.45)', flexShrink: 0 }}>
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                <path d="M2 12L5 8L8 10L11 5L14 7" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                <circle cx="14" cy="7" r="1.5" fill="white"/>
+              </svg>
             </div>
-            <p className="text-xs mt-0.5" style={{ color: '#94a3b8' }}>Enter your access password</p>
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: '#e2e8f4', letterSpacing: '-0.3px' }}>
+                market-analysis<span style={{ color: '#60a5fa' }}>.space</span>
+              </div>
+              <p style={{ fontSize: 11, marginTop: 2, color: '#6b7fa0' }}>Enter your access password</p>
+            </div>
           </div>
-          <button onClick={onClose} className="text-xl leading-none transition-colors" style={{ color: '#64748b' }}
-            onMouseEnter={e => (e.currentTarget.style.color = '#f1f5f9')}
-            onMouseLeave={e => (e.currentTarget.style.color = '#64748b')}>×</button>
+          <button
+            onClick={onClose}
+            style={{ width: 28, height: 28, borderRadius: 8, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(255,255,255,0.04)', border: '1px solid #1a2535', cursor: 'pointer', color: '#6b7fa0', transition: 'all 150ms ease' }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.08)'; (e.currentTarget as HTMLElement).style.color = '#e2e8f4'; }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.04)'; (e.currentTarget as HTMLElement).style.color = '#6b7fa0'; }}
+            aria-label="Close"
+          >
+            <svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round">
+              <path d="M1 1l10 10M11 1L1 11"/>
+            </svg>
+          </button>
         </div>
 
-        <form onSubmit={submit} className="space-y-4">
+        <form onSubmit={submit} style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
           <input
             autoFocus
             type="password"
             value={password}
             onChange={e => setPassword(e.target.value)}
             placeholder="Password"
-            className="w-full px-4 py-3 rounded-xl text-sm transition-colors focus:outline-none"
-            style={{ background: '#0d1117', border: '1px solid #1e293b', color: '#f1f5f9' }}
-            onFocus={e => (e.currentTarget.style.borderColor = '#3b82f6')}
-            onBlur={e => (e.currentTarget.style.borderColor = '#1e293b')}
+            style={{ width: '100%', padding: '12px 16px', borderRadius: 12, fontSize: 14, background: '#070b10', border: '1px solid #1a2535', color: '#e2e8f4', outline: 'none', transition: 'border-color 150ms ease', boxSizing: 'border-box' }}
+            onFocus={e => (e.currentTarget.style.borderColor = 'rgba(59,130,246,0.6)')}
+            onBlur={e => (e.currentTarget.style.borderColor = '#1a2535')}
           />
           {error && (
-            <p className="text-xs rounded-lg px-3 py-2" style={{ color: '#f87171', background: 'rgba(153,27,27,0.2)', border: '1px solid rgba(153,27,27,0.4)' }}>{error}</p>
+            <p style={{ fontSize: 12, color: '#f87171', background: 'rgba(239,68,68,0.08)', border: '1px solid rgba(239,68,68,0.2)', borderRadius: 10, padding: '8px 12px', margin: 0 }}>{error}</p>
           )}
           <button
             type="submit"
             disabled={loading || !password}
-            className="w-full py-3 rounded-xl font-semibold text-sm transition-all disabled:opacity-50"
-            style={{ background: '#3b82f6', color: '#fff' }}
-            onMouseEnter={e => { if (!loading && password) e.currentTarget.style.background = '#60a5fa'; }}
-            onMouseLeave={e => { e.currentTarget.style.background = '#3b82f6'; }}>
+            style={{
+              width: '100%',
+              padding: '13px 0',
+              borderRadius: 12,
+              fontWeight: 700,
+              fontSize: 14,
+              border: 'none',
+              cursor: loading || !password ? 'not-allowed' : 'pointer',
+              transition: 'all 180ms cubic-bezier(0.16,1,0.3,1)',
+              background: loading || !password ? '#1a2535' : 'linear-gradient(135deg, #2563eb 0%, #4f46e5 100%)',
+              color: loading || !password ? '#6b7fa0' : '#fff',
+              boxShadow: loading || !password ? 'none' : '0 0 24px rgba(37,99,235,0.35)',
+            }}
+            onMouseEnter={e => { if (!loading && password) { (e.currentTarget as HTMLElement).style.transform = 'translateY(-1px)'; (e.currentTarget as HTMLElement).style.boxShadow = '0 8px 24px rgba(37,99,235,0.45)'; } }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.transform = ''; (e.currentTarget as HTMLElement).style.boxShadow = loading || !password ? 'none' : '0 0 24px rgba(37,99,235,0.35)'; }}
+          >
             {loading ? 'Signing in…' : 'Open Dashboard →'}
           </button>
         </form>

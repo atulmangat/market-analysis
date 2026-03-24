@@ -116,7 +116,8 @@ Rules: skip vague facts, include specific numbers, expires_days: breaking=2 earn
 # ── Node helpers ───────────────────────────────────────────────────────────────
 
 def _upsert_node(db: Session, node_id: str, node_type: str, label: str,
-                 symbol: str = None, metadata: dict = None):
+                 symbol: str = None, metadata: dict = None) -> bool:
+    """Returns True if a new node was created, False if an existing one was updated."""
     existing = db.query(models.KGNode).filter(models.KGNode.node_id == node_id).first()
     if existing:
         existing.last_seen_at = datetime.utcnow()
@@ -127,6 +128,7 @@ def _upsert_node(db: Session, node_id: str, node_type: str, label: str,
                 existing.metadata_json = json.dumps(old_meta)
             except Exception:
                 pass
+        return False
     else:
         node = models.KGNode(
             node_id=node_id,
@@ -137,9 +139,12 @@ def _upsert_node(db: Session, node_id: str, node_type: str, label: str,
         )
         db.add(node)
         try:
-            db.flush()
+            with db.begin_nested():
+                db.flush()
+            return True
         except Exception:
-            db.rollback()
+            # Duplicate or constraint violation — node already exists
+            return False
 
 
 def upsert_asset_nodes(db: Session, tickers: list[str]) -> None:
@@ -396,7 +401,7 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
         return 0
 
     # ── Stage 2: group facts by ticker, extract KG per ticker ─────────────────
-    STAGE2_TICKER_CAP  = 8    # max tickers to run Stage 2 for
+    STAGE2_TICKER_CAP  = 15   # max tickers to run Stage 2 for
     STAGE2_TIMEOUT_S   = 90   # wall-clock budget for all Stage 2 calls
 
     # Build graph snapshot once (pure DB, fast)
@@ -458,6 +463,7 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
     # ── Write facts to DB ──────────────────────────────────────────────────────
     nodes_by_id: dict[str, dict] = {}
     total_edges_added = 0
+    total_nodes_added = 0
 
     for fact in facts:
         event_id      = fact["event_id"]
@@ -478,7 +484,7 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
         event_node_id = f"event:{event_id[:60]}"
         expires_at = now + timedelta(days=expires_days)
 
-        _upsert_node(db, event_node_id, "EVENT", event_label[:80], metadata={
+        is_new = _upsert_node(db, event_node_id, "EVENT", event_label[:80], metadata={
             "summary":       event_summary[:600],
             "direction":     direction,
             "magnitude":     magnitude,
@@ -488,8 +494,10 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
             "price_targets": price_targets[:5],
             "source_region": source_region,
             "run_id":        run_id,
-            "extracted_at":  now.isoformat(),
+            "extracted_at":  now.isoformat() + "Z",
         })
+        if is_new:
+            total_nodes_added += 1
         nodes_by_id[event_node_id] = {"label": event_label, "type": "EVENT"}
 
         # Affected assets → event edges
@@ -497,7 +505,8 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
             a_node_id = asset_ref if asset_ref.startswith("asset:") else f"asset:{asset_ref}"
             a_sym = a_node_id.replace("asset:", "")
             a_label = TICKER_LABELS.get(a_sym, a_sym)
-            _upsert_node(db, a_node_id, "ASSET", a_label, symbol=a_sym)
+            if _upsert_node(db, a_node_id, "ASSET", a_label, symbol=a_sym):
+                total_nodes_added += 1
             nodes_by_id[a_node_id] = {"label": a_label, "type": "ASSET"}
             db.add(models.KGEdge(
                 source_node_id=event_node_id, target_node_id=a_node_id,
@@ -516,7 +525,8 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
                 ent_node_id = f"entity:{ent_ref}"
                 ent_label = ent_ref
                 ent_type = "ENTITY"
-            _upsert_node(db, ent_node_id, ent_type, ent_label)
+            if _upsert_node(db, ent_node_id, ent_type, ent_label):
+                total_nodes_added += 1
             nodes_by_id[ent_node_id] = {"label": ent_label, "type": ent_type}
             db.add(models.KGEdge(
                 source_node_id=ent_node_id, target_node_id=event_node_id,
@@ -600,7 +610,7 @@ def ingest_retrieval_to_graph(db: Session, research_items: list[dict],
         print(f"[KG] DB commit failed: {e}")
         db.rollback()
 
-    return total_edges_added
+    return total_edges_added, total_nodes_added
 
 
 # ── Subgraph retrieval ─────────────────────────────────────────────────────────
@@ -729,6 +739,221 @@ def build_kg_context_for_ticker(db: Session, ticker: str) -> str:
         return ""
 
 
+# ── LLM-driven graph traversal ─────────────────────────────────────────────────
+
+_KG_TRAVERSE_SEED_PROMPT = """You are a financial knowledge graph navigator.
+
+You will receive a list of ASSET nodes and their direct edges. Each edge shows a connected node ID.
+Your job: decide which connected nodes are worth expanding to find the most actionable market intelligence.
+
+Prioritise:
+- Nodes connected to multiple assets (high cross-asset impact)
+- Event nodes that suggest price catalysts (earnings, macro shocks, regulatory)
+- Anything with HIGH magnitude
+
+Respond with ONLY a JSON object in this exact format — no preamble:
+{"expand": ["node_id_1", "node_id_2", ...], "reason": "one sentence"}
+
+Rules:
+- List at most 12 node IDs to expand
+- Only pick IDs that appear in the edges shown
+- If the current graph already has sufficient context, return {"expand": [], "reason": "sufficient"}"""
+
+_KG_TRAVERSE_FINAL_PROMPT = """You are a financial knowledge graph analyst.
+
+You have traversed a knowledge graph and collected nodes and relationships. Now produce a ranked analysis.
+
+For each asset that has meaningful events/relationships, output ONE JSON object per line:
+{"ticker":"NVDA","direction":"bullish|bearish|neutral","conviction":"high|medium|low","key_events":["slug1","slug2"],"reasoning":"2-3 sentences citing specific graph facts and numbers"}
+
+Rules:
+- Only include assets with at least one supporting event in the graph
+- Order by conviction then recency of supporting events
+- Max 8 tickers
+- Output only JSON lines, no preamble"""
+
+
+def _serialize_assets_with_edges(db: Session, allowed_tickers: list[str]) -> tuple[str, dict, list]:
+    """
+    Fetch all ASSET nodes for allowed_tickers + their direct 1-hop edges.
+    Returns (text_block, nodes_by_id dict).
+    """
+    now = datetime.utcnow()
+    asset_ids = [f"asset:{t}" for t in allowed_tickers]
+    nodes = db.query(models.KGNode).filter(models.KGNode.node_id.in_(asset_ids)).all()
+    nodes_by_id: dict[str, dict] = {n.node_id: _node_to_dict(n) for n in nodes}
+
+    edges = db.query(models.KGEdge).filter(
+        or_(
+            models.KGEdge.source_node_id.in_(asset_ids),
+            models.KGEdge.target_node_id.in_(asset_ids),
+        ),
+        or_(models.KGEdge.expires_at.is_(None), models.KGEdge.expires_at > now),
+    ).order_by(models.KGEdge.confidence.desc()).limit(300).all()
+
+    lines = ["## Asset Nodes and Direct Edges\n"]
+    for node in nodes:
+        lines.append(f"NODE {node.node_id} | {node.label} | updated:{node.last_seen_at.strftime('%Y-%m-%dT%H:%M') if node.last_seen_at else '?'}")
+    lines.append("")
+    for e in edges:
+        age = ""
+        if e.created_at:
+            h = (now - e.created_at).total_seconds() / 3600
+            age = f"{int(h)}h ago" if h < 48 else f"{int(h/24)}d ago"
+        lines.append(f"EDGE {e.source_node_id} --[{e.relation} {int(e.confidence*100)}%]--> {e.target_node_id} ({age})")
+
+    return "\n".join(lines), nodes_by_id, edges
+
+
+def _fetch_and_serialize_nodes(db: Session, node_ids: list[str],
+                                already_loaded: dict, now: datetime) -> str:
+    """
+    Fetch the requested node IDs (skipping already loaded ones), return compact text.
+    Includes each node's metadata summary + their outgoing edges.
+    """
+    new_ids = [nid for nid in node_ids if nid not in already_loaded]
+    if not new_ids:
+        return ""
+
+    nodes = db.query(models.KGNode).filter(models.KGNode.node_id.in_(new_ids)).all()
+    for n in nodes:
+        already_loaded[n.node_id] = _node_to_dict(n)
+
+    edges = db.query(models.KGEdge).filter(
+        or_(
+            models.KGEdge.source_node_id.in_(new_ids),
+            models.KGEdge.target_node_id.in_(new_ids),
+        ),
+        or_(models.KGEdge.expires_at.is_(None), models.KGEdge.expires_at > now),
+    ).order_by(models.KGEdge.confidence.desc()).limit(200).all()
+
+    lines = ["\n## Expanded Nodes\n"]
+    for n in nodes:
+        meta = json.loads(n.metadata_json or "{}")
+        direction = meta.get("direction", "")
+        summary = meta.get("summary", "")[:200]
+        magnitude = meta.get("magnitude", "")
+        key_nums = ", ".join(meta.get("key_numbers", [])[:4])
+        age = ""
+        if n.last_seen_at:
+            h = (now - n.last_seen_at).total_seconds() / 3600
+            age = f"{int(h)}h ago" if h < 48 else f"{int(h/24)}d ago"
+        dir_icon = "▲" if direction == "bullish" else "▼" if direction == "bearish" else "●"
+        lines.append(f"\nNODE {n.node_id} | {n.label} | {dir_icon} {direction} [{magnitude}] | {age}")
+        if summary:
+            lines.append(f"  Summary: {summary}")
+        if key_nums:
+            lines.append(f"  Numbers: {key_nums}")
+    lines.append("")
+    for e in edges:
+        age = ""
+        if e.created_at:
+            h = (now - e.created_at).total_seconds() / 3600
+            age = f"{int(h)}h ago" if h < 48 else f"{int(h/24)}d ago"
+        lines.append(f"EDGE {e.source_node_id} --[{e.relation} {int(e.confidence*100)}%]--> {e.target_node_id} ({age})")
+
+    return "\n".join(lines)
+
+
+def llm_traverse_graph(db: Session, allowed_tickers: list[str],
+                       run_id: str | None = None) -> tuple[list[str], str]:
+    """
+    LLM-driven iterative graph traversal.
+
+    Round 0: show LLM all ASSET nodes + their direct edges
+    Round 1: LLM picks which neighbor nodes to expand → fetch + show
+    Round 2: (optional) LLM picks further expansions
+    Final:   LLM analyses full collected subgraph → ranked tickers + reasoning
+
+    Returns (ranked_ticker_list, kg_context_string_for_agents).
+    """
+    if not allowed_tickers:
+        return [], ""
+
+    now = datetime.utcnow()
+    today = now.strftime("%Y-%m-%d %H:%M UTC")
+
+    # ── Round 0: seed — assets + direct edges ─────────────────────────────────
+    seed_text, nodes_by_id, _ = _serialize_assets_with_edges(db, allowed_tickers)
+    collected_text = seed_text
+
+    # ── Rounds 1-2: LLM-controlled expansion ──────────────────────────────────
+    MAX_ROUNDS = 4
+    for round_num in range(1, MAX_ROUNDS + 1):
+        prompt_body = f"TODAY: {today}\n\n{collected_text}"
+        raw = query_agent(_KG_TRAVERSE_SEED_PROMPT, prompt_body,
+                          caller="kg_traverse", run_id=run_id,
+                          timeout=20, retries=1)
+        if not raw:
+            break
+        try:
+            decision = json.loads(raw.strip())
+        except Exception:
+            # Try to find JSON in the response
+            m = re.search(r'\{.*\}', raw, re.DOTALL)
+            if not m:
+                break
+            try:
+                decision = json.loads(m.group(0))
+            except Exception:
+                break
+
+        expand_ids = decision.get("expand", [])
+        reason = decision.get("reason", "")
+        print(f"[KG traverse] Round {round_num}: expanding {len(expand_ids)} nodes — {reason}")
+
+        if not expand_ids:
+            break
+
+        expanded = _fetch_and_serialize_nodes(db, expand_ids, nodes_by_id, now)
+        if expanded:
+            collected_text += expanded
+
+    # ── Final: LLM analyses full collected subgraph → ranked output ───────────
+    final_body = f"TODAY: {today}\n\n{collected_text}"
+    raw_final = query_agent(_KG_TRAVERSE_FINAL_PROMPT, final_body,
+                            caller="kg_traverse_final", run_id=run_id,
+                            timeout=30, retries=1)
+
+    ranked_tickers: list[str] = []
+    agent_lines: list[str] = ["## Knowledge Graph Analysis (LLM-traversed)\n"]
+
+    if raw_final:
+        for line in raw_final.strip().splitlines():
+            line = line.strip()
+            if not line or not line.startswith("{"):
+                continue
+            try:
+                item = json.loads(line)
+                ticker = item.get("ticker", "")
+                direction = item.get("direction", "neutral")
+                conviction = item.get("conviction", "medium")
+                key_events = item.get("key_events", [])
+                reasoning = item.get("reasoning", "")
+
+                if ticker:
+                    ranked_tickers.append(ticker)
+                    dir_icon = "▲" if direction == "bullish" else "▼" if direction == "bearish" else "●"
+                    agent_lines.append(
+                        f"{dir_icon} **{ticker}** [{conviction.upper()} conviction] — {direction}"
+                    )
+                    if reasoning:
+                        agent_lines.append(f"  {reasoning}")
+                    if key_events:
+                        agent_lines.append(f"  Key events: {', '.join(key_events[:3])}")
+                    agent_lines.append("")
+            except Exception:
+                continue
+
+    if not ranked_tickers:
+        print("[KG traverse] Final LLM returned no ranked tickers — falling back to allowed_tickers")
+        ranked_tickers = allowed_tickers[:8]
+
+    kg_context = "\n".join(agent_lines)
+    print(f"[KG traverse] Done — {len(ranked_tickers)} ranked tickers: {ranked_tickers}")
+    return ranked_tickers, kg_context
+
+
 # ── Serialization helpers ──────────────────────────────────────────────────────
 
 def _node_to_dict(n: models.KGNode) -> dict:
@@ -738,8 +963,8 @@ def _node_to_dict(n: models.KGNode) -> dict:
         "label":        n.label,
         "symbol":       n.symbol,
         "metadata":     json.loads(n.metadata_json or "{}"),
-        "last_seen_at": n.last_seen_at.isoformat() if n.last_seen_at else None,
-        "created_at":   n.created_at.isoformat() if n.created_at else None,
+        "last_seen_at": n.last_seen_at.isoformat() + "Z" if n.last_seen_at else None,
+        "created_at":   n.created_at.isoformat() + "Z" if n.created_at else None,
     }
 
 
@@ -749,6 +974,6 @@ def _edge_to_dict(e: models.KGEdge) -> dict:
         "target":     e.target_node_id,
         "relation":   e.relation,
         "confidence": round(e.confidence, 3),
-        "expires_at": e.expires_at.isoformat() if e.expires_at else None,
-        "created_at": e.created_at.isoformat() if e.created_at else None,
+        "expires_at": e.expires_at.isoformat() + "Z" if e.expires_at else None,
+        "created_at": e.created_at.isoformat() + "Z" if e.created_at else None,
     }
